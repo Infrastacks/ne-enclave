@@ -1004,6 +1004,7 @@ impl WorkspaceManager {
             let instances = self.instances.lock().await;
             match instances.get(&req.workspace_id) {
                 Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
+                #[cfg(feature = "confidential-cvm")]
                 Some(_) => {
                     return SupervisorResponse::Error {
                         kind: SupervisorErrorKind::Unsupported,
@@ -1199,6 +1200,7 @@ impl WorkspaceManager {
             let instances = self.instances.lock().await;
             match instances.get(&req.workspace_id) {
                 Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
+                #[cfg(feature = "confidential-cvm")]
                 Some(_) => {
                     return SupervisorResponse::Error {
                         kind: SupervisorErrorKind::Unsupported,
@@ -1357,6 +1359,7 @@ impl WorkspaceManager {
             let instances = self.instances.lock().await;
             match instances.get(&req.workspace_id) {
                 Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
+                #[cfg(feature = "confidential-cvm")]
                 Some(_) => {
                     return SupervisorResponse::Error {
                         kind: SupervisorErrorKind::Unsupported,
