@@ -1,0 +1,44 @@
+[Unit]
+Description=NeuronEdge Enclave privileged supervisor
+Documentation=https://github.com/Infrastacks/ne-enclave
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/opt/ne-enclave/bin/nee serve-supervisor
+EnvironmentFile=/etc/ne-enclave/ne-enclave.env
+Restart=on-failure
+RestartSec=2
+
+# Real IPC peer-cred auth (NOT dev mode) — the supervisor enforces the
+# ne uid on the unix socket. The jailer needs these to chown the
+# kernel/rootfs into the per-workspace chroot and to manage netns/TAP.
+#
+# Runs as root (privileged) but with the `ne` group so that the
+# RuntimeDirectory (/run/ne-enclave) and the supervisor.sock it holds are
+# owned root:ne — letting the unprivileged ne-api (group ne)
+# traverse the directory and connect to the socket. (The jailer still
+# setgid()s to its own gid via CAP_SETGID.)
+User=root
+Group=ne
+# Capabilities the Firecracker jailer + lifecycle need: chroot into the
+# per-workspace jail (SYS_CHROOT), mknod the guest /dev nodes incl.
+# /dev/net/tun (MKNOD), chown/chmod files into the jail (CHOWN, FOWNER,
+# DAC_OVERRIDE), drop to the jailed uid/gid (SETUID, SETGID), mount the
+# chroot (SYS_ADMIN), signal the jailed firecracker (which runs as a
+# different uid) on terminate (KILL), and manage netns/TAP when networking
+# is enabled (NET_ADMIN). The bounding set also caps uid-0 privilege, so
+# CAP_KILL must be listed explicitly or terminate hangs on a kill() EPERM.
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT
+NoNewPrivileges=false
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ne-enclave /run/ne-enclave /srv/jailer
+RuntimeDirectory=ne-enclave
+RuntimeDirectoryMode=0750
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

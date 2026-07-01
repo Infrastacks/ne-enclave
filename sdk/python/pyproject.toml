@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neuronedge-enclave"
+version = "0.1.0"
+description = "Python SDK for the NeuronEdge Enclave Runtime API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Infrastacks LLC", email = "eng@infrastacks.com" }]
+keywords = [
+    "enclave",
+    "firecracker",
+    "microvm",
+    "confidential-computing",
+    "agent",
+    "grpc",
+    "runtime",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "grpcio >=1.62,<2.0",
+    # The pinned ceiling tracks grpcio-tools' codegen runtime
+    # requirement; grpcio-tools 1.80+ emits protobuf 6.x-compatible
+    # Python. Bump together when codegen.sh is rerun.
+    "protobuf >=4.25,<8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools >=1.62,<2.0",
+    "pytest >=8.0",
+    "pytest-asyncio >=0.23",
+    "ruff >=0.5",
+]
+
+[project.urls]
+Homepage = "https://neuronedge.ai"
+Repository = "https://github.com/Infrastacks/ne-enclave"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ne"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep the Phase 1 P0 lint floor pragmatic — match the project's
+# overall "zero warnings" discipline but don't fight the generated
+# protobuf code (which lives outside ruff's scope via per-file
+# ignores in tool.ruff.lint.per-file-ignores below).
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]  # handled by line-length above
+
+[tool.ruff.lint.per-file-ignores]
+# Generated grpcio protobuf code is not author-controlled.
+"src/ne/runtime/v1/*_pb2*.py" = ["ALL"]

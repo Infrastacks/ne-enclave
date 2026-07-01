@@ -1,0 +1,485 @@
+// NeuronEdge Enclave Runtime API — gRPC surface SDK callers talk to.
+//
+// Maps onto the supervisor's typed NDJSON IPC (see
+// crates/ne-protocol/src/supervisor.rs). Operations land here
+// incrementally per the Phase 1 P0 sequencing in the spike outcome
+// doc § 10. Phase 0 starting set was Ping; Phase 1 P0 wedge 2 adds
+// CreateWorkspace + DestroyWorkspace (PRD FR-4.3 minimum lifecycle).
+// Future (committed via RFC per ARCH §17.6): ExecuteCommand
+// (server-streaming), ForkWorkspace, GetAttestation.
+
+syntax = "proto3";
+
+package ne.runtime.v1;
+
+// The runtime API SDKs and (eventually) the control plane talk to.
+service Runtime {
+  // Liveness + version probe. Returns versions of both the API
+  // daemon and the upstream supervisor it relays to.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Launch one Firecracker microVM workspace. The supervisor stages
+  // kernel + rootfs into a per-workspace jailer chroot, starts
+  // Firecracker, configures it via its HTTP API socket, and boots.
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse);
+
+  // Tear down a registered workspace and reclaim host resources.
+  // Maps onto SupervisorRequest::Terminate on the privileged side.
+  rpc DestroyWorkspace(DestroyWorkspaceRequest) returns (DestroyWorkspaceResponse);
+
+  // Run one command inside a workspace. The API daemon relays the
+  // call through the supervisor, which opens a vsock connection to
+  // the guest agent, asks it to spawn the command, and returns the
+  // captured output. Phase 1 P0 is unary; server-streaming with
+  // stdout/stderr chunks (PRD FR-4.5) lands in P1.
+  rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
+
+  // Read entries from the supervisor's signed audit event log
+  // (per-event Ed25519 + Merkle chain). Per FR-11.3 these events
+  // are what the control plane eventually aggregates into its
+  // tamper-evident store for compliance evidence packaging.
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+
+  rpc WriteFile(WriteFileRequest) returns (WriteFileResponse);
+  rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
+
+  // Pause a running workspace (freeze vCPUs in place).
+  // DEFERRED (wedge-6.8): unsupported on current Firecracker (vsock dies on in-place resume); use snapshot/restore. Server returns Unsupported.
+  rpc PauseWorkspace(PauseWorkspaceRequest) returns (PauseWorkspaceResponse);
+
+  // Resume a previously paused workspace.
+  // DEFERRED (wedge-6.8): unsupported on current Firecracker (vsock dies on in-place resume); use snapshot/restore. Server returns Unsupported.
+  rpc ResumeWorkspace(ResumeWorkspaceRequest) returns (ResumeWorkspaceResponse);
+
+  // Snapshot a paused workspace into a reusable artifact.
+  rpc SnapshotWorkspace(SnapshotWorkspaceRequest) returns (SnapshotWorkspaceResponse);
+
+  // Restore a fresh workspace from an existing snapshot artifact.
+  rpc RestoreWorkspace(RestoreWorkspaceRequest) returns (RestoreWorkspaceResponse);
+
+  // Fork a fresh workspace from a snapshot artifact, resetting the new
+  // guest's identity (hostname / machine-id / RNG) so it is distinct from
+  // the source and any sibling fork.
+  rpc ForkWorkspace(ForkWorkspaceRequest) returns (ForkWorkspaceResponse);
+
+  // Query warm-pool status for the configured tier (if any).
+  // Returns immediately from the pool manager's in-memory state; safe
+  // to call at high frequency for dashboard/health probes.
+  rpc GetPoolStatus(GetPoolStatusRequest) returns (GetPoolStatusResponse);
+
+  // Expose a guest port to host-based ingress routing, reachable at
+  // {port}-{workspace_id}.{ingress_domain}. Optional per-port header
+  // injection. The workspace must be networked.
+  rpc ExposePort(ExposePortRequest) returns (ExposePortResponse);
+  // Stop routing ingress to a previously exposed guest port.
+  rpc UnexposePort(UnexposePortRequest) returns (UnexposePortResponse);
+
+  // Generate attestation evidence for a workspace, binding a caller
+  // nonce (challenge-response). The active provider determines the
+  // proof type; the software fallback is Ed25519-signed.
+  rpc GetAttestationEvidence(GetAttestationEvidenceRequest) returns (GetAttestationEvidenceResponse);
+}
+
+// ---- Ping ---------------------------------------------------------
+
+message PingRequest {}
+
+message PingResponse {
+  // Crate version of the ne-api daemon.
+  string api_version = 1;
+  // Milliseconds since the API daemon began serving.
+  uint64 api_uptime_ms = 2;
+  // Crate version of the ne-supervisor the API relayed to.
+  string supervisor_version = 3;
+  // Milliseconds since the supervisor began accepting connections.
+  uint64 supervisor_uptime_ms = 4;
+}
+
+// ---- CreateWorkspace ----------------------------------------------
+
+message CreateWorkspaceRequest {
+  // Opaque workspace identifier. Caller-supplied; the supervisor
+  // does not mint IDs. Must satisfy jailer's grammar
+  // ([a-zA-Z0-9-]{1,64}).
+  string workspace_id = 1;
+  // Absolute host path to the guest kernel image (uncompressed vmlinux).
+  string kernel_image_path = 2;
+  // Absolute host path to the guest rootfs image (ext4 or squashfs).
+  string rootfs_image_path = 3;
+  // Whether the rootfs should be mounted read-only inside the guest.
+  bool rootfs_read_only = 4;
+  // Guest vCPU count. Protobuf has no u8 — runtime validates 1..=255.
+  uint32 vcpu_count = 5;
+  // Guest memory in MiB.
+  uint32 mem_size_mib = 6;
+  // Guest vsock CID. 0 disables the vsock device.
+  uint32 guest_vsock_cid = 7;
+  // Optional kernel command-line arguments. When unset the supervisor
+  // substitutes its configured default.
+  optional string kernel_boot_args = 8;
+  // Optional per-workspace network policy. When unset the workspace
+  // gets no eth0 and no NAT. When set, the supervisor provisions a
+  // dedicated netns + veth + TAP + (optionally) MASQUERADE. Requires
+  // the supervisor to have been started with --enable-networking; if
+  // not, the field is logged at warn and otherwise ignored.
+  optional NetworkConfig network = 9;
+  // Optional warm-pool tier tag. When set the supervisor (or pool
+  // manager) may satisfy this request from a pre-warmed VM pool keyed
+  // by this string. Callers that do not use pools omit the field.
+  optional string tier = 10;
+}
+
+// Per-workspace network policy.
+//
+// Phase 1 P0 second cut: deny-by-default FORWARD chain populated by
+// `allow_cidrs`. Future iterations add port allowlists, hostname
+// allowlists, and DNS overrides via additional fields — repeated /
+// optional keep the wire shape additive.
+message NetworkConfig {
+  // When true, the supervisor installs a MASQUERADE rule so the
+  // workspace egresses through the host's default route. When false,
+  // the netns + interfaces still exist but no NAT rule lands — useful
+  // for air-gapped / confidential workloads.
+  bool enable_egress = 1;
+  // Destination CIDRs the workspace is permitted to reach. Empty
+  // list combined with `enable_egress = true` keeps the historic
+  // open-egress shape (the supervisor inserts an ACCEPT-all rule).
+  // Empty list with `enable_egress = false` blocks every outbound
+  // destination. Conntrack-tracked return traffic for already-
+  // accepted flows is always allowed regardless.
+  repeated string allow_cidrs = 2;
+  // Hostname allowlist enforced by the per-workspace DNS filter.
+  // Matches by suffix; `openai.com` allows `api.openai.com`,
+  // `chat.openai.com`, etc. Leading `*.` is permitted and
+  // equivalent to the bare form. Empty list disables the DNS
+  // filter entirely; non-empty switches the workspace into
+  // deny-by-default DNS (NXDOMAIN for unlisted names).
+  repeated string allow_hostnames = 3;
+  // When set, the workspace opts into the host-side privacy router
+  // (HTTP body PII scanning). The supervisor spawns one
+  // ne-privacy-router per workspace inside the netns and
+  // installs iptables DNAT to redirect TCP/80 egress to it. The
+  // PII policy itself is host-global in Phase 1 P0 (operator-set
+  // via supervisor CLI) — the message stays empty for now and will
+  // grow per-workspace overrides (e.g. an inline policy) in
+  // Phase 2 without breaking existing clients.
+  optional PrivacyRouterConfig privacy_router = 4;
+  // Ports inside the guest exposed to host-based ingress routing. Only
+  // listed ports are reachable via {port}-{workspace_id}.{ingress_domain};
+  // everything else is refused. Optional per-port auth-header injection.
+  repeated ExposedPort exposed_ports = 5;
+}
+
+// Per-workspace privacy-router opt-in marker.
+//
+// Empty in Phase 1 P0: presence is the opt-in signal; the operator-
+// set global policy applies. Kept as a message (rather than a bool)
+// so Phase 2 can add fields (`policy`, `redirect_ports`, etc.)
+// without an SDK migration.
+message PrivacyRouterConfig {}
+
+// One guest port exposed to host-based ingress, with optional headers the
+// edge injects before forwarding (e.g. an auth/identity header).
+message ExposedPort {
+  uint32 port = 1;                              // guest TCP port; runtime validates 1..=65535
+  repeated HeaderInjection inject_headers = 2;
+}
+
+// A single header injected at the ingress edge.
+message HeaderInjection {
+  string name = 1;
+  string value = 2;
+}
+
+message CreateWorkspaceResponse {
+  string workspace_id = 1;
+  // PID of the jailer (effectively Firecracker's PID).
+  uint32 firecracker_pid = 2;
+  // Host-side absolute path to the vsock UDS the guest agent reaches
+  // through. See Firecracker's host→guest CONNECT handshake.
+  string vsock_host_socket = 3;
+  // Host-side absolute path to the jailer chroot for this workspace.
+  string jailer_chroot = 4;
+  // Network resources the supervisor provisioned, when the request
+  // asked for networking. Absent when the request omitted `network`
+  // or the supervisor was not started with --enable-networking.
+  optional WorkspaceNetwork network = 5;
+}
+
+// Network details for a created workspace. Surfaced back so callers
+// can recognize where the workspace lives on the link-local pool
+// without an extra query.
+message WorkspaceNetwork {
+  // Netns the supervisor placed the workspace into (full path on the
+  // host, e.g. `/var/run/netns/ne-<short_id>`).
+  string netns_path = 1;
+  // TAP device the guest's eth0 is wired to.
+  string tap_device = 2;
+  // Host-side veth IP. Workspace uses this as its default gateway.
+  string host_ip = 3;
+  // Guest-side veth IP — the address the guest's eth0 should be
+  // configured with.
+  string guest_ip = 4;
+  // Subnet prefix length for both IPs (currently 30 for /30 link-local).
+  uint32 prefix = 5;
+}
+
+// ---- DestroyWorkspace ---------------------------------------------
+
+message DestroyWorkspaceRequest {
+  string workspace_id = 1;
+  // Milliseconds to wait between SIGTERM and SIGKILL.
+  uint32 grace_period_ms = 2;
+}
+
+message DestroyWorkspaceResponse {
+  string workspace_id = 1;
+}
+
+// ---- ExecuteCommand -----------------------------------------------
+
+message ExecuteCommandRequest {
+  // Workspace the command runs in. Must already exist (from a prior
+  // CreateWorkspace).
+  string workspace_id = 1;
+  // Path to the command binary, resolved against guest $PATH.
+  string command = 2;
+  // Arguments passed verbatim — no shell interpretation.
+  repeated string args = 3;
+  // Per-call timeout in milliseconds. 0 disables the timeout.
+  uint32 timeout_ms = 4;
+  // Guest vsock port the agent listens on. Defaults to 52 by
+  // convention; surfaced as a field so test harnesses can wire to
+  // alternates without recompiling.
+  uint32 guest_port = 5;
+}
+
+message ExecuteCommandResponse {
+  string workspace_id = 1;
+  // Captured stdout (lossy UTF-8; full buffer in Phase 1 P0).
+  string stdout = 2;
+  // Captured stderr (same conversion as stdout).
+  string stderr = 3;
+  // Process exit code (-1 if terminated by signal in Phase 1 P0).
+  int32 exit_code = 4;
+  // Wall-clock duration the command ran for, milliseconds.
+  uint64 elapsed_ms = 5;
+  // True if the guest truncated stdout or stderr at its per-stream cap
+  // (audit S3-F2). The captured bytes are still valid; only the tail
+  // was dropped.
+  bool truncated = 6;
+}
+
+// ---- ListEvents ---------------------------------------------------
+
+message ListEventsRequest {
+  // When set, only return events whose workspace_id matches.
+  optional string workspace_id = 1;
+  // Skip events with chain_index < since_chain_index. 0 returns
+  // everything from genesis.
+  uint64 since_chain_index = 2;
+  // Soft cap on returned events. 0 is treated as 100.
+  uint32 limit = 3;
+}
+
+message ListEventsResponse {
+  repeated AuditEvent events = 1;
+}
+
+// One signed audit event. Mirrors ne_protocol::audit::AuditEvent;
+// see crates/ne-protocol/src/audit.rs for field semantics. The
+// API daemon forwards the signed bytes unchanged so downstream
+// verifiers reach a stable canonical hash.
+message AuditEvent {
+  string event_id = 1;
+  uint64 timestamp_ms = 2;
+  string event_type = 3;
+  optional string workspace_id = 4;
+  // Event-specific payload serialized as JSON. Schema is
+  // per-event_type; readers branch on event_type.
+  string payload_json = 5;
+  uint64 chain_index = 6;
+  string prev_hash_hex = 7;
+  string signature_b64 = 8;
+  string signer_pubkey_b64 = 9;
+}
+
+// ---- WriteFile -----------------------------------------------------
+
+message WriteFileRequest {
+  string workspace_id = 1;
+  // Relative path inside the workspace's /workspace jail root. Absolute
+  // paths and ".." segments are rejected by the guest agent.
+  string path = 2;
+  // File contents. Hard cap 10 MiB (10 * 1024 * 1024 bytes); larger
+  // requests are rejected at the api daemon with INVALID_ARGUMENT.
+  bytes content = 3;
+  // Guest vsock port; 0 → server defaults to 52.
+  uint32 guest_port = 4;
+}
+
+message WriteFileResponse {
+  string workspace_id = 1;
+  uint64 bytes_written = 2;
+  // Echoes the canonical absolute path the file landed at, prefixed
+  // with the jail root. Useful for audit clarity on the caller side.
+  string absolute_path = 3;
+}
+
+// ---- ReadFile ------------------------------------------------------
+
+message ReadFileRequest {
+  string workspace_id = 1;
+  string path = 2;
+  // Maximum bytes to return. 0 → server default (10 MiB).
+  uint64 max_bytes = 3;
+  uint32 guest_port = 4;
+}
+
+message ReadFileResponse {
+  string workspace_id = 1;
+  bytes content = 2;
+  // Size on disk in bytes. May exceed bytes returned when truncated.
+  uint64 size_bytes = 3;
+  bool truncated = 4;
+}
+
+// ---- PauseWorkspace -----------------------------------------------
+
+message PauseWorkspaceRequest { string workspace_id = 1; }
+message PauseWorkspaceResponse { string workspace_id = 1; }
+
+// ---- ResumeWorkspace ----------------------------------------------
+
+message ResumeWorkspaceRequest { string workspace_id = 1; }
+message ResumeWorkspaceResponse { string workspace_id = 1; }
+
+// ---- SnapshotWorkspace --------------------------------------------
+
+message SnapshotWorkspaceRequest {
+  string workspace_id = 1;
+  // Live-state snapshot: keep the source running + reachable via hot-swap restore.
+  bool live = 2;
+}
+message SnapshotWorkspaceResponse {
+  // Allocated snapshot id (ULID).
+  string snapshot_id = 1;
+  // Source workspace this snapshot was taken from.
+  string created_from_workspace_id = 2;
+  // SHA-256 (hex) of the memory file.
+  string mem_sha256 = 3;
+  // SHA-256 (hex) of the vmstate file.
+  string vmstate_sha256 = 4;
+  // Combined size of mem + vmstate in bytes.
+  uint64 size_bytes = 5;
+  // Source's NEW Firecracker PID after a successful live hot-swap; absent if not live.
+  optional uint32 firecracker_pid = 6;
+}
+
+// ---- RestoreWorkspace ---------------------------------------------
+
+message RestoreWorkspaceRequest {
+  // Snapshot artifact id to restore from.
+  string snapshot_id = 1;
+  // New workspace id to register the restored VM under.
+  string new_workspace_id = 2;
+}
+message RestoreWorkspaceResponse {
+  string workspace_id = 1;
+  // PID of the restored Firecracker process under jailer.
+  uint32 firecracker_pid = 2;
+  // Host-side absolute path to the vsock UDS.
+  string vsock_host_socket = 3;
+  // Host-side absolute path to the jailer chroot for this workspace.
+  string jailer_chroot = 4;
+}
+
+// ---- ForkWorkspace ------------------------------------------------
+
+message ForkWorkspaceRequest {
+  // Snapshot artifact id to fork from.
+  string snapshot_id = 1;
+  // New workspace id to register the fork under.
+  string new_workspace_id = 2;
+  // Optional hostname for the fork; defaults to new_workspace_id.
+  string hostname = 3;
+}
+message ForkWorkspaceResponse {
+  string workspace_id = 1;
+  // PID of the forked Firecracker process under jailer.
+  uint32 firecracker_pid = 2;
+  // Host-side absolute path to the vsock UDS.
+  string vsock_host_socket = 3;
+  // Host-side absolute path to the jailer chroot for this workspace.
+  string jailer_chroot = 4;
+  // Snapshot this fork was created from.
+  string source_snapshot_id = 5;
+  // Hostname applied to the fork.
+  string hostname = 6;
+  // machine-id applied to the fork (32 lowercase hex).
+  string machine_id = 7;
+  // Guest vsock CID (inherited from the snapshot vmstate).
+  uint32 guest_vsock_cid = 8;
+}
+
+// ---- GetPoolStatus ------------------------------------------------
+
+message GetPoolStatusRequest {}
+message GetPoolStatusResponse {
+  // True when the pool manager is configured with a tier.
+  bool configured = 1;
+  // Tier tag this pool manages. Empty when not configured.
+  string tier = 2;
+  // Target number of pre-warmed VMs the pool aims to maintain.
+  uint32 target_size = 3;
+  // Number of VMs currently idle and ready to serve a request.
+  uint32 available = 4;
+  // Number of VMs currently being prepared (booting / warming).
+  uint32 in_flight = 5;
+}
+
+// ---- ExposePort / UnexposePort ------------------------------------
+
+message ExposePortRequest {
+  string workspace_id = 1;
+  ExposedPort port = 2;
+}
+message ExposePortResponse {
+  string workspace_id = 1;
+  uint32 port = 2;
+}
+message UnexposePortRequest {
+  string workspace_id = 1;
+  uint32 port = 2;
+}
+message UnexposePortResponse {
+  string workspace_id = 1;
+  uint32 port = 2;
+}
+
+// ---- GetAttestationEvidence ---------------------------------------
+
+message GetAttestationEvidenceRequest {
+  string workspace_id = 1;
+  bytes nonce = 2;            // 16..=64 bytes; runtime validates
+}
+message GetAttestationEvidenceResponse {
+  AttestationEvidence evidence = 1;
+}
+message AttestationEvidence {
+  string provider_type = 1;  // "software" (sev_snp / tdx reserved)
+  string workspace_id = 2;
+  bytes measurement = 3;     // 32 bytes
+  bytes nonce = 4;
+  int64 issued_at = 5;
+  bytes report_data = 6;
+  AttestationProof proof = 7;
+}
+message AttestationProof {
+  // Software proof. Hardware proof fields are reserved for later.
+  bytes signature = 1;       // 64 bytes (software)
+  bytes signer_pubkey = 2;   // 32 bytes (software)
+  // SEV-SNP firmware Attestation Report (provider_type "sev_snp").
+  bytes sev_snp_report = 3;     // firmware Attestation Report (sev_snp)
+  bytes sev_snp_vcek_chain = 4; // VCEK cert chain, DER leaf-first (sev_snp)
+}

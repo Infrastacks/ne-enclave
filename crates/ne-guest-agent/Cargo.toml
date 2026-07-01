@@ -1,0 +1,37 @@
+[package]
+name = "ne-guest-agent"
+description = "NeuronEdge Enclave guest agent — runs inside the microVM, reachable from the host over vsock."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ne-guest-agent"
+path = "src/main.rs"
+
+[dependencies]
+ne-protocol = { path = "../ne-protocol" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = { workspace = true }
+libc = "0.2"
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

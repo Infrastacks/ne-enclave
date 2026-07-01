@@ -1,0 +1,21 @@
+# clippy configuration for the NeuronEdge Enclave workspace.
+# Identifiers that appear in doc comments and are valid as-is (brand names,
+# standard acronyms, binary-size units). Registered here rather than backticked
+# ad nauseam because these are names/units, not code identifiers.
+doc-valid-idents = [
+    "NeuronEdge",
+    "Firecracker",
+    "OpenShell",
+    "Infrastacks",
+    "GitHub",
+    "IPv4",
+    "IPv6",
+    "MiB",
+    "GiB",
+    "KiB",
+    "TiB",
+    "macOS",
+    "Linux",
+    "GitHub",
+    "OAuth",
+]

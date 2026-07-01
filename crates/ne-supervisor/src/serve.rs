@@ -1,0 +1,415 @@
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! Library entrypoint for the privileged supervisor. The `nee` CLI
+//! builds a [`SupervisorConfig`] from flags/env and calls [`serve`].
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+
+use crate::audit::AuditLog;
+use crate::command::Dispatcher;
+use crate::ipc::{IpcServer, PeerAuth};
+use crate::workspace::{WorkspaceManager, WorkspaceManagerConfig};
+
+/// Resolved supervisor configuration (mirrors the historical
+/// `ne-supervisor` CLI flags 1:1 so behavior is unchanged).
+#[derive(Debug, Clone)]
+pub struct SupervisorConfig {
+    /// Path to the unix domain socket the API daemon connects on.
+    pub socket: PathBuf,
+    /// Expected UID of the API daemon. Required in production.
+    pub expected_peer_uid: Option<u32>,
+    /// Disable peer-credential authentication (STANDARDS §4.2).
+    pub dev_mode: bool,
+    /// Absolute host path to the Firecracker binary.
+    pub firecracker_binary: PathBuf,
+    /// Absolute host path to the jailer binary.
+    pub jailer_binary: PathBuf,
+    /// Base directory under which jailer creates per-workspace chroots.
+    pub jailer_chroot_base: PathBuf,
+    /// UID that jailer drops Firecracker to.
+    pub jailer_uid: u32,
+    /// GID that jailer drops Firecracker to.
+    pub jailer_gid: u32,
+    /// Path to the `openshell-sandbox` binary (confidential tier, B). Unused on
+    /// the standard (Firecracker) tier.
+    pub openshell_sandbox_binary: PathBuf,
+    /// Milliseconds to wait for Firecracker's API socket to appear.
+    pub api_socket_timeout_ms: u64,
+    /// Persistent state directory (audit signing keys + JSONL audit log).
+    pub state_dir: PathBuf,
+    /// Enable per-workspace network plumbing (netns + veth + TAP + MASQUERADE).
+    pub enable_networking: bool,
+    /// Path to the `ip` binary (iproute2).
+    pub ip_binary: PathBuf,
+    /// Path to the `iptables` binary.
+    pub iptables_binary: PathBuf,
+    /// Upstream interface MASQUERADE rules use for egress.
+    pub upstream_iface: String,
+    /// Optional path to the `ne-dns-filter` binary.
+    pub dns_filter_binary: Option<PathBuf>,
+    /// Upstream resolver the per-workspace DNS filter forwards allowed queries to.
+    pub dns_upstream: String,
+    /// Optional path to the `ne-privacy-router` binary.
+    pub privacy_router_binary: Option<PathBuf>,
+    /// Path to the host-global PII policy YAML the privacy router enforces.
+    pub privacy_router_policy: Option<PathBuf>,
+    /// Warm-pool tier name (enables the pool with the next two).
+    pub warm_pool_tier: Option<String>,
+    /// Base snapshot id pool members are forked from.
+    pub warm_pool_snapshot: Option<String>,
+    /// Target pool size (0 disables the pool).
+    pub warm_pool_size: usize,
+    /// Max concurrent in-flight provisions during refill.
+    pub warm_pool_max_in_flight: usize,
+    /// Ingress domain (e.g. `apps.example.com`). Enables the in-process
+    /// ingress edge when set.
+    pub ingress_domain: Option<String>,
+    /// TCP address the ingress edge listens on.
+    pub ingress_listen: SocketAddr,
+    /// Maximum concurrent in-flight ingress connections (flood backstop, audit
+    /// `S7-F2`). Excess connections wait in the kernel accept backlog.
+    pub ingress_max_connections: usize,
+    /// Path to the ingress TLS certificate chain (PEM).
+    pub ingress_tls_cert: Option<PathBuf>,
+    /// Path to the ingress TLS private key (PEM).
+    pub ingress_tls_key: Option<PathBuf>,
+}
+
+impl SupervisorConfig {
+    /// Resolve the peer-auth mode, refusing to start in production mode
+    /// without an expected peer uid (STANDARDS §4.2).
+    pub fn resolve_auth(&self) -> Result<PeerAuth> {
+        match (self.dev_mode, self.expected_peer_uid) {
+            (true, _) => Ok(PeerAuth::DevDisabled),
+            (false, Some(uid)) => Ok(PeerAuth::RequireUid(uid)),
+            (false, None) => anyhow::bail!(
+                "refusing to start: production mode requires --expected-peer-uid; pass \
+                 --dev-mode for local development (STANDARDS §4.2)"
+            ),
+        }
+    }
+}
+
+/// Adapts the supervisor's [`AuditLog`] to the [`ne_ingress::AuditSink`]
+/// interface so ingress routing decisions land in the signed audit chain.
+#[cfg(target_os = "linux")]
+struct SupervisorIngressAudit {
+    audit: AuditLog,
+}
+
+#[cfg(target_os = "linux")]
+impl ne_ingress::AuditSink for SupervisorIngressAudit {
+    fn route_allowed(&self, host: &str, wsid: &str, port: u16) {
+        let audit = self.audit.clone();
+        let (host, wsid) = (host.to_string(), wsid.to_string());
+        tokio::spawn(async move {
+            let _ = audit
+                .emit(
+                    ne_protocol::audit::EventType::IngressRouteAllowed,
+                    Some(wsid),
+                    serde_json::json!({ "host": host, "port": port }),
+                )
+                .await;
+        });
+    }
+
+    fn route_denied(&self, host: &str, reason: ne_ingress::DenyReason) {
+        let audit = self.audit.clone();
+        let host = host.to_string();
+        let reason = reason.as_str().to_string();
+        tokio::spawn(async move {
+            let _ = audit
+                .emit(
+                    ne_protocol::audit::EventType::IngressRouteDenied,
+                    None,
+                    serde_json::json!({ "host": host, "reason": reason }),
+                )
+                .await;
+        });
+    }
+}
+
+/// Assemble and run the supervisor. The caller initializes tracing and
+/// installs the parent-death signal.
+pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
+    tracing::info!(
+        socket = %cfg.socket.display(),
+        dev_mode = cfg.dev_mode,
+        firecracker = %cfg.firecracker_binary.display(),
+        jailer = %cfg.jailer_binary.display(),
+        "ne-supervisor starting"
+    );
+
+    let auth = cfg.resolve_auth()?;
+
+    let audit = AuditLog::open(&cfg.state_dir)
+        .await
+        .context("opening audit log + signing key under --state-dir")?;
+
+    #[cfg(target_os = "linux")]
+    let network = if cfg.enable_networking {
+        Some(crate::network::NetworkController::new(
+            cfg.ip_binary.clone(),
+            cfg.iptables_binary.clone(),
+            cfg.upstream_iface.clone(),
+            cfg.dns_filter_binary.clone(),
+            cfg.dns_upstream.clone(),
+            cfg.privacy_router_binary.clone(),
+            cfg.privacy_router_policy.clone(),
+            // Pass the supervisor's audit log into the controller
+            // so DNS + privacy decisions land in the signed chain
+            // alongside workspace lifecycle events.
+            Some(audit.clone()),
+        ))
+    } else {
+        None
+    };
+
+    // Warm pool is enabled only when tier + snapshot + size>0 are all present.
+    #[cfg(target_os = "linux")]
+    let warm_pool = match (
+        &cfg.warm_pool_tier,
+        &cfg.warm_pool_snapshot,
+        cfg.warm_pool_size,
+    ) {
+        (Some(tier), Some(snapshot), size) if size > 0 => Some(crate::pool::WarmPoolConfig {
+            tier_name: tier.clone(),
+            base_snapshot_id: snapshot.clone(),
+            target_size: size,
+            max_in_flight: cfg.warm_pool_max_in_flight.max(1),
+        }),
+        (None, None, 0) => None,
+        _ => anyhow::bail!(
+            "incomplete warm-pool config: set --warm-pool-tier, --warm-pool-snapshot, and --warm-pool-size together"
+        ),
+    };
+
+    // Attestation provider selection + fail-closed gate.
+    //
+    // Two decisions, in order:
+    //   1. Confidential mode (NE_CONFIDENTIAL_MODE + CVM hardware present)
+    //      selects the firmware-rooted SEV-SNP provider. "CVM present" is
+    //      `/dev/sev-guest` (GCP/bare-metal/AWS) OR `/dev/tpmrm0` (Azure
+    //      OpenHCL paravisor — Wedge 5 proved `/dev/sev-guest` is absent on
+    //      DCasv5; the vTPM is the CVM signal there). A request for confidential
+    //      mode WITHOUT either is fatal — a confidential deployment never
+    //      silently falls back to software attestation.
+    //   2. Otherwise the software-fallback provider is used, gated by the
+    //      existing `software_provider_allowed` prod-gate (dev mode OR an
+    //      explicit NE_ATTEST_ALLOW_SOFTWARE opt-in). The gate only fires on
+    //      the software path so a confidential deployment isn't required to
+    //      also set the software opt-in.
+    let allow_software_attestation = std::env::var("NE_ATTEST_ALLOW_SOFTWARE").is_ok();
+    let confidential = std::env::var("NE_CONFIDENTIAL_MODE").is_ok();
+    let sev_present = cfg!(target_os = "linux") && std::path::Path::new("/dev/sev-guest").exists();
+    let vtpm_present = cfg!(target_os = "linux") && std::path::Path::new("/dev/tpmrm0").exists();
+    let cvm_present = crate::workspace::cvm_hardware_present(sev_present, vtpm_present);
+    if crate::workspace::refuse_software_in_confidential_mode(confidential, cvm_present) {
+        anyhow::bail!(
+            "confidential mode requested (NE_CONFIDENTIAL_MODE) but no CVM hardware is present \
+             (neither /dev/sev-guest nor /dev/tpmrm0); refusing to start — a confidential \
+             deployment cannot fall back to software attestation"
+        );
+    }
+    let attestation_profile = if confidential && cvm_present {
+        crate::workspace::AttestationProfile::SevSnp
+    } else {
+        crate::workspace::AttestationProfile::Software
+    };
+    // The software-fallback provider is not firmware-rooted, so it must fail
+    // closed outside dev unless the operator explicitly opts in. Only enforced
+    // on the software path — a confidential (SEV-SNP) deployment bypasses it.
+    if matches!(
+        attestation_profile,
+        crate::workspace::AttestationProfile::Software
+    ) && !ne_attestation::software_provider_allowed(cfg.dev_mode, allow_software_attestation)
+    {
+        anyhow::bail!(
+            "software attestation refused: not in dev mode and \
+             NE_ATTEST_ALLOW_SOFTWARE is not set. Set it to explicitly permit \
+             non-firmware-rooted (software) attestation in this deployment, or \
+             configure a hardware attestation provider."
+        );
+    }
+
+    let workspaces = Arc::new(
+        WorkspaceManager::new(
+            WorkspaceManagerConfig {
+                firecracker_binary: cfg.firecracker_binary,
+                jailer_binary: cfg.jailer_binary,
+                chroot_base: cfg.jailer_chroot_base,
+                jailer_uid: cfg.jailer_uid,
+                jailer_gid: cfg.jailer_gid,
+                openshell_sandbox_binary: cfg.openshell_sandbox_binary,
+                api_socket_timeout: Duration::from_millis(cfg.api_socket_timeout_ms),
+                default_kernel_boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_string(),
+                attestation_profile,
+                #[cfg(target_os = "linux")]
+                network,
+                state_dir: cfg.state_dir,
+                #[cfg(target_os = "linux")]
+                warm_pool,
+            },
+            audit.clone(),
+        )
+        .context("construct workspace manager")?,
+    );
+    let dispatcher = Arc::new(Dispatcher::new(Arc::clone(&workspaces), audit.clone()));
+    #[cfg(target_os = "linux")]
+    workspaces.spawn_refill();
+
+    // Spawn the in-process ingress edge when an ingress domain is configured.
+    // The task runs until aborted at shutdown; bind failures are fatal.
+    #[cfg(target_os = "linux")]
+    let ingress_task: Option<tokio::task::JoinHandle<()>> = if let Some(domain) =
+        cfg.ingress_domain.clone()
+    {
+        let registry = workspaces.ingress_registry();
+        let audit_sink: Arc<dyn ne_ingress::AuditSink> = Arc::new(SupervisorIngressAudit {
+            audit: audit.clone(),
+        });
+        let mut router_cfg = ne_ingress::RouterConfig::new(domain);
+        router_cfg.max_connections = cfg.ingress_max_connections;
+        let router = ne_ingress::IngressRouter::new(registry, router_cfg, audit_sink);
+        let listener = tokio::net::TcpListener::bind(cfg.ingress_listen)
+            .await
+            .context("bind ingress listener")?;
+        match (cfg.ingress_tls_cert.as_ref(), cfg.ingress_tls_key.as_ref()) {
+            (Some(cert), Some(key)) => {
+                let tls = ne_ingress::tls::load_server_config(cert, key)
+                    .context("load ingress TLS cert/key")?;
+                tracing::info!(
+                    listen = %cfg.ingress_listen,
+                    domain = %cfg.ingress_domain.as_deref().unwrap_or(""),
+                    "ingress edge: HTTPS"
+                );
+                Some(tokio::spawn(router.serve_tls(listener, tls)))
+            }
+            // Fail closed: a partial TLS config must never silently serve
+            // plaintext on the ingress port.
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "ingress TLS requires BOTH --ingress-tls-cert and --ingress-tls-key (or neither for plaintext)"
+                );
+            }
+            (None, None) => {
+                ne_ingress::tls::plaintext_listener_allowed(cfg.ingress_listen.ip(), cfg.dev_mode)
+                    .context("plaintext ingress guard")?;
+                tracing::warn!(
+                    listen = %cfg.ingress_listen,
+                    "ingress edge: PLAINTEXT (no TLS cert configured)"
+                );
+                Some(tokio::spawn(router.serve_plaintext(listener)))
+            }
+        }
+    } else {
+        None
+    };
+
+    let server = IpcServer::bind(&cfg.socket, auth)
+        .await
+        .context("binding supervisor IPC socket")?;
+
+    // Socket is bound + listening: tell systemd (Type=notify) we're ready.
+    // Best-effort: outside a notify-socket environment this is a no-op.
+    if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        tracing::debug!("sd_notify READY failed (not under systemd notify?): {e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+        let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+        tokio::select! {
+            r = server.serve(dispatcher) => {
+                r.context("supervisor IPC server terminated with error")?;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received — reaping warm pool");
+                workspaces.shutdown_pool().await;
+            }
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT received — reaping warm pool");
+                workspaces.shutdown_pool().await;
+            }
+        }
+        // Abort the ingress edge on shutdown (it loops forever until cancelled).
+        if let Some(t) = ingress_task {
+            t.abort();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    server
+        .serve(dispatcher)
+        .await
+        .context("supervisor IPC server terminated with error")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> SupervisorConfig {
+        SupervisorConfig {
+            socket: "/run/ne-enclave/supervisor.sock".into(),
+            expected_peer_uid: None,
+            dev_mode: false,
+            firecracker_binary: "/opt/ne-enclave/bin/firecracker".into(),
+            jailer_binary: "/opt/ne-enclave/bin/jailer".into(),
+            jailer_chroot_base: "/srv/jailer".into(),
+            jailer_uid: 1000,
+            jailer_gid: 1000,
+            openshell_sandbox_binary: "/opt/ne-enclave/bin/openshell-sandbox".into(),
+            api_socket_timeout_ms: 10_000,
+            state_dir: "/var/lib/ne-enclave".into(),
+            enable_networking: false,
+            ip_binary: "/usr/sbin/ip".into(),
+            iptables_binary: "/usr/sbin/iptables".into(),
+            upstream_iface: "eth0".into(),
+            dns_filter_binary: None,
+            dns_upstream: "1.1.1.1:53".into(),
+            privacy_router_binary: None,
+            privacy_router_policy: None,
+            warm_pool_tier: None,
+            warm_pool_snapshot: None,
+            warm_pool_size: 0,
+            warm_pool_max_in_flight: 2,
+            ingress_domain: None,
+            ingress_listen: "0.0.0.0:443".parse().unwrap(),
+            ingress_max_connections: 1024,
+            ingress_tls_cert: None,
+            ingress_tls_key: None,
+        }
+    }
+
+    #[test]
+    fn prod_without_peer_uid_is_rejected() {
+        let err = base().resolve_auth().expect_err("must reject");
+        assert!(err.to_string().contains("expected-peer-uid"));
+    }
+
+    #[test]
+    fn prod_with_peer_uid_requires_that_uid() {
+        let mut c = base();
+        c.expected_peer_uid = Some(4242);
+        assert!(matches!(
+            c.resolve_auth().unwrap(),
+            PeerAuth::RequireUid(4242)
+        ));
+    }
+
+    #[test]
+    fn dev_mode_disables_peer_auth() {
+        let mut c = base();
+        c.dev_mode = true;
+        assert!(matches!(c.resolve_auth().unwrap(), PeerAuth::DevDisabled));
+    }
+}

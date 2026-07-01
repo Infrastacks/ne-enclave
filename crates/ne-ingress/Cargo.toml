@@ -1,0 +1,33 @@
+[package]
+name = "ne-ingress"
+description = "NeuronEdge Enclave host-based ingress edge — L7 reverse proxy routing {port}-{workspace_id}.{ingress_domain} to in-guest services."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "ne_ingress"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+hyper = { version = "1.6", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client", "client-legacy", "http1"] }
+http-body-util = "0.1"
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }

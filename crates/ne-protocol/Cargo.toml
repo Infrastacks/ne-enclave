@@ -1,0 +1,38 @@
+[package]
+name = "ne-protocol"
+description = "Shared types and protocol definitions for NeuronEdge Enclave runtime and control plane."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Opt-in feature that compiles the gRPC server / client stubs from
+# proto/ne/v1/. Off by default so non-Rust SDKs (Python, TS)
+# that only need the JSON wire schema don't pay the tonic cost.
+grpc = ["dep:prost", "dep:tonic"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+prost = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+ne-attestation = { path = "../ne-attestation" }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

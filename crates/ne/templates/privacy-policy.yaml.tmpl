@@ -1,0 +1,36 @@
+# Default PII policy for the NeuronEdge Enclave privacy router.
+#
+# This file is the host-global policy the supervisor hands to every
+# per-workspace `ne-privacy-router` it spawns (for workspaces that opt in
+# via `enable_privacy_router`). It is installed to
+# /etc/ne-enclave/privacy-policy.yaml by `nee install` and is intentionally
+# operator-editable: re-running install will NOT overwrite your changes.
+#
+# Enforcement actions (per entity, or as the global fallback):
+#   audit  - log the detection, forward the payload unchanged (observe-only)
+#   redact - replace the detected span with a truncated-SHA-256 token
+#   block  - reject the request (HTTP 403)
+#
+# The shipped default is `redact` as the fallback: every PII entity the
+# detection engine recognises is scrubbed from LLM egress. This delivers the
+# headline "PII-guarded execution" guarantee for opt-in workspaces while
+# keeping traffic flowing (the request is forwarded, just scrubbed). To observe
+# before enforcing, change `enforcement` to `audit`; to harden, set
+# high-sensitivity entities to `block`.
+#
+# Per-entity overrides (keys are snake_case EntityType names, e.g. `ssn`,
+# `credit_card`, `email`, `aws_access_key`, `jwt`). Unlisted entities fall
+# back to `enforcement`. See the THREAT-MODEL for the full detection surface.
+#
+# entities:
+#   ssn: block
+#   credit_card: redact
+#   aws_access_key: block
+#
+# Custom patterns (operator-defined regex):
+# custom_patterns:
+#   - name: employee_id
+#     pattern: "EMP-\\d{6}"
+#     action: redact
+
+enforcement: redact

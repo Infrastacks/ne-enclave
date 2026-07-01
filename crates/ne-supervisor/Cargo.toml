@@ -1,0 +1,84 @@
+[package]
+name = "ne-supervisor"
+description = "Privileged supervisor for NeuronEdge Enclave workspaces (Firecracker microVM lifecycle, host resource management)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "ne_supervisor"
+path = "src/lib.rs"
+
+# Confidential tier (single-CVM-direct, B). Default off so the standard
+# (Firecracker) build is byte-identical. When enabled on Linux, pulls in
+# `russh` for SSH control of spawned OpenShell sandboxes. OpenShell itself
+# is NOT a Cargo dependency — the supervisor spawns the `openshell-sandbox`
+# binary as a subprocess (see `src/openshell.rs`, R1 spec §3.2).
+[features]
+default = []
+confidential-cvm = ["dep:russh", "dep:russh-sftp", "dep:async-trait", "dep:pkcs8"]
+
+[dependencies]
+ne-protocol = { path = "../ne-protocol" }
+ne-ingress = { path = "../ne-ingress" }
+# `kds` enables ne-attestation's live AMD KDS VCEK fetcher (`KdsVcekFetcher`),
+# used by the SEV-SNP provider branch in `workspace.rs` (Linux-gated path).
+# Cargo unifies features across targets, so `kds` is on for the whole build;
+# `KdsVcekFetcher` compiles on macOS but is only referenced in the
+# `cfg(target_os = "linux")` provider-construction block.
+ne-attestation = { path = "../ne-attestation", features = ["kds"] }
+ne-seal = { path = "../ne-seal" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+# Audit chain
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+# HMAC-SHA256 for the NSSH1 preface (pure, compiled on all platforms for tests).
+hmac = "0.12"
+ulid = { workspace = true }
+rand = { workspace = true }
+
+sd-notify = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+caps = { workspace = true }
+# SSH client to control spawned OpenShell sandboxes (confidential tier, B).
+# Pinned to 0.57 (matches the OpenShell fork's russh for SSH-protocol parity;
+# the NSSH1 preface is SSH-version-independent — sent before negotiation).
+# Linux-only (the netns/SSH path never applies off-Linux) and gated behind
+# the `confidential-cvm` feature so the standard build pulls nothing extra.
+russh = { version = "0.57", optional = true }
+# SFTP client (file transfer to/from the sandbox) — companion to russh.
+russh-sftp = { version = "2.3", optional = true }
+# async_trait for the russh::client::Handler impl (confidential-cvm only).
+async-trait = { version = "0.1", optional = true }
+# Pin pkcs8 to 0.11.0-rc.11 (not the stable 0.11.0): russh 0.57's internal
+# ssh-key pulls rsa 0.10.0-rc.12, which expects pkcs8's KeyMalformed as a unit
+# variant (true in 0.11.0-rc.11; the stable 0.11.0 made it a tuple variant,
+# breaking the rsa pre-release). OpenShell's fork builds clean with this pin.
+pkcs8 = { version = "=0.11.0-rc.11", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Note: the integration tests (dns_filter_e2e, firecracker_lifecycle,
+# run_command_e2e) spawn the fused `nee` binary. Since `nee` is a
+# bin-only crate, Cargo does not expose CARGO_BIN_EXE_nee through a
+# dev-dependency, so the tests resolve the binary path from
+# CARGO_MANIFEST_DIR at runtime instead.

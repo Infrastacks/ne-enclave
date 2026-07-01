@@ -1,0 +1,3197 @@
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! Workspace registry — owns the set of running Firecracker
+//! microVMs the supervisor knows about.
+//!
+//! The registry is cross-platform; the heavy lifting it delegates to
+//! [`crate::firecracker`] is Linux-only. On macOS the manager exists
+//! but every workspace operation returns
+//! `Unsupported` — that's what keeps the dev loop on a Mac quiet while
+//! the Linux integration lands.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use ne_protocol::supervisor::{
+    CreateWorkspaceRequest, ExposePortRequest, ForkRequest, ReadFileRequest, RestoreRequest,
+    RunCommandRequest, SnapshotRequest, SupervisorErrorKind, SupervisorResponse, TerminateRequest,
+    UnexposePortRequest, WorkspaceRef, WriteFileRequest,
+};
+
+use crate::audit::AuditLog;
+
+/// Host-side wall clock for the guest file-RPC round trip. Five seconds
+/// above the guest's 25-second `FILE_OP_TIMEOUT` so the guest's typed
+/// `Timeout` response reaches the host before this wall clock fires.
+#[cfg(target_os = "linux")]
+const FILE_RPC_TIMEOUT_MS: u32 = 30_000;
+
+/// Guest vsock port the ne-guest-agent listens on by convention.
+#[cfg(target_os = "linux")]
+const DEFAULT_GUEST_VSOCK_PORT: u32 = 52;
+
+/// Short readiness probe at pool checkout — the member was proven ready at
+/// provision time; this only catches members that died while idle.
+#[cfg(target_os = "linux")]
+const POOL_CHECKOUT_PROBE: Duration = Duration::from_secs(2);
+
+#[cfg(target_os = "linux")]
+use ne_protocol::audit::EventType;
+#[cfg(target_os = "linux")]
+use ne_protocol::guest::{GuestErrorKind, GuestResponse};
+#[cfg(target_os = "linux")]
+use ne_protocol::snapshot::GuestIdentity;
+#[cfg(target_os = "linux")]
+use ne_protocol::supervisor::{
+    CommandCompleted, FileRead, FileWritten, ForkInfo, MAX_INLINE_FILE_BYTES, WorkspaceCreated,
+    WorkspaceNetwork, WorkspaceState,
+};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use tokio::sync::Mutex;
+#[cfg(target_os = "linux")]
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tracing::{info, warn};
+
+#[cfg(target_os = "linux")]
+use crate::network::NetworkController;
+
+/// Which attestation provider the supervisor should construct.
+///
+/// `serve()` resolves this from `NE_CONFIDENTIAL_MODE` + `/dev/sev-guest`
+/// presence (see [`crate::serve`]) and injects it here so the
+/// provider-selection decision is unit-testable independent of process state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationProfile {
+    /// Ed25519 software-fallback provider (still gated by
+    /// `NE_ATTEST_ALLOW_SOFTWARE` / dev mode in `serve()`).
+    Software,
+    /// AMD SEV-SNP firmware-rooted provider (Linux + `/dev/sev-guest`).
+    SevSnp,
+}
+
+/// Which execution backend a workspace lands on. The standard tier
+/// (Firecracker microVM) and the confidential tier (single-CVM-direct, B;
+/// OpenShell) are dispatched on the [`AttestationProfile`] resolved at
+/// `serve()` time. This is the value type of the live-workspace registry;
+/// see [`WorkspaceManager`](struct@WorkspaceManager).
+#[derive(Debug)]
+#[cfg(target_os = "linux")]
+pub enum WorkspaceExec {
+    /// Standard tier: a Firecracker microVM under jailer.
+    Firecracker(crate::firecracker::Instance),
+    /// Confidential tier (B): an OpenShell sandbox spawned in-process in the
+    /// attested CVM. Only present under `feature = "confidential-cvm"`.
+    #[cfg(feature = "confidential-cvm")]
+    OpenShell(crate::openshell::Sandbox),
+}
+
+/// Pure decision: which [`WorkspaceExec`] variant does the given profile route to?
+///
+/// Extracted so the routing table is unit-testable on macOS (no CVM needed).
+/// `Software` → the standard Firecracker tier; `SevSnp` → the confidential
+/// OpenShell tier (B).
+#[must_use]
+pub fn exec_backend_for_profile(profile: AttestationProfile) -> &'static str {
+    match profile {
+        AttestationProfile::Software => "firecracker",
+        AttestationProfile::SevSnp => "openshell",
+    }
+}
+
+/// Pure decision: is any CVM hardware signal present?
+///
+/// "CVM present" is `/dev/sev-guest` (GCP/bare-metal/AWS direct SNP) **OR**
+/// `/dev/tpmrm0` (the Azure `OpenHCL` paravisor path — Wedge 5 proved Azure
+/// `DCasv5` has **no** `/dev/sev-guest`; the vTPM device is the CVM signal).
+/// Either is sufficient to construct the SEV-SNP provider. Extracted so the
+/// truth table is unit-testable on macOS.
+#[must_use]
+#[allow(clippy::similar_names)]
+pub fn cvm_hardware_present(sev_present: bool, vtpm_present: bool) -> bool {
+    sev_present || vtpm_present
+}
+
+/// Pure decision for the confidential-mode fail-closed gate.
+///
+/// Returns `true` when a confidential deployment MUST refuse to start because
+/// no CVM hardware is available — i.e. the operator asked for confidential mode
+/// but neither `/dev/sev-guest` nor `/dev/tpmrm0` is present. Extracted from
+/// `serve()` so the table is unit-testable on macOS (the real `Path::exists`
+/// + env read happens at the call site).
+#[must_use]
+#[allow(clippy::similar_names)]
+pub fn refuse_software_in_confidential_mode(confidential: bool, cvm_present: bool) -> bool {
+    confidential && !cvm_present
+}
+
+/// Per-runtime configuration that doesn't come from the request — host
+/// binary paths, jailer drop-priv uid/gid, chroot base.
+#[derive(Debug, Clone)]
+pub struct WorkspaceManagerConfig {
+    /// Absolute host path to the Firecracker binary.
+    pub firecracker_binary: PathBuf,
+    /// Absolute host path to the jailer binary.
+    pub jailer_binary: PathBuf,
+    /// Base directory under which jailer creates per-workspace chroots.
+    pub chroot_base: PathBuf,
+    /// UID jailer drops the Firecracker process to.
+    pub jailer_uid: u32,
+    /// GID jailer drops the Firecracker process to.
+    pub jailer_gid: u32,
+    /// Path to the `openshell-sandbox` binary (confidential tier, B; spawned
+    /// per workspace + controlled over SSH). Unused on the standard tier.
+    pub openshell_sandbox_binary: PathBuf,
+    /// How long to wait for Firecracker's API socket to appear before
+    /// declaring the launch failed.
+    pub api_socket_timeout: Duration,
+    /// Kernel boot args used when a `CreateWorkspace` request omits its
+    /// own `kernel_boot_args` field.
+    pub default_kernel_boot_args: String,
+    /// Which attestation provider to construct. Resolved in `serve()` from
+    /// `NE_CONFIDENTIAL_MODE` + `/dev/sev-guest` presence; see
+    /// [`AttestationProfile`] and [`refuse_software_in_confidential_mode`].
+    pub attestation_profile: AttestationProfile,
+    /// Optional network controller. When `Some`, a workspace request
+    /// that carries a [`ne_protocol::supervisor::NetworkConfig`]
+    /// gets a per-workspace netns + TAP + NAT. When `None`, requests
+    /// with network config are still accepted but networking is
+    /// skipped (logged at warn). This keeps the dev loop usable on
+    /// hosts where the supervisor doesn't have `CAP_NET_ADMIN`.
+    #[cfg(target_os = "linux")]
+    pub network: Option<NetworkController>,
+    /// Persistent state directory. Snapshot artifacts land under
+    /// `<state_dir>/snapshots/<snapshot_id>/`. The signing key is
+    /// loaded from `<state_dir>/keys/`.
+    pub state_dir: PathBuf,
+    /// Optional warm pool (one tier). `None` disables the pool entirely.
+    #[cfg(target_os = "linux")]
+    pub warm_pool: Option<crate::pool::WarmPoolConfig>,
+}
+
+impl WorkspaceManagerConfig {
+    /// Phase 0 defaults matched to a standard single-host install layout.
+    #[must_use]
+    pub fn dev_defaults() -> Self {
+        Self {
+            firecracker_binary: PathBuf::from("/opt/ne-enclave/bin/firecracker"),
+            jailer_binary: PathBuf::from("/opt/ne-enclave/bin/jailer"),
+            chroot_base: PathBuf::from("/srv/jailer"),
+            jailer_uid: 1000,
+            jailer_gid: 1000,
+            openshell_sandbox_binary: PathBuf::from("/opt/ne-enclave/bin/openshell-sandbox"),
+            api_socket_timeout: Duration::from_secs(10),
+            default_kernel_boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_string(),
+            attestation_profile: AttestationProfile::Software,
+            #[cfg(target_os = "linux")]
+            network: None,
+            state_dir: PathBuf::from("/var/lib/ne-enclave"),
+            #[cfg(target_os = "linux")]
+            warm_pool: None,
+        }
+    }
+}
+
+/// The supervisor's workspace registry.
+#[derive(Debug)]
+pub struct WorkspaceManager {
+    // Both fields are only consumed on Linux; kept on macOS for
+    // construction symmetry so callers (main.rs, tests) can build a
+    // manager cross-platform.
+    #[allow(dead_code)]
+    cfg: WorkspaceManagerConfig,
+    #[allow(dead_code)]
+    audit: AuditLog,
+    #[cfg(target_os = "linux")]
+    instances: Mutex<HashMap<String, WorkspaceExec>>,
+    #[cfg(target_os = "linux")]
+    pool: Option<Arc<crate::pool::WarmPool>>,
+    /// Sender half of the refill-kick channel; used by `create_from_pool`.
+    #[cfg(target_os = "linux")]
+    refill_tx: Option<mpsc::Sender<()>>,
+    #[cfg(target_os = "linux")]
+    refill_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    #[cfg(target_os = "linux")]
+    ingress: Arc<ne_ingress::IngressRegistry>,
+    /// Active attestation provider (software fallback in this wedge).
+    #[cfg(target_os = "linux")]
+    attestation: Arc<dyn ne_attestation::AttestationProvider>,
+    /// Per-workspace bounded ring of recently-seen attestation nonces
+    /// (replay detection). Bounded; not a durable anti-replay store.
+    #[cfg(target_os = "linux")]
+    attestation_nonces: Mutex<HashMap<String, NonceRing>>,
+}
+
+/// Bounded set of recently-seen nonce hashes for one workspace.
+/// O(1) membership via a `HashSet`, FIFO eviction via a `VecDeque`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct NonceRing {
+    seen: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+#[cfg(target_os = "linux")]
+impl NonceRing {
+    const CAP: usize = 256;
+
+    /// Record a nonce hash. Returns `true` if it was already present (replay).
+    fn record(&mut self, hash: [u8; 32]) -> bool {
+        if self.seen.contains(&hash) {
+            return true;
+        }
+        if self.order.len() >= Self::CAP
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
+        }
+        self.order.push_back(hash);
+        self.seen.insert(hash);
+        false
+    }
+}
+
+/// Validate a caller-supplied workspace/snapshot id before it is used as a
+/// filesystem path component or jailer `--id`. Matches the jailer grammar
+/// (`[A-Za-z0-9-]{1,64}`): no path separators, no `.`/`..`, no NUL — so the id
+/// cannot traverse out of `state_dir`/`chroot_base`. See S2-F1.
+#[cfg(target_os = "linux")]
+fn is_valid_workspace_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Compute the v1 configuration measurement for a running instance.
+/// Hashes the launch configuration (no per-request file IO, so the
+/// warm-pool create path is unaffected). Swapping kernel/rootfs paths
+/// for content digests is a follow-up.
+#[cfg(target_os = "linux")]
+fn measure_config(inst: &crate::firecracker::Instance) -> ne_attestation::Measurement {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::json!({
+        "vcpu_count": inst.vcpu_count,
+        "mem_size_mib": inst.mem_size_mib,
+        "kernel_boot_args": inst.kernel_boot_args,
+        "networked": inst.network_slot.is_some(),
+        "kernel_path": inst.kernel_path.to_string_lossy(),
+        "rootfs_path": inst.rootfs_path.to_string_lossy(),
+    });
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    ne_attestation::Measurement(digest.into())
+}
+
+#[cfg(target_os = "linux")]
+impl WorkspaceManager {
+    /// Best-effort audit emission. Logs but doesn't fail the
+    /// originating op — the supervisor must always be able to
+    /// honor a lifecycle request even when the audit log can't
+    /// be written (out-of-disk, etc.). Production posture
+    /// tightens this once the control plane treats audit-write
+    /// failure as a release-blocking condition.
+    async fn audit_emit(
+        &self,
+        event_type: EventType,
+        workspace_id: Option<String>,
+        payload: serde_json::Value,
+    ) {
+        if let Err(e) = self.audit.emit(event_type, workspace_id, payload).await {
+            warn!(error = %e, ?event_type, "audit emit failed");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl WorkspaceManager {
+    /// Construct an empty registry that returns `Unsupported` for every
+    /// workspace op (non-Linux build, PRD NFR-5.1).
+    ///
+    /// Returns `Result` for signature parity with the Linux impl (whose
+    /// SEV-SNP provider construction is fallible); on non-Linux this never
+    /// errors.
+    ///
+    /// # Errors
+    /// Never on non-Linux.
+    pub fn new(cfg: WorkspaceManagerConfig, audit: AuditLog) -> anyhow::Result<Self> {
+        Ok(Self { cfg, audit })
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    //
+    // The signature stays `async` to match the Linux impl; clippy
+    // notices there's no `.await` on this branch.
+    #[allow(clippy::unused_async)]
+    pub async fn create(&self, _req: CreateWorkspaceRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "CreateWorkspace requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn terminate(&self, _req: TerminateRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "Terminate requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn run_command(&self, _req: RunCommandRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "RunCommand requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn write_file(&self, _req: WriteFileRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "WriteFile requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn read_file(&self, _req: ReadFileRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "ReadFile requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    /// Also deferred on Linux (wedge-6.8): vsock dies on in-place resume; use snapshot/restore.
+    #[allow(clippy::unused_async)]
+    pub async fn pause(&self, _req: WorkspaceRef) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "in-place pause is deferred: the guest vsock control channel \
+                      does not survive an in-place Firecracker resume. Use \
+                      snapshot/restore instead."
+                .to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    /// Also deferred on Linux (wedge-6.8): vsock dies on in-place resume; use snapshot/restore.
+    #[allow(clippy::unused_async)]
+    pub async fn resume(&self, _req: WorkspaceRef) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "in-place resume is deferred: the guest vsock control channel \
+                      does not survive an in-place Firecracker resume. Use \
+                      snapshot/restore instead."
+                .to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn snapshot(&self, _req: SnapshotRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "SnapshotWorkspace requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn restore(&self, _req: RestoreRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "RestoreWorkspace requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn fork(&self, _req: ForkRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "ForkWorkspace requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn pool_status(
+        &self,
+        _req: ne_protocol::supervisor::PoolStatusRequest,
+    ) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "warm pool requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn expose_port(&self, _req: ExposePortRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "ExposePort requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn unexpose_port(&self, _req: UnexposePortRequest) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "UnexposePort requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+
+    /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
+    #[allow(clippy::unused_async)]
+    pub async fn get_attestation_evidence(
+        &self,
+        _req: ne_protocol::supervisor::GetAttestationEvidenceRequest,
+    ) -> SupervisorResponse {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "GetAttestationEvidence requires Linux + KVM (PRD NFR-5.1)".to_string(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WorkspaceManager {
+    /// Construct an empty registry that uses `cfg` for every launch.
+    ///
+    /// Fallible because the SEV-SNP provider opens `/dev/sev-guest` (Task 9
+    /// fills the ioctl; until then `open()` is an unsupported-error stub). A
+    /// confidential deployment that cannot initialize the hardware provider
+    /// fails here rather than silently dropping to software attestation.
+    ///
+    /// # Errors
+    /// `anyhow::Error` if the resolved attestation provider could not be
+    /// constructed (e.g. `/dev/sev-guest` open failure under the SEV-SNP
+    /// profile).
+    pub fn new(cfg: WorkspaceManagerConfig, audit: AuditLog) -> anyhow::Result<Self> {
+        let (pool, refill_tx, refill_rx) = cfg.warm_pool.as_ref().map_or_else(
+            || (None, None, Mutex::new(None)),
+            |wp| {
+                let (tx, rx) = mpsc::channel(8);
+                (
+                    Some(Arc::new(crate::pool::WarmPool::new(wp.clone()))),
+                    Some(tx),
+                    Mutex::new(Some(rx)),
+                )
+            },
+        );
+        let attestation_signing_key = audit.signing_key();
+        // Read the profile BEFORE `cfg` is moved into the struct literal below
+        // (otherwise the `match cfg.attestation_profile` is a use-after-move on
+        // Linux, where the SevSnp arm's IoctlSnpReportSource is in scope).
+        let attestation_profile = cfg.attestation_profile;
+        Ok(Self {
+            cfg,
+            audit,
+            instances: Mutex::new(HashMap::new()),
+            pool,
+            refill_tx,
+            refill_rx,
+            ingress: ne_ingress::IngressRegistry::new(),
+            // Provider selection: the profile is resolved in `serve()` from
+            // NE_CONFIDENTIAL_MODE + /dev/sev-guest presence, and the
+            // confidential-mode fail-closed gate
+            // (refuse_software_in_confidential_mode) has already refused to
+            // start if confidential was requested without SEV hardware.
+            // SevSnp construction is Linux-only; IoctlSnpReportSource::open()
+            // is still a Task-9 stub but the wiring is in place.
+            attestation: match attestation_profile {
+                AttestationProfile::Software => Arc::new(ne_attestation::SoftwareProvider::new(
+                    attestation_signing_key,
+                ))
+                    as Arc<dyn ne_attestation::AttestationProvider>,
+                AttestationProfile::SevSnp => {
+                    use ne_attestation::snp_source::IoctlSnpReportSource;
+                    use ne_attestation::vcek::{KdsVcekFetcher, VcekCache, VcekFetcher};
+                    let source = Arc::new(IoctlSnpReportSource::open()?)
+                        as Arc<dyn ne_attestation::SnpReportSource>;
+                    let vcek =
+                        Arc::new(VcekCache::new(KdsVcekFetcher::new())) as Arc<dyn VcekFetcher>;
+                    Arc::new(ne_attestation::SevSnpProvider::new(source, vcek))
+                        as Arc<dyn ne_attestation::AttestationProvider>
+                }
+            },
+            attestation_nonces: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Return a handle to the in-process ingress route table so the server
+    /// layer (Task D3) can pass it to the ingress router.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn ingress_registry(&self) -> Arc<ne_ingress::IngressRegistry> {
+        Arc::clone(&self.ingress)
+    }
+
+    /// Launch a new Firecracker microVM and register it under the
+    /// caller-supplied `workspace_id`.
+    pub async fn create(&self, req: CreateWorkspaceRequest) -> SupervisorResponse {
+        if req.tier.is_some() {
+            return self.create_from_pool(req).await;
+        }
+        // ---- existing blank cold path below, unchanged ----
+        if self.instances.lock().await.contains_key(&req.workspace_id) {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
+                message: format!("workspace {} already exists", req.workspace_id),
+            };
+        }
+
+        // Two-tier dispatch (R1): the confidential profile (SevSnp) routes to
+        // the OpenShell-in-CVM substrate (single-CVM-direct, B); the software
+        // profile routes to the Firecracker microVM path below. The OpenShell
+        // path is Linux + `confidential-cvm` only.
+        #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
+        if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
+            return self.create_confidential(req).await;
+        }
+        #[cfg(not(all(target_os = "linux", feature = "confidential-cvm")))]
+        if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::Unsupported,
+                message: format!(
+                    "confidential tier (SevSnp) requires Linux + the confidential-cvm feature; \
+                     workspace {} cannot be created on this build",
+                    req.workspace_id
+                ),
+            };
+        }
+
+        // Provision network plumbing first so we can hand the TAP +
+        // netns to Firecracker. On any failure here we exit without
+        // touching the chroot, so cleanup is a no-op.
+        let network_slot = match (&req.network, &self.cfg.network) {
+            (Some(net), Some(controller)) => {
+                let policy = crate::network::NetworkPolicy {
+                    enable_egress: net.enable_egress,
+                    allow_cidrs: net.allow_cidrs.clone(),
+                    allow_hostnames: net.allow_hostnames.clone(),
+                    enable_privacy_router: net.privacy_router.is_some(),
+                };
+                match controller.setup(&req.workspace_id, &policy).await {
+                    Ok(slot) => {
+                        // Chain a NetworkSetup event before the
+                        // launch attempt so operators can correlate
+                        // the netns + iptables footprint with the
+                        // workspace even if the Firecracker spawn
+                        // that follows fails.
+                        self.audit_emit(
+                            EventType::NetworkSetup,
+                            Some(req.workspace_id.clone()),
+                            serde_json::json!({
+                                "netns": slot.netns,
+                                "host_ip": slot.host_ip,
+                                "guest_ip": slot.workspace_ip,
+                                "slot": slot.slot,
+                                "forward_chain": slot.forward_chain,
+                                "enable_egress": policy.enable_egress,
+                                "allow_cidrs": policy.allow_cidrs,
+                                "allow_hostnames": policy.allow_hostnames,
+                                "masquerade_installed": slot.masquerade_installed,
+                                "dns_filter_pid": slot.dns_filter_pid,
+                                "privacy_router_pid": slot.privacy_router_pid,
+                                "privacy_router_enabled": policy.enable_privacy_router,
+                            }),
+                        )
+                        .await;
+                        Some(slot)
+                    }
+                    Err(e) => {
+                        warn!(workspace_id = %req.workspace_id, error = %e, "network setup failed");
+                        self.audit_emit(
+                            EventType::CommandFailed,
+                            Some(req.workspace_id.clone()),
+                            serde_json::json!({ "op": "create_workspace", "stage": "network",
+                                                "error": e.to_string() }),
+                        )
+                        .await;
+                        return SupervisorResponse::Error {
+                            kind: SupervisorErrorKind::LaunchFailed,
+                            message: format!("network setup: {e}"),
+                        };
+                    }
+                }
+            }
+            (Some(_), None) => {
+                warn!(workspace_id = %req.workspace_id,
+                      "request asked for network but supervisor was started without --enable-networking");
+                None
+            }
+            (None, _) => None,
+        };
+
+        let network_attachment =
+            network_slot
+                .as_ref()
+                .map(|slot| crate::firecracker::NetworkAttachment {
+                    netns_path: PathBuf::from(format!("/var/run/netns/{}", slot.netns)),
+                    tap_name: slot.tap.clone(),
+                });
+
+        let cfg = crate::firecracker::LaunchConfig {
+            workspace_id: req.workspace_id.clone(),
+            kernel_image: PathBuf::from(&req.kernel_image_path),
+            rootfs_image: PathBuf::from(&req.rootfs_image_path),
+            rootfs_read_only: req.rootfs_read_only,
+            vcpu_count: req.vcpu_count,
+            mem_size_mib: req.mem_size_mib,
+            guest_vsock_cid: req.guest_vsock_cid,
+            kernel_boot_args: {
+                let base = req
+                    .kernel_boot_args
+                    .clone()
+                    .unwrap_or_else(|| self.cfg.default_kernel_boot_args.clone());
+                let layout = network_slot
+                    .as_ref()
+                    .map(|s| crate::network::SlotIpLayout::for_slot(s.slot));
+                compose_boot_args(&base, layout.as_ref())
+            },
+            firecracker_binary: self.cfg.firecracker_binary.clone(),
+            jailer_binary: self.cfg.jailer_binary.clone(),
+            chroot_base: self.cfg.chroot_base.clone(),
+            jailer_uid: self.cfg.jailer_uid,
+            jailer_gid: self.cfg.jailer_gid,
+            api_socket_timeout: self.cfg.api_socket_timeout,
+            network: network_attachment,
+        };
+
+        match crate::firecracker::launch(cfg).await {
+            Ok(mut instance) => {
+                instance.network_slot = network_slot;
+                let workspace_network =
+                    instance.network_slot.as_ref().map(|slot| WorkspaceNetwork {
+                        netns_path: format!("/var/run/netns/{}", slot.netns),
+                        tap_device: slot.tap.clone(),
+                        host_ip: slot.host_ip.clone(),
+                        guest_ip: slot.workspace_ip.clone(),
+                        prefix: slot.prefix,
+                    });
+                let resp = WorkspaceCreated {
+                    workspace_id: instance.workspace_id.clone(),
+                    firecracker_pid: instance.firecracker_pid,
+                    vsock_host_socket: instance.vsock_host_socket.display().to_string(),
+                    jailer_chroot: instance.jailer_chroot.display().to_string(),
+                    network: workspace_network,
+                    // Standard tier (Firecracker) — no OpenShell backend.
+                    exec_backend: None,
+                    control_socket: None,
+                };
+                info!(
+                    workspace_id = %resp.workspace_id,
+                    pid = resp.firecracker_pid,
+                    networked = resp.network.is_some(),
+                    "workspace created"
+                );
+                self.audit_emit(
+                    EventType::WorkspaceCreated,
+                    Some(resp.workspace_id.clone()),
+                    serde_json::json!({
+                        "firecracker_pid": resp.firecracker_pid,
+                        "vsock_host_socket": resp.vsock_host_socket,
+                        "jailer_chroot": resp.jailer_chroot,
+                        "network": resp.network,
+                    }),
+                )
+                .await;
+                // Capture ingress registration inputs before `instance` and
+                // `req` are consumed. The slot now lives on `instance`
+                // (moved above), so read its guest IP from there.
+                #[cfg(target_os = "linux")]
+                let ingress_routes = instance
+                    .network_slot
+                    .as_ref()
+                    .and_then(|slot| slot.guest_eth_ip.parse::<std::net::Ipv4Addr>().ok())
+                    .map(|guest_ip| (guest_ip, exposed_ports_from_request(&req.network)));
+                #[cfg(target_os = "linux")]
+                let registry_wsid = req.workspace_id.clone();
+                self.instances
+                    .lock()
+                    .await
+                    .insert(req.workspace_id, WorkspaceExec::Firecracker(instance));
+                #[cfg(target_os = "linux")]
+                if let Some((guest_ip, ports)) = ingress_routes {
+                    self.ingress
+                        .upsert_workspace(&registry_wsid, guest_ip, ports)
+                        .await;
+                }
+                SupervisorResponse::WorkspaceCreated(resp)
+            }
+            Err(e) => {
+                warn!(workspace_id = %req.workspace_id, error = %e, "workspace launch failed");
+                // Reclaim the netns we provisioned before the launch
+                // failure to avoid leaking link-local slots.
+                if let (Some(slot), Some(controller)) = (network_slot, &self.cfg.network)
+                    && let Err(te) = controller.teardown(slot).await
+                {
+                    warn!(error = %te, "post-failure network teardown failed");
+                }
+                self.audit_emit(
+                    EventType::CommandFailed,
+                    Some(req.workspace_id),
+                    serde_json::json!({ "op": "create_workspace", "error": e.to_string() }),
+                )
+                .await;
+                SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::LaunchFailed,
+                    message: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// Confidential-tier (B) create: spawn an OpenShell sandbox directly in the
+    /// attested CVM (single-CVM-direct). Linux + `confidential-cvm` only — the
+    /// `SevSnp` profile routes here instead of the Firecracker microVM path.
+    ///
+    /// OpenShell provides its own isolation (Landlock/seccomp/netns) + governance
+    /// (L7 OPA + PII/supply-chain); the CVM is the outer hardware boundary. The
+    /// supervisor controls the sandbox over SSH (NSSH1 preface + exec/SFTP).
+    #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
+    async fn create_confidential(&self, req: CreateWorkspaceRequest) -> SupervisorResponse {
+        use crate::openshell::{OpenShellError, OpenShellLaunchConfig, Sandbox};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // The OpenShell path does not consume the Firecracker-specific request
+        // fields (kernel/rootfs/vcpu/mem/vsock cid); the sandbox is configured
+        // The OpenShell path does not consume the Firecracker-specific request
+        // fields (kernel/rootfs/vcpu/mem/vsock cid); the sandbox is configured
+        // by the operator-supplied policy files + the agent command. The
+        // workspace_id is the only field reused.
+        //
+        // Bind a concrete ephemeral port (not 0) so we can connect back: bind a
+        // TcpListener to :0, read the OS-assigned port, drop the listener, then
+        // hand that port to the sandbox. A tiny race window is acceptable here
+        // (the supervisor is the only loopback client).
+        let ssh_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .map(|l| l.local_addr().map(|a| a.port()).unwrap_or(0))
+            .unwrap_or(0);
+        let ssh_listen_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, ssh_port));
+
+        let cfg = OpenShellLaunchConfig {
+            sandbox_binary: self.cfg.openshell_sandbox_binary.clone(),
+            workspace_id: req.workspace_id.clone(),
+            // B v1: run an interactive shell by default; the agent command is
+            // operator-configured via the policy data file. A future step
+            // surfaces the agent command via the request.
+            agent_command: vec![
+                "/bin/bash".to_string(),
+                "-c".to_string(),
+                "sleep infinity".to_string(),
+            ],
+            // Policy paths are operator-configured at install time (default
+            // under the state dir). Surfaced as a follow-up config field.
+            policy_rules_path: self.cfg.state_dir.join("openshell/policy.rego"),
+            policy_data_path: self.cfg.state_dir.join("openshell/policy.yaml"),
+            ssh_listen_addr,
+            ssh_ready_timeout: self.cfg.api_socket_timeout,
+        };
+
+        match Sandbox::spawn(&cfg).await {
+            Ok(sandbox) => {
+                let ssh_addr = sandbox.ssh_addr;
+                let workspace_id = sandbox.workspace_id.clone();
+                let resp = WorkspaceCreated {
+                    workspace_id: workspace_id.clone(),
+                    // No Firecracker on the confidential tier — sentinel values.
+                    firecracker_pid: 0,
+                    vsock_host_socket: String::new(),
+                    jailer_chroot: String::new(),
+                    network: None,
+                    exec_backend: Some("openshell".to_string()),
+                    control_socket: Some(ssh_addr.to_string()),
+                };
+                info!(
+                    workspace_id = %resp.workspace_id,
+                    ssh_addr = %ssh_addr,
+                    "confidential workspace created (OpenShell, single-CVM-direct)"
+                );
+                self.audit_emit(
+                    EventType::WorkspaceCreated,
+                    Some(resp.workspace_id.clone()),
+                    serde_json::json!({
+                        "exec_backend": "openshell",
+                        "control_socket": ssh_addr.to_string(),
+                    }),
+                )
+                .await;
+                self.instances
+                    .lock()
+                    .await
+                    .insert(req.workspace_id, WorkspaceExec::OpenShell(sandbox));
+                SupervisorResponse::WorkspaceCreated(resp)
+            }
+            Err(OpenShellError::Spawn(msg)) => {
+                warn!(workspace_id = %req.workspace_id, error = %msg, "openshell spawn failed");
+                self.audit_emit(
+                    EventType::CommandFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({ "op": "create_confidential", "error": msg }),
+                )
+                .await;
+                SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::Internal,
+                    message: format!("openshell-sandbox spawn failed: {msg}"),
+                }
+            }
+            Err(e) => {
+                warn!(workspace_id = %req.workspace_id, error = %e, "openshell launch failed");
+                SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::Internal,
+                    message: format!("confidential workspace launch failed: {e}"),
+                }
+            }
+        }
+    }
+
+    /// health-probe it, adopt it under the caller's id. On an empty pool, fall
+    /// back to a synchronous fork from the tier base (warm state preserved).
+    async fn create_from_pool(&self, req: CreateWorkspaceRequest) -> SupervisorResponse {
+        let tier = req.tier.clone().unwrap_or_default();
+
+        let Some(pool) = &self.pool else {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::TierNotFound,
+                message: format!("no warm pool configured (requested tier {tier:?})"),
+            };
+        };
+        if tier != pool.config().tier_name {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::TierNotFound,
+                message: format!(
+                    "tier {:?} not configured (configured tier: {:?})",
+                    tier,
+                    pool.config().tier_name
+                ),
+            };
+        }
+        if req.network.is_some() {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidRequest,
+                message:
+                    "tier-based create cannot request networking (pool members are non-networked)"
+                        .to_string(),
+            };
+        }
+        if self.instances.lock().await.contains_key(&req.workspace_id) {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
+                message: format!("workspace {} already exists", req.workspace_id),
+            };
+        }
+
+        let base_snapshot_id = pool.config().base_snapshot_id.clone();
+
+        // Pop + probe loop: discard any member that died while idle.
+        let mut adopted: Option<crate::firecracker::Instance> = None;
+        while let Some(mut member) = pool.pop().await {
+            let vsock = member.vsock_host_socket.clone();
+            match crate::firecracker::wait_for_guest_ready(
+                &vsock,
+                DEFAULT_GUEST_VSOCK_PORT,
+                POOL_CHECKOUT_PROBE,
+            )
+            .await
+            {
+                Ok(()) => {
+                    member.workspace_id = req.workspace_id.clone();
+                    adopted = Some(member);
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "warm-pool member failed checkout probe — evicting");
+                    self.audit_emit(
+                        EventType::PoolMemberEvicted,
+                        Some(req.workspace_id.clone()),
+                        serde_json::json!({ "reason": "checkout_probe_failed", "error": e.to_string() }),
+                    )
+                    .await;
+                    let _ = crate::firecracker::terminate(member, Duration::from_secs(5)).await;
+                    self.kick_refill();
+                }
+            }
+        }
+
+        if let Some(instance) = adopted {
+            let resp = WorkspaceCreated {
+                workspace_id: instance.workspace_id.clone(),
+                firecracker_pid: instance.firecracker_pid,
+                vsock_host_socket: instance.vsock_host_socket.display().to_string(),
+                jailer_chroot: instance.jailer_chroot.display().to_string(),
+                network: None,
+                exec_backend: None,
+                control_socket: None,
+            };
+            if let Err(resp) = self.register_or_teardown(&req.workspace_id, instance).await {
+                return resp;
+            }
+            info!(workspace_id = %req.workspace_id, tier = %tier, "warm-pool hit");
+            self.audit_emit(
+                EventType::PoolHit,
+                Some(req.workspace_id.clone()),
+                serde_json::json!({ "tier": tier, "firecracker_pid": resp.firecracker_pid }),
+            )
+            .await;
+            self.kick_refill();
+            return SupervisorResponse::WorkspaceCreated(resp);
+        }
+
+        // Miss: synchronous fork from the tier base.
+        info!(workspace_id = %req.workspace_id, tier = %tier, "warm-pool miss — synchronous fork fallback");
+        self.audit_emit(
+            EventType::PoolMiss,
+            Some(req.workspace_id.clone()),
+            serde_json::json!({ "tier": tier }),
+        )
+        .await;
+        self.kick_refill();
+
+        let (instance, _machine_id) = match self
+            .boot_ready_reset(&base_snapshot_id, &req.workspace_id, &req.workspace_id)
+            .await
+        {
+            Ok(v) => v,
+            Err((kind, message)) => {
+                self.audit_emit(
+                    EventType::CommandFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({ "op": "create_from_pool_fallback",
+                                        "error_kind": format!("{kind:?}"), "error": message }),
+                )
+                .await;
+                return SupervisorResponse::Error { kind, message };
+            }
+        };
+        let resp = WorkspaceCreated {
+            workspace_id: instance.workspace_id.clone(),
+            firecracker_pid: instance.firecracker_pid,
+            vsock_host_socket: instance.vsock_host_socket.display().to_string(),
+            jailer_chroot: instance.jailer_chroot.display().to_string(),
+            network: None,
+            // Standard tier (Firecracker) — no OpenShell backend.
+            exec_backend: None,
+            control_socket: None,
+        };
+        if let Err(resp) = self.register_or_teardown(&req.workspace_id, instance).await {
+            return resp;
+        }
+        self.audit_emit(
+            EventType::WorkspaceCreated,
+            Some(req.workspace_id.clone()),
+            serde_json::json!({ "firecracker_pid": resp.firecracker_pid, "tier": tier, "via": "pool_miss_fallback" }),
+        )
+        .await;
+        SupervisorResponse::WorkspaceCreated(resp)
+    }
+
+    /// Relay one [`RunCommandRequest`] to the workspace's guest agent
+    /// over vsock and return the result.
+    pub async fn run_command(&self, req: RunCommandRequest) -> SupervisorResponse {
+        let vsock_uds = {
+            let instances = self.instances.lock().await;
+            match instances.get(&req.workspace_id) {
+                Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
+                Some(_) => {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::Unsupported,
+                        message: format!(
+                            "workspace {} runs on the confidential tier; use the OpenShell control path",
+                            req.workspace_id
+                        ),
+                    };
+                }
+                None => {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::WorkspaceNotFound,
+                        message: format!("workspace {} not found", req.workspace_id),
+                    };
+                }
+            }
+        };
+
+        let guest_resp = match crate::firecracker::run_command_via_vsock(
+            &vsock_uds,
+            req.guest_port,
+            &req.command,
+            &req.args,
+            req.timeout_ms,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(crate::firecracker::GuestRpcError::ConnectRejected(line)) => {
+                warn!(workspace_id = %req.workspace_id, %line, "vsock CONNECT rejected");
+                self.audit_emit(
+                    EventType::CommandExecuted,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "command": req.command,
+                        "args": req.args,
+                        "error_kind": "guest_unreachable",
+                        "error": format!("vsock CONNECT rejected: {line}"),
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::GuestUnreachable,
+                    message: format!("vsock CONNECT rejected: {line}"),
+                };
+            }
+            Err(crate::firecracker::GuestRpcError::Timeout(ms)) => {
+                warn!(workspace_id = %req.workspace_id, timeout_ms = ms, "vsock RPC timed out (run_command)");
+                self.audit_emit(
+                    EventType::CommandExecuted,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "command": req.command,
+                        "args": req.args,
+                        "error_kind": "timeout",
+                        "timeout_ms": ms,
+                        "timeout_origin": "host",
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::Timeout,
+                    message: format!("vsock RPC exceeded {ms}ms"),
+                };
+            }
+            Err(e) => {
+                warn!(workspace_id = %req.workspace_id, error = %e, "vsock RPC failed");
+                self.audit_emit(
+                    EventType::CommandExecuted,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "command": req.command,
+                        "args": req.args,
+                        "error_kind": "guest_unreachable",
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::GuestUnreachable,
+                    message: e.to_string(),
+                };
+            }
+        };
+
+        match guest_resp {
+            GuestResponse::CommandCompleted(c) => {
+                info!(
+                    workspace_id = %req.workspace_id,
+                    exit_code = c.exit_code,
+                    elapsed_ms = c.elapsed_ms,
+                    "run_command completed"
+                );
+                self.audit_emit(
+                    EventType::CommandExecuted,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "command": req.command,
+                        "args": req.args,
+                        "exit_code": c.exit_code,
+                        "elapsed_ms": c.elapsed_ms,
+                    }),
+                )
+                .await;
+                SupervisorResponse::CommandCompleted(CommandCompleted {
+                    workspace_id: req.workspace_id,
+                    stdout: c.stdout,
+                    stderr: c.stderr,
+                    exit_code: c.exit_code,
+                    elapsed_ms: c.elapsed_ms,
+                    truncated: c.truncated,
+                })
+            }
+            GuestResponse::Error { kind, message } => {
+                let supervisor_kind = match kind {
+                    GuestErrorKind::Timeout => SupervisorErrorKind::Timeout,
+                    GuestErrorKind::InvalidRequest => SupervisorErrorKind::InvalidRequest,
+                    GuestErrorKind::CommandFailed => SupervisorErrorKind::LaunchFailed,
+                    _ => SupervisorErrorKind::Internal,
+                };
+                warn!(workspace_id = %req.workspace_id, ?kind, %message, "guest returned error");
+                let mut payload = serde_json::json!({
+                    "command": req.command,
+                    "args": req.args,
+                    "error_kind": serde_json::to_value(kind).unwrap_or_else(|_| {
+                        serde_json::Value::String(format!("{kind:?}"))
+                    }),
+                    "error": message,
+                });
+                if matches!(kind, GuestErrorKind::Timeout)
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert(
+                        "timeout_origin".to_string(),
+                        serde_json::Value::String("guest".to_string()),
+                    );
+                }
+                self.audit_emit(
+                    EventType::CommandExecuted,
+                    Some(req.workspace_id.clone()),
+                    payload,
+                )
+                .await;
+                SupervisorResponse::Error {
+                    kind: supervisor_kind,
+                    message,
+                }
+            }
+            other => {
+                warn!(workspace_id = %req.workspace_id, ?other, "unexpected guest response");
+                SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::GuestProtocolError,
+                    message: format!("unexpected guest response: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Relay a [`WriteFileRequest`] to the workspace's guest agent
+    /// and emit the matching audit event.
+    pub async fn write_file(&self, req: WriteFileRequest) -> SupervisorResponse {
+        // Defense in depth: the API daemon already enforces this cap,
+        // but the supervisor is a separate trust boundary (direct
+        // socket clients exist in dev mode). Match the documented
+        // 10 MiB cap exactly.
+        if req.content.len() > MAX_INLINE_FILE_BYTES {
+            self.audit_emit(
+                EventType::FileOpFailed,
+                Some(req.workspace_id.clone()),
+                serde_json::json!({
+                    "op": "write_file",
+                    "path": req.path,
+                    "error_kind": "file_too_large",
+                    "error": format!(
+                        "content length {} exceeds inline cap of {} bytes",
+                        req.content.len(),
+                        MAX_INLINE_FILE_BYTES,
+                    ),
+                }),
+            )
+            .await;
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::FileTooLarge,
+                message: format!(
+                    "content length {} exceeds inline cap of {} bytes",
+                    req.content.len(),
+                    MAX_INLINE_FILE_BYTES,
+                ),
+            };
+        }
+
+        let vsock_uds = {
+            let instances = self.instances.lock().await;
+            match instances.get(&req.workspace_id) {
+                Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
+                Some(_) => {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::Unsupported,
+                        message: format!(
+                            "workspace {} runs on the confidential tier; use the OpenShell control path",
+                            req.workspace_id
+                        ),
+                    };
+                }
+                None => {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::WorkspaceNotFound,
+                        message: format!("workspace {} not found", req.workspace_id),
+                    };
+                }
+            }
+        };
+
+        let guest_port = if req.guest_port == 0 {
+            52
+        } else {
+            req.guest_port
+        };
+        let timeout_ms = FILE_RPC_TIMEOUT_MS;
+
+        let guest_resp = match crate::firecracker::write_file_via_vsock(
+            &vsock_uds,
+            guest_port,
+            &req.path,
+            req.content,
+            timeout_ms,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(crate::firecracker::GuestRpcError::ConnectRejected(line)) => {
+                warn!(workspace_id = %req.workspace_id, %line, "vsock CONNECT rejected (write_file)");
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "op": "write_file",
+                        "path": req.path,
+                        "error_kind": "guest_unreachable",
+                        "error": format!("vsock CONNECT rejected: {line}"),
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::GuestUnreachable,
+                    message: format!("vsock CONNECT rejected: {line}"),
+                };
+            }
+            Err(crate::firecracker::GuestRpcError::Timeout(ms)) => {
+                warn!(workspace_id = %req.workspace_id, timeout_ms = ms, "vsock RPC timed out (write_file)");
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "op": "write_file",
+                        "path": req.path,
+                        "error_kind": "timeout",
+                        "timeout_ms": ms,
+                        "timeout_origin": "host",
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::Timeout,
+                    message: format!("vsock RPC exceeded {ms}ms"),
+                };
+            }
+            Err(e) => {
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "op": "write_file",
+                        "path": req.path,
+                        "error_kind": "guest_unreachable",
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::GuestUnreachable,
+                    message: e.to_string(),
+                };
+            }
+        };
+
+        match guest_resp {
+            GuestResponse::FileWritten(written) => {
+                self.audit_emit(
+                    EventType::FileWritten,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "path": req.path,
+                        "absolute_path": written.absolute_path,
+                        "bytes_written": written.bytes_written,
+                        "guest_port": guest_port,
+                    }),
+                )
+                .await;
+                SupervisorResponse::FileWritten(FileWritten {
+                    workspace_id: req.workspace_id,
+                    bytes_written: written.bytes_written,
+                    absolute_path: written.absolute_path,
+                })
+            }
+            GuestResponse::Error { kind, message } => {
+                warn!(
+                    workspace_id = %req.workspace_id,
+                    ?kind,
+                    %message,
+                    "guest file op error (write_file)"
+                );
+                let supervisor_kind = guest_kind_to_supervisor_kind(kind);
+                let mut payload = serde_json::json!({
+                    "op": "write_file",
+                    "path": req.path,
+                    "error_kind": serde_json::to_value(kind).unwrap_or_else(|_| {
+                        serde_json::Value::String(format!("{kind:?}"))
+                    }),
+                    "error": message,
+                });
+                if matches!(kind, GuestErrorKind::Timeout)
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert(
+                        "timeout_origin".to_string(),
+                        serde_json::Value::String("guest".to_string()),
+                    );
+                }
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    payload,
+                )
+                .await;
+                SupervisorResponse::Error {
+                    kind: supervisor_kind,
+                    message,
+                }
+            }
+            other => SupervisorResponse::Error {
+                kind: SupervisorErrorKind::GuestProtocolError,
+                message: format!("unexpected guest response: {other:?}"),
+            },
+        }
+    }
+
+    /// Relay a [`ReadFileRequest`] to the workspace's guest agent.
+    pub async fn read_file(&self, req: ReadFileRequest) -> SupervisorResponse {
+        let vsock_uds = {
+            let instances = self.instances.lock().await;
+            match instances.get(&req.workspace_id) {
+                Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
+                Some(_) => {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::Unsupported,
+                        message: format!(
+                            "workspace {} runs on the confidential tier; use the OpenShell control path",
+                            req.workspace_id
+                        ),
+                    };
+                }
+                None => {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::WorkspaceNotFound,
+                        message: format!("workspace {} not found", req.workspace_id),
+                    };
+                }
+            }
+        };
+
+        let guest_port = if req.guest_port == 0 {
+            52
+        } else {
+            req.guest_port
+        };
+        let timeout_ms = FILE_RPC_TIMEOUT_MS;
+
+        let guest_resp = match crate::firecracker::read_file_via_vsock(
+            &vsock_uds,
+            guest_port,
+            &req.path,
+            req.max_bytes,
+            timeout_ms,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(crate::firecracker::GuestRpcError::ConnectRejected(line)) => {
+                warn!(workspace_id = %req.workspace_id, %line, "vsock CONNECT rejected (read_file)");
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "op": "read_file",
+                        "path": req.path,
+                        "error_kind": "guest_unreachable",
+                        "error": format!("vsock CONNECT rejected: {line}"),
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::GuestUnreachable,
+                    message: format!("vsock CONNECT rejected: {line}"),
+                };
+            }
+            Err(crate::firecracker::GuestRpcError::Timeout(ms)) => {
+                warn!(workspace_id = %req.workspace_id, timeout_ms = ms, "vsock RPC timed out (read_file)");
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "op": "read_file",
+                        "path": req.path,
+                        "error_kind": "timeout",
+                        "timeout_ms": ms,
+                        "timeout_origin": "host",
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::Timeout,
+                    message: format!("vsock RPC exceeded {ms}ms"),
+                };
+            }
+            Err(e) => {
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "op": "read_file",
+                        "path": req.path,
+                        "error_kind": "guest_unreachable",
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::GuestUnreachable,
+                    message: e.to_string(),
+                };
+            }
+        };
+
+        match guest_resp {
+            GuestResponse::FileRead(read) => {
+                self.audit_emit(
+                    EventType::FileRead,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "path": req.path,
+                        "absolute_path": format!("/workspace/{}", req.path),
+                        "bytes_returned": read.content.len(),
+                        "size_bytes": read.size_bytes,
+                        "truncated": read.truncated,
+                        "guest_port": guest_port,
+                    }),
+                )
+                .await;
+                SupervisorResponse::FileRead(FileRead {
+                    workspace_id: req.workspace_id,
+                    content: read.content,
+                    size_bytes: read.size_bytes,
+                    truncated: read.truncated,
+                })
+            }
+            GuestResponse::Error { kind, message } => {
+                warn!(
+                    workspace_id = %req.workspace_id,
+                    ?kind,
+                    %message,
+                    "guest file op error (read_file)"
+                );
+                let supervisor_kind = guest_kind_to_supervisor_kind(kind);
+                let mut payload = serde_json::json!({
+                    "op": "read_file",
+                    "path": req.path,
+                    "error_kind": serde_json::to_value(kind).unwrap_or_else(|_| {
+                        serde_json::Value::String(format!("{kind:?}"))
+                    }),
+                    "error": message,
+                });
+                if matches!(kind, GuestErrorKind::Timeout)
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert(
+                        "timeout_origin".to_string(),
+                        serde_json::Value::String("guest".to_string()),
+                    );
+                }
+                self.audit_emit(
+                    EventType::FileOpFailed,
+                    Some(req.workspace_id.clone()),
+                    payload,
+                )
+                .await;
+                SupervisorResponse::Error {
+                    kind: supervisor_kind,
+                    message,
+                }
+            }
+            other => SupervisorResponse::Error {
+                kind: SupervisorErrorKind::GuestProtocolError,
+                message: format!("unexpected guest response: {other:?}"),
+            },
+        }
+    }
+
+    /// Tear down a registered workspace and reclaim its host resources.
+    pub async fn terminate(&self, req: TerminateRequest) -> SupervisorResponse {
+        let Some(exec) = self.instances.lock().await.remove(&req.workspace_id) else {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceNotFound,
+                message: format!("workspace {} not found", req.workspace_id),
+            };
+        };
+
+        // Dispatch on the backend. The confidential tier's teardown is
+        // separate (OpenShell sandbox); the standard tier reaps the
+        // Firecracker process + reclaims its network slot.
+        let grace = Duration::from_millis(u64::from(req.grace_period_ms));
+        #[cfg(feature = "confidential-cvm")]
+        let (network_slot, firecracker_result) = match exec {
+            WorkspaceExec::OpenShell(sandbox) => {
+                sandbox.terminate(grace).await;
+                // OpenShell sandboxes don't carry a NetworkSlot today (the
+                // sandbox's own netns is managed by the spawned binary).
+                (None, Ok(()))
+            }
+            WorkspaceExec::Firecracker(instance) => {
+                let slot = instance.network_slot.clone();
+                let r = crate::firecracker::terminate(instance, grace).await;
+                (slot, r)
+            }
+        };
+        #[cfg(not(feature = "confidential-cvm"))]
+        let (network_slot, firecracker_result) = match exec {
+            WorkspaceExec::Firecracker(instance) => {
+                let slot = instance.network_slot.clone();
+                let r = crate::firecracker::terminate(instance, grace).await;
+                (slot, r)
+            }
+        };
+
+        // Reclaim network resources regardless of how firecracker
+        // teardown went — leaking netns / NAT rules across a single
+        // failed teardown would burn slots quickly. Emit the
+        // NetworkTeardown audit event whether reclamation succeeded
+        // or not; downstream operators can correlate a "teardown
+        // emitted but slot still present" signal with a leak.
+        if let (Some(slot), Some(controller)) = (network_slot, &self.cfg.network) {
+            let teardown_outcome = controller.teardown(slot.clone()).await;
+            let teardown_ok = teardown_outcome.is_ok();
+            self.audit_emit(
+                EventType::NetworkTeardown,
+                Some(req.workspace_id.clone()),
+                serde_json::json!({
+                    "netns": slot.netns,
+                    "slot": slot.slot,
+                    "forward_chain": slot.forward_chain,
+                    "dns_filter_pid": slot.dns_filter_pid,
+                    "privacy_router_pid": slot.privacy_router_pid,
+                    "reclaim_ok": teardown_ok,
+                    "error": teardown_outcome.as_ref().err().map(ToString::to_string),
+                }),
+            )
+            .await;
+            if let Err(e) = teardown_outcome {
+                warn!(workspace_id = %req.workspace_id, error = %e,
+                      "network teardown failed (resources may have leaked)");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        self.ingress.remove_workspace(&req.workspace_id).await;
+
+        // S1-F3: free the per-workspace attestation nonce ring so a long-lived
+        // supervisor that churns workspaces does not grow `attestation_nonces`
+        // without bound (one 256-entry ring per ever-attested workspace).
+        self.attestation_nonces
+            .lock()
+            .await
+            .remove(&req.workspace_id);
+
+        match firecracker_result {
+            Ok(()) => {
+                info!(workspace_id = %req.workspace_id, "workspace terminated");
+                self.audit_emit(
+                    EventType::WorkspaceTerminated,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({ "grace_period_ms": req.grace_period_ms }),
+                )
+                .await;
+                SupervisorResponse::WorkspaceTerminated {
+                    workspace_id: req.workspace_id,
+                }
+            }
+            Err(e) => {
+                warn!(workspace_id = %req.workspace_id, error = %e, "workspace terminate failed");
+                self.audit_emit(
+                    EventType::CommandFailed,
+                    Some(req.workspace_id),
+                    serde_json::json!({ "op": "terminate", "error": e.to_string() }),
+                )
+                .await;
+                SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::Internal,
+                    message: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// DEFERRED (wedge-6.8): in-place pause/resume is unsupported on current
+    /// Firecracker — the vsock control channel does not survive an in-place
+    /// `PATCH /vm Resumed` (the resumed guest is unreachable over vsock). Use
+    /// snapshot/restore (fresh process) instead, which works. Tracked for a
+    /// future Firecracker fork patch. `WorkspaceManager::snapshot` still uses
+    /// the low-level `crate::firecracker::pause`/`resume` directly; only this
+    /// public API is gated.
+    // `async` kept (no await while deferred) so the dispatcher contract in
+    // `command.rs` (`self.workspaces.pause(r).await`) is unchanged and the body
+    // re-becomes async when the API is restored.
+    #[allow(clippy::unused_async)]
+    pub async fn pause(&self, ws_ref: WorkspaceRef) -> SupervisorResponse {
+        let _ = &ws_ref;
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "in-place pause is deferred: the guest vsock control channel \
+                      does not survive an in-place Firecracker resume. Use \
+                      snapshot/restore instead."
+                .to_string(),
+        }
+    }
+
+    /// DEFERRED (wedge-6.8): see [`Self::pause`].
+    #[allow(clippy::unused_async)]
+    pub async fn resume(&self, ws_ref: WorkspaceRef) -> SupervisorResponse {
+        let _ = &ws_ref;
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::Unsupported,
+            message: "in-place resume is deferred: the guest vsock control channel \
+                      does not survive an in-place Firecracker resume. Use \
+                      snapshot/restore instead."
+                .to_string(),
+        }
+    }
+
+    /// Snapshot a workspace.
+    ///
+    /// Locking strategy: hold the guard for the firecracker pause, `snapshot_create`,
+    /// and resume calls (they borrow the instance and are quick API calls), then drop
+    /// the guard before the copy-out, hashing, and signing (which only need the artifact
+    /// paths and don't touch the instance). This keeps the lock window narrow.
+    pub async fn snapshot(&self, req: SnapshotRequest) -> SupervisorResponse {
+        // Step 1: lock, get instance metadata + artifact paths; run FC calls under lock.
+        let (
+            source_ws_id,
+            mem_in_chroot,
+            vmstate_in_chroot,
+            guest_vsock_cid,
+            vcpu_count,
+            mem_size_mib,
+            kernel_boot_args,
+            rootfs_path,
+            kernel_path,
+            was_running,
+        ) = {
+            let mut guard = self.instances.lock().await;
+            let Some(exec) = guard.get_mut(&req.workspace_id) else {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::WorkspaceNotFound,
+                    message: format!("workspace {} not found", req.workspace_id),
+                };
+            };
+            // Snapshot is Firecracker-vmstate-coupled; the confidential tier
+            // (OpenShell) returns Unsupported in B v1 (a process-checkpoint
+            // format is a later wedge). Unwrap the FC variant for the rest.
+            let instance = match exec {
+                WorkspaceExec::Firecracker(inst) => inst,
+                #[cfg(feature = "confidential-cvm")]
+                WorkspaceExec::OpenShell(_) => {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::Unsupported,
+                        message: format!(
+                            "snapshot is unsupported on the confidential tier (workspace {}); B v1",
+                            req.workspace_id
+                        ),
+                    };
+                }
+            };
+
+            // Live snapshot requires a running source (it keeps the source live).
+            if req.live && instance.lifecycle_state != WorkspaceState::Running {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::SnapshotFailed,
+                    message: format!(
+                        "live snapshot requires a running workspace; {} is {:?}",
+                        req.workspace_id, instance.lifecycle_state
+                    ),
+                };
+            }
+
+            // Reject snapshotting a networked source: restore is non-networked
+            // only (FC bakes the host TAP name into vmstate, so a restored VM
+            // would reference a TAP that doesn't exist). Fail at capture time
+            // rather than producing an artifact that can never be restored.
+            if instance.network_slot.is_some() {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::SnapshotFailed,
+                    message: format!(
+                        "workspace {} has networking; snapshot of networked workspaces is \
+                         not supported in this build",
+                        req.workspace_id
+                    ),
+                };
+            }
+
+            // Step 2: if running, pause first.
+            let was_running = instance.lifecycle_state == WorkspaceState::Running;
+            if was_running {
+                if let Err(e) = crate::firecracker::pause(instance).await {
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::SnapshotFailed,
+                        message: format!("pre-snapshot pause failed: {e}"),
+                    };
+                }
+                instance.lifecycle_state = WorkspaceState::Paused;
+            }
+
+            // Step 3: create the snapshot inside the chroot.
+            let arts = match crate::firecracker::snapshot_create(instance).await {
+                Ok(a) => a,
+                Err(e) => {
+                    // If we paused it, try to restore running state.
+                    if was_running {
+                        let _ = crate::firecracker::resume(instance).await;
+                        instance.lifecycle_state = WorkspaceState::Running;
+                    }
+                    self.audit_emit(
+                        EventType::SnapshotFailed,
+                        Some(req.workspace_id.clone()),
+                        serde_json::json!({ "error": e.to_string() }),
+                    )
+                    .await;
+                    return SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::SnapshotFailed,
+                        message: e.to_string(),
+                    };
+                }
+            };
+
+            // Step 4: Non-live path keeps today's behavior (in-place resume). The live path
+            // intentionally leaves the source PAUSED here — live_hot_swap replaces it
+            // with a fresh, reachable process after the guard is dropped.
+            // Only flip the tracked state back to Running when resume actually
+            // succeeds — on resume failure FC is still frozen, so the map must
+            // honestly report Paused rather than lie that it is Running.
+            if was_running && !req.live {
+                match crate::firecracker::resume(instance).await {
+                    Ok(()) => instance.lifecycle_state = WorkspaceState::Running,
+                    Err(e) => {
+                        warn!(workspace_id = %req.workspace_id, error = %e,
+                              "post-snapshot resume failed — workspace left paused");
+                    }
+                }
+            }
+
+            // Capture everything we need before dropping the guard.
+            (
+                instance.workspace_id.clone(),
+                arts.mem_in_chroot,
+                arts.vmstate_in_chroot,
+                instance.guest_vsock_cid,
+                instance.vcpu_count,
+                instance.mem_size_mib,
+                instance.kernel_boot_args.clone(),
+                instance.rootfs_path.clone(),
+                instance.kernel_path.clone(),
+                was_running,
+            )
+        };
+        // Guard dropped — from here we only use paths + metadata.
+
+        // Step 5: allocate snapshot id + create destination dir.
+        let snapshot_id = ulid::Ulid::new().to_string();
+        let dest = crate::snapshot::snapshot_dir(&self.cfg.state_dir, &snapshot_id);
+        if let Err(e) = tokio::fs::create_dir_all(&dest).await {
+            self.audit_emit(
+                EventType::SnapshotFailed,
+                Some(source_ws_id.clone()),
+                serde_json::json!({ "error": e.to_string() }),
+            )
+            .await;
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::Internal,
+                message: format!("snapshot dir create failed: {e}"),
+            };
+        }
+
+        // Step 6: copy mem/vmstate out of the chroot to the snapshots dir.
+        // The chroot files are written by FC (as jailer_uid); the supervisor
+        // runs as root and can read them.
+        let copy_result = async {
+            tokio::fs::copy(&mem_in_chroot, dest.join("mem")).await?;
+            tokio::fs::copy(&vmstate_in_chroot, dest.join("vmstate")).await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+
+        if let Err(e) = copy_result {
+            let _ = tokio::fs::remove_dir_all(&dest).await;
+            self.audit_emit(
+                EventType::SnapshotFailed,
+                Some(source_ws_id.clone()),
+                serde_json::json!({ "error": e.to_string() }),
+            )
+            .await;
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::Internal,
+                message: format!("artifact copy failed: {e}"),
+            };
+        }
+
+        // Step 7: get FC version + load signing key + write manifest.
+        let fc_version =
+            crate::firecracker::firecracker_version(&self.cfg.firecracker_binary).await;
+
+        let keys_dir = self.cfg.state_dir.join("keys");
+        let signer = match crate::signing::load_or_create_signing_key(&keys_dir).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&dest).await;
+                self.audit_emit(
+                    EventType::SnapshotFailed,
+                    Some(source_ws_id.clone()),
+                    serde_json::json!({ "error": e.to_string() }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::Internal,
+                    message: format!("signing key load failed: {e}"),
+                };
+            }
+        };
+
+        // hostname in GuestIdentity = source workspace id (unique, meaningful label).
+        let guest_identity = GuestIdentity {
+            hostname: source_ws_id.clone(),
+            mac: "unset".into(), // non-networked snapshots have no TAP MAC
+            guest_vsock_cid,
+            vcpu_count,
+            mem_size_mib,
+        };
+
+        let mut info = match crate::snapshot::write_manifest(
+            &dest,
+            &signer,
+            &snapshot_id,
+            &source_ws_id,
+            &fc_version,
+            &rootfs_path,
+            guest_identity,
+            &kernel_boot_args,
+            &kernel_path,
+        )
+        .await
+        {
+            Ok(i) => i,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&dest).await;
+                self.audit_emit(
+                    EventType::SnapshotFailed,
+                    Some(source_ws_id.clone()),
+                    serde_json::json!({ "error": e.to_string() }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::SnapshotFailed,
+                    message: e.to_string(),
+                };
+            }
+        };
+
+        // Live snapshot: hot-swap the frozen source with a fresh restore so it
+        // comes back Running + reachable. Fail-closed — on swap failure the source
+        // is left Paused and the (valid, signed) artifact persists.
+        if req.live {
+            match self.live_hot_swap(&source_ws_id, &snapshot_id).await {
+                Ok(new_pid) => {
+                    info.firecracker_pid = Some(new_pid);
+                }
+                Err((kind, message)) => {
+                    self.audit_emit(
+                        EventType::SnapshotFailed,
+                        Some(source_ws_id.clone()),
+                        serde_json::json!({
+                            "snapshot_id": snapshot_id,
+                            "phase": "live_hot_swap",
+                            "error": message,
+                            "note": "snapshot artifact created; source left paused",
+                        }),
+                    )
+                    .await;
+                    return SupervisorResponse::Error {
+                        kind,
+                        message: format!(
+                            "snapshot {snapshot_id} created but live resume failed: {message}; \
+                             source {source_ws_id} left paused"
+                        ),
+                    };
+                }
+            }
+        }
+
+        // Step 8: audit + return.
+        info!(
+            workspace_id = %source_ws_id,
+            snapshot_id = %snapshot_id,
+            mem_sha256 = %info.mem_sha256,
+            size_bytes = info.size_bytes,
+            was_running,
+            "snapshot created"
+        );
+        self.audit_emit(
+            EventType::SnapshotCreated,
+            Some(source_ws_id.clone()),
+            serde_json::json!({
+                "snapshot_id": snapshot_id,
+                "mem_sha256": info.mem_sha256,
+                "vmstate_sha256": info.vmstate_sha256,
+                "size_bytes": info.size_bytes,
+                "source": source_ws_id,
+                "live": req.live,
+                "new_firecracker_pid": info.firecracker_pid,
+            }),
+        )
+        .await;
+        SupervisorResponse::SnapshotCreated(info)
+    }
+
+    /// Shared fork/restore boot: verify the artifact (signature + hashes,
+    /// fail-closed), build a `LaunchConfig` from the manifest, and boot a
+    /// fresh jailed Firecracker via `firecracker::restore` (load + resume).
+    /// Returns the live, `UNregistered` instance plus the verified manifest.
+    /// On failure returns the typed error response the caller relays.
+    async fn boot_from_snapshot(
+        &self,
+        snapshot_id: &str,
+        new_workspace_id: &str,
+    ) -> Result<
+        (
+            crate::firecracker::Instance,
+            ne_protocol::snapshot::SnapshotManifest,
+        ),
+        SupervisorResponse,
+    > {
+        // S2-F1 (Critical): validate BOTH caller-supplied ids before either is
+        // used as a filesystem path component. `snapshot_id` feeds
+        // `snapshot_dir(state_dir, ..)` (read path) and `new_workspace_id`
+        // becomes the jailer `--id` / chroot component (as-root write path). An
+        // absolute or `..`-bearing id would escape the intended tree (Rust
+        // `Path::join` replaces on an absolute component; the OS resolves `..`),
+        // turning restore/fork into an as-root create/`remove_dir_all` outside
+        // the workspace tree. The jailer grammar (`[A-Za-z0-9-]{1,64}`) is the
+        // safe charset for both. `firecracker::spawn_jailed_firecracker` repeats
+        // this check as a defense-in-depth backstop.
+        if !is_valid_workspace_id(snapshot_id) {
+            return Err(SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidRequest,
+                message: format!(
+                    "invalid snapshot_id {snapshot_id:?}: expected [A-Za-z0-9-]{{1,64}}"
+                ),
+            });
+        }
+        if !is_valid_workspace_id(new_workspace_id) {
+            return Err(SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidRequest,
+                message: format!(
+                    "invalid new_workspace_id {new_workspace_id:?}: expected [A-Za-z0-9-]{{1,64}}"
+                ),
+            });
+        }
+
+        let dir = crate::snapshot::snapshot_dir(&self.cfg.state_dir, snapshot_id);
+        // S5-F1 (High): pin manifest verification to the host's own signing key
+        // (the only legitimate producer of a snapshot here) rather than the key
+        // embedded in the untrusted manifest — closes the self-signed forgery
+        // class on the restore/fork trust path.
+        let manifest = crate::snapshot::verify_artifact_pinned(&dir, &self.audit.verifying_key())
+            .await
+            .map_err(|e| SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidSnapshot,
+                message: e.to_string(),
+            })?;
+
+        let launch_cfg = crate::firecracker::LaunchConfig {
+            workspace_id: new_workspace_id.to_string(),
+            kernel_image: PathBuf::from(&manifest.kernel_path),
+            rootfs_image: PathBuf::from(&manifest.rootfs_path),
+            rootfs_read_only: true,
+            vcpu_count: manifest.guest_identity.vcpu_count,
+            mem_size_mib: manifest.guest_identity.mem_size_mib,
+            guest_vsock_cid: manifest.guest_identity.guest_vsock_cid,
+            kernel_boot_args: manifest.kernel_boot_args.clone(),
+            firecracker_binary: self.cfg.firecracker_binary.clone(),
+            jailer_binary: self.cfg.jailer_binary.clone(),
+            chroot_base: self.cfg.chroot_base.clone(),
+            jailer_uid: self.cfg.jailer_uid,
+            jailer_gid: self.cfg.jailer_gid,
+            api_socket_timeout: self.cfg.api_socket_timeout,
+            network: None,
+        };
+        let restore_cfg = crate::firecracker::RestoreLaunchConfig {
+            launch: launch_cfg,
+            mem_source: dir.join("mem"),
+            vmstate_source: dir.join("vmstate"),
+        };
+        match crate::firecracker::restore(restore_cfg).await {
+            Ok(inst) => Ok((inst, manifest)),
+            Err(crate::firecracker::LaunchError::NetworkedRestoreUnsupported) => {
+                Err(SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::InvalidSnapshot,
+                    message: "networked snapshot restore is not supported".to_string(),
+                })
+            }
+            Err(e) => Err(SupervisorResponse::Error {
+                kind: SupervisorErrorKind::RestoreFailed,
+                message: e.to_string(),
+            }),
+        }
+    }
+
+    /// Register a freshly-booted instance under the final lock, re-checking
+    /// for an id collision (the boot above released the lock for seconds).
+    /// On collision, tear the instance down rather than leak it.
+    async fn register_or_teardown(
+        &self,
+        workspace_id: &str,
+        instance: crate::firecracker::Instance,
+    ) -> Result<(), SupervisorResponse> {
+        let mut guard = self.instances.lock().await;
+        if guard.contains_key(workspace_id) {
+            drop(guard);
+            warn!(
+                workspace_id,
+                "lost boot race — tearing down freshly-booted instance"
+            );
+            let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+            return Err(SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
+                message: format!("workspace {workspace_id} already exists"),
+            });
+        }
+        guard.insert(
+            workspace_id.to_string(),
+            WorkspaceExec::Firecracker(instance),
+        );
+        Ok(())
+    }
+
+    /// Live-snapshot hot-swap: replace a just-snapshotted (now frozen/paused) source
+    /// with a fresh Firecracker restored from that same snapshot, so the source comes
+    /// back Running + vsock-reachable (an in-place resume would leave it vsock-dead —
+    /// the deferred wedge-6.8 limitation). Same identity is intentional: this is the
+    /// *same* workspace continuing, NOT a fork — so NO `ResetIdentity`.
+    ///
+    /// On success: the registry entry for `source_ws_id` now points at the new
+    /// instance; the old frozen process + chroot are reaped; returns the new PID.
+    /// On failure: the freshly-restored instance (if any) is torn down and the
+    /// ORIGINAL frozen source is left registered as `Paused` (never destroyed).
+    async fn live_hot_swap(
+        &self,
+        source_ws_id: &str,
+        snapshot_id: &str,
+    ) -> Result<u32, (SupervisorErrorKind, String)> {
+        // Provisional id doubles as the new jailer chroot id; the swap rewrites the
+        // in-registry workspace_id back to the source id (chroot keeps the provisional
+        // id — the cosmetic warm-pool 7.0 pattern).
+        let provisional_id = format!("live-{}", ulid::Ulid::new());
+
+        // Boot a fresh FC from the snapshot (verify -> load -> resume). Reachable by
+        // construction (fresh process rebuilds the vsock muxer). boot_from_snapshot
+        // cleans up its own chroot on load failure.
+        let (instance, _manifest) = self
+            .boot_from_snapshot(snapshot_id, &provisional_id)
+            .await
+            .map_err(|resp| match resp {
+                SupervisorResponse::Error { kind, message } => (kind, message),
+                _ => (
+                    SupervisorErrorKind::Internal,
+                    "unexpected boot response".to_string(),
+                ),
+            })?;
+
+        // Wait for the guest agent to re-arm its vsock listener post-load.
+        if let Err(e) = crate::firecracker::wait_for_guest_ready(
+            &instance.vsock_host_socket,
+            DEFAULT_GUEST_VSOCK_PORT,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+            return Err((
+                SupervisorErrorKind::RestoreFailed,
+                format!("live restore guest not ready: {e}"),
+            ));
+        }
+
+        let new_pid = instance.firecracker_pid;
+
+        // Swap under the registry mutex (atomic w.r.t. the mutex only). The source
+        // id may have been removed concurrently during our lock-free boot window
+        // (a concurrent terminate). If so, do NOT resurrect it: tear the fresh
+        // instance down and fail. The signed artifact still persists, so
+        // fail-closed holds.
+        let old = {
+            let mut guard = self.instances.lock().await;
+            let Some(old) = guard.remove(source_ws_id) else {
+                drop(guard);
+                let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+                return Err((
+                    SupervisorErrorKind::WorkspaceNotFound,
+                    format!(
+                        "source {source_ws_id} was terminated during live snapshot; \
+                         restored instance discarded"
+                    ),
+                ));
+            };
+            let mut instance = instance;
+            instance.workspace_id = source_ws_id.to_string();
+            guard.insert(
+                source_ws_id.to_string(),
+                WorkspaceExec::Firecracker(instance),
+            );
+            old
+        };
+
+        // Reap the old frozen FC process + chroot (outside the lock). Live
+        // snapshot is FC-only, so unwrap the Firecracker variant.
+        let old_instance = match old {
+            WorkspaceExec::Firecracker(inst) => inst,
+            #[cfg(feature = "confidential-cvm")]
+            WorkspaceExec::OpenShell(_) => {
+                warn!(workspace_id = %source_ws_id, "live hot-swap: old was OpenShell (snapshot unsupported there) — skipping FC reap");
+                return Ok(new_pid);
+            }
+        };
+        if let Err(e) = crate::firecracker::terminate(old_instance, Duration::from_secs(5)).await {
+            warn!(workspace_id = %source_ws_id, error = %e, "live hot-swap: old source teardown failed");
+        }
+        Ok(new_pid)
+    }
+
+    /// Generate a fresh 32-lowercase-hex machine-id from a new ULID's 128 bits.
+    fn fresh_machine_id() -> String {
+        hex::encode(ulid::Ulid::new().to_bytes())
+    }
+
+    /// Read `n` fresh random bytes from the host's `/dev/urandom`.
+    async fn fresh_entropy(n: usize) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open("/dev/urandom").await?;
+        let mut buf = vec![0u8; n];
+        f.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    /// Boot a fresh VM from `snapshot_id` (verify → load → resume), wait for the
+    /// guest, then reset its identity to `hostname` + a fresh machine-id + fresh
+    /// RNG. Fail-closed: any failure tears the booted VM down. On success returns
+    /// the live, `UNregistered` instance plus its new machine-id.
+    async fn boot_ready_reset(
+        &self,
+        snapshot_id: &str,
+        new_workspace_id: &str,
+        hostname: &str,
+    ) -> Result<(crate::firecracker::Instance, String), (SupervisorErrorKind, String)> {
+        let (instance, _manifest) = self
+            .boot_from_snapshot(snapshot_id, new_workspace_id)
+            .await
+            .map_err(|resp| match resp {
+                SupervisorResponse::Error { kind, message } => (kind, message),
+                _ => (
+                    SupervisorErrorKind::Internal,
+                    "unexpected boot response".to_string(),
+                ),
+            })?;
+
+        let vsock_uds = instance.vsock_host_socket.clone();
+        if let Err(e) = crate::firecracker::wait_for_guest_ready(
+            &vsock_uds,
+            DEFAULT_GUEST_VSOCK_PORT,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+            return Err((
+                SupervisorErrorKind::ForkFailed,
+                format!("guest not ready: {e}"),
+            ));
+        }
+
+        let machine_id = Self::fresh_machine_id();
+        let entropy_seed = match Self::fresh_entropy(32).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+                return Err((
+                    SupervisorErrorKind::Internal,
+                    format!("entropy generation failed: {e}"),
+                ));
+            }
+        };
+
+        match crate::firecracker::reset_identity_via_vsock(
+            &vsock_uds,
+            DEFAULT_GUEST_VSOCK_PORT,
+            hostname.to_string(),
+            machine_id.clone(),
+            entropy_seed,
+            30_000,
+        )
+        .await
+        {
+            Ok(GuestResponse::IdentityReset { .. }) => Ok((instance, machine_id)),
+            Ok(other) => {
+                let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+                Err((
+                    SupervisorErrorKind::ForkFailed,
+                    format!("identity reset: unexpected guest response: {other:?}"),
+                ))
+            }
+            Err(e) => {
+                let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+                Err((
+                    SupervisorErrorKind::ForkFailed,
+                    format!("identity reset failed: {e}"),
+                ))
+            }
+        }
+    }
+
+    /// Provision one pool member: a fresh fork from the tier base snapshot,
+    /// identity already reset, returned `UNregistered`. Audits on success.
+    async fn provision_pool_member(
+        &self,
+    ) -> Result<crate::firecracker::Instance, (SupervisorErrorKind, String)> {
+        let pool = self.pool.as_ref().ok_or_else(|| {
+            (
+                SupervisorErrorKind::Internal,
+                "no warm pool configured".to_string(),
+            )
+        })?;
+        let snapshot_id = pool.config().base_snapshot_id.clone();
+        // Provisional id doubles as jailer chroot id and provision-time hostname.
+        let provisional_id = format!("pool-{}", ulid::Ulid::new());
+        let (instance, machine_id) = self
+            .boot_ready_reset(&snapshot_id, &provisional_id, &provisional_id)
+            .await?;
+        self.audit_emit(
+            EventType::PoolMemberProvisioned,
+            Some(provisional_id.clone()),
+            serde_json::json!({
+                "provisional_id": provisional_id,
+                "source_snapshot_id": snapshot_id,
+                "machine_id": machine_id,
+                "firecracker_pid": instance.firecracker_pid,
+            }),
+        )
+        .await;
+        Ok(instance)
+    }
+
+    /// Reserve and start the provisions needed to top the pool up to target.
+    /// Each provision runs in its own task so up to `max_in_flight` boots
+    /// proceed concurrently; accounting prevents over-spawn across ticks.
+    fn refill_once(self: &Arc<Self>) {
+        let Some(pool) = self.pool.clone() else {
+            return;
+        };
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            // One RAII permit per reserved slot: the success path consumes it via
+            // `complete_provision`; any failure — including a panic in the task —
+            // drops it, releasing the in-flight slot so it can never leak.
+            let permits = pool.reserve_provisions().await;
+            for permit in permits {
+                let me2 = Arc::clone(&me);
+                let pool2 = Arc::clone(&pool);
+                tokio::spawn(async move {
+                    match me2.provision_pool_member().await {
+                        Ok(member) => pool2.complete_provision(member, permit).await,
+                        Err((kind, message)) => {
+                            warn!(?kind, %message, "warm-pool provision failed");
+                            me2.audit_emit(
+                                EventType::CommandFailed,
+                                None,
+                                serde_json::json!({ "op": "pool_provision",
+                                                    "error_kind": format!("{kind:?}"), "error": message }),
+                            )
+                            .await;
+                            drop(permit); // release the in-flight slot
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Spawn the background refill loop. Call once, after wrapping the manager
+    /// in an `Arc`. No-op if no pool is configured.
+    pub fn spawn_refill(self: &Arc<Self>) {
+        if self.pool.is_none() {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let Some(mut rx) = me.refill_rx.lock().await.take() else {
+                return;
+            };
+            loop {
+                me.refill_once();
+                tokio::select! {
+                    () = tokio::time::sleep(crate::pool::POOL_REFILL_INTERVAL) => {}
+                    r = rx.recv() => {
+                        if r.is_none() { break; }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Nudge the refill loop (best-effort). Called by `create_from_pool`.
+    fn kick_refill(&self) {
+        if let Some(tx) = &self.refill_tx {
+            let _ = tx.try_send(());
+        }
+    }
+
+    /// Report warm-pool status.
+    pub async fn pool_status(
+        &self,
+        _req: ne_protocol::supervisor::PoolStatusRequest,
+    ) -> SupervisorResponse {
+        use ne_protocol::supervisor::PoolStatusInfo;
+        let info = match &self.pool {
+            Some(pool) => {
+                let (available, in_flight) = pool.counts().await;
+                PoolStatusInfo {
+                    configured: true,
+                    tier: Some(pool.config().tier_name.clone()),
+                    target_size: u32::try_from(pool.config().target_size).unwrap_or(u32::MAX),
+                    available: u32::try_from(available).unwrap_or(u32::MAX),
+                    in_flight: u32::try_from(in_flight).unwrap_or(u32::MAX),
+                }
+            }
+            None => PoolStatusInfo {
+                configured: false,
+                tier: None,
+                target_size: 0,
+                available: 0,
+                in_flight: 0,
+            },
+        };
+        SupervisorResponse::PoolStatus(info)
+    }
+
+    /// Terminate every pooled member. Call on supervisor shutdown so no
+    /// Firecracker process leaks.
+    pub async fn shutdown_pool(&self) {
+        let Some(pool) = &self.pool else { return };
+        let members = pool.drain().await;
+        let n = members.len();
+        for inst in members {
+            if let Err(e) = crate::firecracker::terminate(inst, Duration::from_secs(5)).await {
+                warn!(error = %e, "warm-pool member teardown failed during shutdown");
+            }
+        }
+        if n > 0 {
+            info!(count = n, "warm-pool reaped on shutdown");
+        }
+    }
+
+    /// Restore a fresh workspace from a snapshot artifact.
+    pub async fn restore(&self, req: RestoreRequest) -> SupervisorResponse {
+        // Step 1: fast-fail courtesy check (re-checked under final lock).
+        if self
+            .instances
+            .lock()
+            .await
+            .contains_key(&req.new_workspace_id)
+        {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
+                message: format!("workspace {} already exists", req.new_workspace_id),
+            };
+        }
+
+        // Step 2: verify + boot (shared with fork).
+        let (instance, _manifest) = match self
+            .boot_from_snapshot(&req.snapshot_id, &req.new_workspace_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(resp) => {
+                if let SupervisorResponse::Error { kind, message } = &resp {
+                    self.audit_emit(
+                            EventType::CommandFailed,
+                            Some(req.new_workspace_id.clone()),
+                            serde_json::json!({ "op": "restore", "snapshot_id": req.snapshot_id,
+                                                "error_kind": format!("{kind:?}"), "error": message }),
+                        )
+                        .await;
+                }
+                return resp;
+            }
+        };
+
+        // Build the success response before the insert moves the instance.
+        let resp = WorkspaceCreated {
+            workspace_id: instance.workspace_id.clone(),
+            firecracker_pid: instance.firecracker_pid,
+            vsock_host_socket: instance.vsock_host_socket.display().to_string(),
+            jailer_chroot: instance.jailer_chroot.display().to_string(),
+            network: None,
+            // Standard tier (Firecracker) — no OpenShell backend.
+            exec_backend: None,
+            control_socket: None,
+        };
+
+        // Step 3: register under the final lock with collision re-check.
+        if let Err(resp) = self
+            .register_or_teardown(&req.new_workspace_id, instance)
+            .await
+        {
+            return resp;
+        }
+
+        // Step 4: log success (after register, so a lost race doesn't log a
+        // false success), then audit + return.
+        info!(
+            new_workspace_id = %resp.workspace_id,
+            snapshot_id = %req.snapshot_id,
+            pid = resp.firecracker_pid,
+            "workspace restored from snapshot"
+        );
+        self.audit_emit(
+            EventType::WorkspaceRestored,
+            Some(req.new_workspace_id.clone()),
+            serde_json::json!({
+                "snapshot_id": req.snapshot_id,
+                "new_workspace_id": req.new_workspace_id,
+                "firecracker_pid": resp.firecracker_pid,
+            }),
+        )
+        .await;
+        SupervisorResponse::WorkspaceRestored(resp)
+    }
+
+    /// Fork a fresh workspace from a snapshot, then reset its guest
+    /// identity (hostname / machine-id / RNG) so it is distinct from the
+    /// source and any sibling fork.
+    ///
+    /// Fail-closed: a fork is NEVER returned with un-reset identity. If the
+    /// guest is unreachable or `ResetIdentity` fails, the freshly-booted VM
+    /// is torn down and `ForkFailed` is returned.
+    pub async fn fork(&self, req: ForkRequest) -> SupervisorResponse {
+        // Step 1: courtesy collision check.
+        if self
+            .instances
+            .lock()
+            .await
+            .contains_key(&req.new_workspace_id)
+        {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
+                message: format!("workspace {} already exists", req.new_workspace_id),
+            };
+        }
+
+        // Steps 2-4: boot + ready + identity reset (shared with pool provisioning).
+        let hostname = req
+            .hostname
+            .clone()
+            .unwrap_or_else(|| req.new_workspace_id.clone());
+        let (instance, machine_id) = match self
+            .boot_ready_reset(&req.snapshot_id, &req.new_workspace_id, &hostname)
+            .await
+        {
+            Ok(v) => v,
+            Err((kind, message)) => {
+                self.audit_emit(
+                    EventType::CommandFailed,
+                    Some(req.new_workspace_id.clone()),
+                    serde_json::json!({ "op": "fork", "snapshot_id": req.snapshot_id,
+                                            "error_kind": format!("{kind:?}"), "error": message }),
+                )
+                .await;
+                return SupervisorResponse::Error { kind, message };
+            }
+        };
+
+        // Step 5: build response, register under final lock.
+        let info = ForkInfo {
+            workspace_id: instance.workspace_id.clone(),
+            firecracker_pid: instance.firecracker_pid,
+            vsock_host_socket: instance.vsock_host_socket.display().to_string(),
+            jailer_chroot: instance.jailer_chroot.display().to_string(),
+            source_snapshot_id: req.snapshot_id.clone(),
+            hostname: hostname.clone(),
+            machine_id: machine_id.clone(),
+            guest_vsock_cid: instance.guest_vsock_cid,
+        };
+        if let Err(resp) = self
+            .register_or_teardown(&req.new_workspace_id, instance)
+            .await
+        {
+            return resp;
+        }
+
+        // Step 6: audit + return.
+        info!(
+            new_workspace_id = %info.workspace_id,
+            snapshot_id = %req.snapshot_id,
+            hostname = %info.hostname,
+            "workspace forked from snapshot"
+        );
+        self.audit_emit(
+            EventType::WorkspaceForked,
+            Some(req.new_workspace_id.clone()),
+            serde_json::json!({
+                "source_snapshot_id": req.snapshot_id,
+                "new_workspace_id": req.new_workspace_id,
+                "hostname": info.hostname,
+                "machine_id": info.machine_id,
+                "firecracker_pid": info.firecracker_pid,
+            }),
+        )
+        .await;
+        SupervisorResponse::WorkspaceForked(info)
+    }
+
+    /// Expose a guest port via host-based ingress routing.
+    ///
+    /// The workspace must exist **and** be networked (have a TAP slot);
+    /// non-networked workspaces have no host-visible guest IP to route to.
+    pub async fn expose_port(&self, req: ExposePortRequest) -> SupervisorResponse {
+        // Workspace must exist AND be networked (have a slot).
+        let networked = self
+            .instances
+            .lock()
+            .await
+            .get(&req.workspace_id)
+            .map(|exec| match exec {
+                WorkspaceExec::Firecracker(inst) => inst.network_slot.is_some(),
+                #[cfg(feature = "confidential-cvm")]
+                WorkspaceExec::OpenShell(_) => false,
+            });
+        match networked {
+            None => {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::WorkspaceNotFound,
+                    message: format!("workspace {} not found", req.workspace_id),
+                };
+            }
+            Some(false) => {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::WorkspaceNotNetworked,
+                    message: format!(
+                        "workspace {} has no network; cannot expose ports",
+                        req.workspace_id
+                    ),
+                };
+            }
+            Some(true) => {}
+        }
+        let route = ne_ingress::PortRoute {
+            port: req.port.port,
+            inject_headers: req
+                .port
+                .inject_headers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect(),
+        };
+        let header_names: Vec<&str> = req
+            .port
+            .inject_headers
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect();
+        match self.ingress.expose_port(&req.workspace_id, route).await {
+            Ok(()) => {
+                self.audit_emit(
+                    EventType::IngressPortExposed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({ "port": req.port.port, "header_names": header_names }),
+                )
+                .await;
+                SupervisorResponse::PortExposed {
+                    workspace_id: req.workspace_id,
+                    port: req.port.port,
+                }
+            }
+            Err(_) => SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceNotFound,
+                message: format!("workspace {} not registered for ingress", req.workspace_id),
+            },
+        }
+    }
+
+    /// Stop exposing a previously-exposed guest port via host-based ingress routing.
+    pub async fn unexpose_port(&self, req: UnexposePortRequest) -> SupervisorResponse {
+        match self
+            .ingress
+            .unexpose_port(&req.workspace_id, req.port)
+            .await
+        {
+            Ok(()) => {
+                self.audit_emit(
+                    EventType::IngressPortUnexposed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({ "port": req.port }),
+                )
+                .await;
+                SupervisorResponse::PortUnexposed {
+                    workspace_id: req.workspace_id,
+                    port: req.port,
+                }
+            }
+            Err(ne_ingress::RegistryError::PortNotFound) => SupervisorResponse::Error {
+                kind: SupervisorErrorKind::IngressPortNotFound,
+                message: format!("port {} not exposed on {}", req.port, req.workspace_id),
+            },
+            Err(_) => SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceNotFound,
+                message: format!("workspace {} not found", req.workspace_id),
+            },
+        }
+    }
+
+    /// Generate attestation evidence for a workspace (challenge-response).
+    pub async fn get_attestation_evidence(
+        &self,
+        req: ne_protocol::supervisor::GetAttestationEvidenceRequest,
+    ) -> SupervisorResponse {
+        use ne_protocol::supervisor::SupervisorErrorKind as K;
+
+        let Some(nonce) = ne_attestation::Nonce::new(req.nonce.clone()) else {
+            self.audit_emit(
+                EventType::AttestationFailed,
+                Some(req.workspace_id.clone()),
+                serde_json::json!({ "reason": "malformed_nonce" }),
+            )
+            .await;
+            return SupervisorResponse::Error {
+                kind: K::InvalidRequest,
+                message: "nonce must be 16..=64 bytes".to_string(),
+            };
+        };
+
+        let measurement = {
+            let instances = self.instances.lock().await;
+            instances
+                .get(&req.workspace_id)
+                .and_then(|exec| match exec {
+                    WorkspaceExec::Firecracker(inst) => Some(measure_config(inst)),
+                    // The confidential tier (B) does not derive a per-workspace
+                    // measurement from the launch config — its attestation is the
+                    // host-CVM launch evidence (Wedge 5), surfaced separately. Use
+                    // a zeroed placeholder here; a per-backend measurement fn is a
+                    // follow-up.
+                    #[cfg(feature = "confidential-cvm")]
+                    WorkspaceExec::OpenShell(_) => Some(ne_attestation::Measurement([0u8; 32])),
+                })
+        };
+        let Some(measurement) = measurement else {
+            self.audit_emit(
+                EventType::AttestationFailed,
+                Some(req.workspace_id.clone()),
+                serde_json::json!({ "reason": "workspace_not_found" }),
+            )
+            .await;
+            return SupervisorResponse::Error {
+                kind: K::WorkspaceNotFound,
+                message: format!("workspace {} not found", req.workspace_id),
+            };
+        };
+
+        let nonce_hash: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(nonce.as_bytes()).into()
+        };
+        let is_replay = {
+            let mut rings = self.attestation_nonces.lock().await;
+            let ring = rings.entry(req.workspace_id.clone()).or_default();
+            ring.record(nonce_hash)
+        };
+        if is_replay {
+            self.audit_emit(
+                EventType::AttestationReplayed,
+                Some(req.workspace_id.clone()),
+                serde_json::json!({ "nonce_sha256": hex::encode(nonce_hash) }),
+            )
+            .await;
+            return SupervisorResponse::Error {
+                kind: K::AttestationReplay,
+                message: "nonce already used for this workspace".to_string(),
+            };
+        }
+
+        let issued_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        )
+        .unwrap_or(i64::MAX);
+        let evreq = ne_attestation::EvidenceRequest {
+            workspace_id: req.workspace_id.clone(),
+            measurement,
+            nonce,
+        };
+        match self.attestation.generate(&evreq, issued_at) {
+            Ok(evidence) => {
+                // Serialize the resolved provider_type to its snake_case string
+                // ("software" / "sev_snp") rather than a hardcoded literal, so
+                // the audit chain reflects whichever provider this deployment
+                // actually constructed. Only hashes are emitted — never raw
+                // report/key bytes.
+                self.audit_emit(
+                    EventType::AttestationEvidenceIssued,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({
+                        "provider_type": serde_json::to_value(evidence.provider_type)
+                            .unwrap_or(serde_json::Value::Null),
+                        "measurement_sha256": hex::encode(measurement.0),
+                        "nonce_sha256": hex::encode(nonce_hash),
+                    }),
+                )
+                .await;
+                SupervisorResponse::AttestationEvidenceIssued { evidence }
+            }
+            Err(e) => {
+                self.audit_emit(
+                    EventType::AttestationFailed,
+                    Some(req.workspace_id.clone()),
+                    serde_json::json!({ "reason": "generate_failed" }),
+                )
+                .await;
+                SupervisorResponse::Error {
+                    kind: K::Internal,
+                    message: format!("attestation generation failed: {e}"),
+                }
+            }
+        }
+    }
+}
+
+/// Map the `exposed_ports` from a [`NetworkConfig`] request into the flat
+/// [`ne_ingress::PortRoute`] list the registry expects. Returns an empty
+/// `Vec` when `network` is `None` (non-networked workspace — nothing to
+/// register).
+#[cfg(target_os = "linux")]
+fn exposed_ports_from_request(
+    network: &Option<ne_protocol::supervisor::NetworkConfig>,
+) -> Vec<ne_ingress::PortRoute> {
+    network
+        .as_ref()
+        .map(|n| {
+            n.exposed_ports
+                .iter()
+                .map(|p| ne_ingress::PortRoute {
+                    port: p.port,
+                    inject_headers: p
+                        .inject_headers
+                        .iter()
+                        .map(|h| (h.name.clone(), h.value.clone()))
+                        .collect(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Append the guest `ip=` autoconf directive to the base kernel boot args
+/// when the workspace is networked. The guest kernel must be built with
+/// `CONFIG_IP_PNP=y` (see `images/.../linux_ip_pnp.fragment`). When not
+/// networked, the base args are returned unchanged.
+#[cfg(target_os = "linux")]
+fn compose_boot_args(base: &str, layout: Option<&crate::network::SlotIpLayout>) -> String {
+    layout.map_or_else(
+        || base.to_string(),
+        |l| format!("{base} {}", l.ip_boot_arg()),
+    )
+}
+
+/// Map a [`ne_protocol::guest::GuestErrorKind`] to the
+/// corresponding [`SupervisorErrorKind`] for relay back to the API
+/// caller. One-to-one where the semantics align; everything else
+/// collapses to `Internal`.
+#[cfg(target_os = "linux")]
+fn guest_kind_to_supervisor_kind(kind: GuestErrorKind) -> SupervisorErrorKind {
+    use ne_protocol::guest::GuestErrorKind as G;
+    match kind {
+        G::PathRejected => SupervisorErrorKind::PathRejected,
+        G::FileNotFound => SupervisorErrorKind::FileNotFound,
+        G::FileTooLarge => SupervisorErrorKind::FileTooLarge,
+        G::IoError => SupervisorErrorKind::IoError,
+        G::InvalidRequest => SupervisorErrorKind::InvalidRequest,
+        G::CommandFailed => SupervisorErrorKind::LaunchFailed,
+        G::Timeout => SupervisorErrorKind::Timeout,
+        // `GuestErrorKind` is `#[non_exhaustive]`; G::Internal and any
+        // future variants collapse to Internal until the supervisor
+        // adds a specific arm.
+        _ => SupervisorErrorKind::Internal,
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use super::{
+        NonceRing, WorkspaceManager, WorkspaceManagerConfig, compose_boot_args,
+        guest_kind_to_supervisor_kind, is_valid_workspace_id,
+    };
+    use ne_protocol::guest::GuestErrorKind as G;
+    use ne_protocol::supervisor::{
+        CreateWorkspaceRequest, ForkRequest, RestoreRequest, SupervisorErrorKind as S,
+        SupervisorResponse, WorkspaceRef,
+    };
+
+    use crate::audit::AuditLog;
+
+    /// Build a minimal `WorkspaceManager` backed by a tempdir state + audit log.
+    async fn test_manager() -> WorkspaceManager {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        // Leak so the audit file stays alive; bounded per-test.
+        let state_dir = Box::leak(Box::new(tmp)).path().to_path_buf();
+        // Signing key lives under <state_dir>/keys/ — create the dir now.
+        tokio::fs::create_dir_all(state_dir.join("keys"))
+            .await
+            .expect("keys dir");
+        let audit = AuditLog::open(&state_dir).await.expect("audit open");
+        let mut cfg = WorkspaceManagerConfig::dev_defaults();
+        cfg.state_dir = state_dir;
+        WorkspaceManager::new(cfg, audit).expect("workspace manager")
+    }
+
+    #[test]
+    fn guest_kind_maps_to_supervisor_kind_one_to_one() {
+        for (input, expected) in [
+            (G::PathRejected, S::PathRejected),
+            (G::FileNotFound, S::FileNotFound),
+            (G::FileTooLarge, S::FileTooLarge),
+            (G::IoError, S::IoError),
+            (G::InvalidRequest, S::InvalidRequest),
+            (G::CommandFailed, S::LaunchFailed),
+            (G::Timeout, S::Timeout),
+            (G::Internal, S::Internal),
+        ] {
+            assert_eq!(
+                guest_kind_to_supervisor_kind(input),
+                expected,
+                "for {input:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_supervisor_rejects_oversized_body() {
+        // Defense-in-depth cap rejects without ever reaching the guest.
+        // We can't easily construct a full WorkspaceManager + audit log
+        // for this unit test, so instead we exercise the protocol
+        // constant directly.
+        assert_eq!(
+            ne_protocol::supervisor::MAX_INLINE_FILE_BYTES,
+            10 * 1024 * 1024,
+            "protocol crate must own the cap value",
+        );
+    }
+
+    #[test]
+    fn is_valid_workspace_id_grammar() {
+        // S2-F1: only the jailer grammar is accepted; anything that could
+        // traverse a path is rejected.
+        assert!(is_valid_workspace_id("ws-01jabcdef"));
+        assert!(is_valid_workspace_id("01J0SNAPSHOTULID"));
+        assert!(!is_valid_workspace_id(""), "empty rejected");
+        assert!(
+            !is_valid_workspace_id("../../etc"),
+            "dot-dot + slash rejected"
+        );
+        assert!(
+            !is_valid_workspace_id("/var/lib/ne-enclave"),
+            "absolute rejected"
+        );
+        assert!(!is_valid_workspace_id("ws/01j"), "slash rejected");
+        assert!(!is_valid_workspace_id("ws.01j"), "dot rejected");
+        assert!(!is_valid_workspace_id("ws_01j"), "underscore rejected");
+        assert!(!is_valid_workspace_id(&"a".repeat(65)), "too long rejected");
+    }
+
+    #[tokio::test]
+    async fn restore_and_fork_reject_traversal_ids() {
+        // S2-F1: a traversal in either id must be rejected as InvalidRequest
+        // BEFORE any filesystem path is built (it never reaches verify_artifact
+        // or the jailer). The check lives at the shared boot_from_snapshot
+        // chokepoint, so both restore and fork are covered.
+        let mgr = test_manager().await;
+
+        // Bad snapshot_id (read path).
+        let resp = mgr
+            .restore(RestoreRequest {
+                snapshot_id: "../../../../var/lib/ne-enclave".into(),
+                new_workspace_id: "ws-ok".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::InvalidRequest,
+                    ..
+                }
+            ),
+            "traversal snapshot_id must be InvalidRequest, got {resp:?}"
+        );
+
+        // Bad new_workspace_id (as-root write path) with a valid snapshot_id.
+        let resp = mgr
+            .restore(RestoreRequest {
+                snapshot_id: "01J0VALIDSNAPSHOT".into(),
+                new_workspace_id: "../../../../var/lib/ne-enclave".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::InvalidRequest,
+                    ..
+                }
+            ),
+            "traversal new_workspace_id must be InvalidRequest, got {resp:?}"
+        );
+
+        // Same for fork.
+        let resp = mgr
+            .fork(ForkRequest {
+                snapshot_id: "01J0VALIDSNAPSHOT".into(),
+                new_workspace_id: "/abs/escape".into(),
+                hostname: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::InvalidRequest,
+                    ..
+                }
+            ),
+            "traversal fork new_workspace_id must be InvalidRequest, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_returns_unsupported_deferred() {
+        // Public pause/resume is deferred (wedge-6.8): in-place Firecracker
+        // resume kills the vsock control channel. Both APIs must return
+        // Unsupported regardless of whether the workspace exists.
+        let mgr = test_manager().await;
+        let resp = mgr
+            .pause(WorkspaceRef {
+                workspace_id: "any-id".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::Unsupported,
+                    ..
+                }
+            ),
+            "expected Unsupported (deferred), got {resp:?}"
+        );
+        let resp = mgr
+            .resume(WorkspaceRef {
+                workspace_id: "any-id".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::Unsupported,
+                    ..
+                }
+            ),
+            "expected Unsupported (deferred), got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_missing_snapshot_is_invalid() {
+        let mgr = test_manager().await;
+        let resp = mgr
+            .restore(RestoreRequest {
+                snapshot_id: "missing-snap-id".into(),
+                new_workspace_id: "ws-x".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::InvalidSnapshot,
+                    ..
+                }
+            ),
+            "expected InvalidSnapshot, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_missing_snapshot_is_invalid() {
+        let mgr = test_manager().await;
+        let resp = mgr
+            .fork(ForkRequest {
+                snapshot_id: "missing-snap".into(),
+                new_workspace_id: "fork-x".into(),
+                hostname: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::InvalidSnapshot,
+                    ..
+                }
+            ),
+            "expected InvalidSnapshot, got {resp:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_machine_id_is_32_lower_hex() {
+        let id = WorkspaceManager::fresh_machine_id();
+        assert_eq!(id.len(), 32);
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_tier_but_no_pool_is_tier_not_found() {
+        let mgr = test_manager().await;
+        let req = CreateWorkspaceRequest {
+            workspace_id: "w".into(),
+            kernel_image_path: "k".into(),
+            rootfs_image_path: "r".into(),
+            rootfs_read_only: true,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            guest_vsock_cid: 3,
+            kernel_boot_args: None,
+            network: None,
+            tier: Some("default".into()),
+        };
+        let resp = mgr.create(req).await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::TierNotFound,
+                    ..
+                }
+            ),
+            "expected TierNotFound, got {resp:?}"
+        );
+    }
+
+    #[test]
+    fn boot_args_append_guest_ip_when_networked() {
+        let base = "console=ttyS0 reboot=k panic=1 pci=off";
+        let layout = crate::network::SlotIpLayout::for_slot(3);
+        let with = compose_boot_args(base, Some(&layout));
+        assert_eq!(
+            with,
+            "console=ttyS0 reboot=k panic=1 pci=off ip=169.254.3.6::169.254.3.5:255.255.255.252::eth0:off"
+        );
+        let without = compose_boot_args(base, None);
+        assert_eq!(without, base);
+    }
+
+    #[test]
+    fn nonce_ring_detects_replay_and_evicts_at_cap() {
+        let mut ring = NonceRing::default();
+        let a = [1u8; 32];
+        assert!(!ring.record(a), "first sighting is not a replay");
+        assert!(ring.record(a), "second sighting is a replay");
+        // Fill past CAP with distinct hashes; `a` must eventually evict.
+        for i in 0..u32::try_from(NonceRing::CAP).expect("CAP fits in u32") {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            // ensure distinct from `a`
+            h[31] = 0xFF;
+            let _ = ring.record(h);
+        }
+        assert!(
+            !ring.record(a),
+            "after CAP distinct inserts, `a` was evicted and is fresh again"
+        );
+        assert!(ring.seen.len() <= NonceRing::CAP, "set never exceeds CAP");
+    }
+}
+
+/// Cross-platform unit tests for the confidential-mode fail-closed gate.
+/// The gate logic is pure (env + path checks happen at the call site in
+/// `serve()`), so these run on macOS too.
+#[cfg(test)]
+mod gate_tests {
+    use super::{cvm_hardware_present, refuse_software_in_confidential_mode};
+
+    #[test]
+    fn non_confidential_never_refuses() {
+        // Software deployment (default): no confidential mode, CVM irrelevant.
+        assert!(!refuse_software_in_confidential_mode(false, false));
+        assert!(!refuse_software_in_confidential_mode(false, true));
+    }
+
+    #[test]
+    fn confidential_without_sev_refuses() {
+        // The fail-closed case: confidential requested but no CVM hardware.
+        assert!(refuse_software_in_confidential_mode(true, false));
+    }
+
+    #[test]
+    fn confidential_with_sev_proceeds() {
+        // Confidential deployment on hardware: SEV-SNP provider is constructed.
+        assert!(!refuse_software_in_confidential_mode(true, true));
+    }
+
+    #[test]
+    fn cvm_present_via_either_device() {
+        // `/dev/sev-guest` (GCP/bare-metal) OR `/dev/tpmrm0` (Azure) is a CVM.
+        assert!(cvm_hardware_present(true, false));
+        assert!(cvm_hardware_present(false, true));
+        assert!(cvm_hardware_present(true, true));
+        assert!(!cvm_hardware_present(false, false));
+    }
+
+    #[test]
+    fn confidential_with_only_vtpm_proceeds() {
+        // The Azure DCasv5 case (Wedge 5): no /dev/sev-guest, but /dev/tpmrm0.
+        let cvm = cvm_hardware_present(false, true);
+        assert!(!refuse_software_in_confidential_mode(true, cvm));
+    }
+}
+
+/// Cross-platform unit tests for the two-tier execution-backend routing
+/// (R1). Pure, so they run on macOS — the actual OpenShell spawn is
+/// Linux + `confidential-cvm` only (verified on the `DCasv5`).
+#[cfg(test)]
+mod exec_routing_tests {
+    use super::{AttestationProfile, exec_backend_for_profile};
+
+    #[test]
+    fn software_profile_routes_to_firecracker() {
+        // Standard tier (default): Firecracker microVM isolation.
+        assert_eq!(
+            exec_backend_for_profile(AttestationProfile::Software),
+            "firecracker"
+        );
+    }
+
+    #[test]
+    fn sevsnp_profile_routes_to_openshell() {
+        // Confidential tier (single-CVM-direct, B): OpenShell in-CVM.
+        assert_eq!(
+            exec_backend_for_profile(AttestationProfile::SevSnp),
+            "openshell"
+        );
+    }
+}

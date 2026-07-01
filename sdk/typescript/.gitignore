@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.DS_Store
+
+# Root .gitignore excludes package-lock.json globally (legacy
+# convention from the standalone NeuronEdge SaaS). CI's
+# actions/setup-node cache step needs the lockfile checked in, so
+# we re-include it just for this SDK.
+!package-lock.json
