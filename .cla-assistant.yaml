@@ -1,0 +1,42 @@
+# cla-assistant configuration.
+# Docs: https://github.com/contributor-assistant/github-action
+#
+# This file configures the CLA check that runs on every pull request. Until the
+# @cla-assistant GitHub App is installed on the Infrastacks org and this repo is
+# opted in, this file has no effect. See CONTRIBUTING.md / CLA.md for the terms.
+#
+# Once the action is wired into CI (or the app is installed), a contributor opens
+# a PR, the bot comments with a one-click CLA sign-off link, and the PR is
+# blocked from merge until the CLA is signed.
+
+# Require the CLA on every change to every file.
+updateWorkflow: true
+allowRemote: false
+
+# The CLA document contributors agree to.
+cla:
+  content: |
+    By signing this CLA, you confirm that you have read and agree to the
+    NeuronEdge Enclave Contributor License Agreement
+    (https://github.com/Infrastacks/ne-enclave/blob/main/CLA.md), which grants
+    Infrastacks LLC a broad license to your contribution and preserves the
+    project's option to relicense under any OSI-approved license no more
+    restrictive than Apache-2.0. You retain your copyrights.
+
+# Where signed agreements are stored (a branch in this repo).
+agreement:
+  file: '.cla/signatures/cla.json'
+  branch: 'cla-signatures'
+
+# Labels applied once the CLA is signed.
+signedBadge:
+  label: 'cla-signed'
+  color: '#2ECC71'
+
+# Labels applied when the CLA is NOT yet signed.
+unsignedBadge:
+  label: 'cla-required'
+  color: '#E74C3C'
+
+# Lock the PR from merge until the CLA is signed.
+lockCheck: true
