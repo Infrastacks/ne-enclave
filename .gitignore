@@ -1,0 +1,33 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# WASM build artifacts (generated from crates/ne-enclave-wasm)
+/crates/*/pkg/
+
+# Python SDK
+/sdk/*/.venv/
+/sdk/*/__pycache__/
+/sdk/*/*.egg-info/
+/sdk/*/.pytest_cache/
+/sdk/*/dist/
+/sdk/*/.ruff_cache/
+
+# Node / TypeScript SDK
+/sdk/*/node_modules/
+/sdk/*/dist/
+/sdk/*/build/
+/sdk/*/.turbo/
+
+# Guest image build artifacts
+/target/images/
+/images/buildroot/output/
+/images/buildroot/dl/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
