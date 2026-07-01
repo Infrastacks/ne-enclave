@@ -142,6 +142,8 @@ Built on two production-credible Apache-2.0 Rust projects, both under Infrastack
 - **Confidential tier:** the workspace runs inside an AMD SEV-SNP CVM — operator-excluded, hardware-attested. Key release is gated on a two-layer binding (the boot-fixed AMD report + a TPM-Quote nonce), verified to the genuine AMD Milan ARK.
 - **Honest ceiling:** the confidential tier attests the *host CVM launch*, not the agent's guest code (guest-code measurement is a tracked follow-on). The isolation within the CVM is OpenShell's shared-kernel sandbox (Landlock/seccomp/netns), not a separate per-workspace hardware boundary (that's a future bare-metal tier). Per-workspace hardware isolation via nested microVMs is architecturally impossible on managed cloud (AMD SEV-SNP strips the virtualization extensions from the leaf guest).
 
+The full, as-built threat model — trust boundaries, attack trees, and an explicit residual-risk register — is in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md). It is written for a hostile reader and names every limitation honestly.
+
 ---
 
 ## Status
@@ -159,6 +161,7 @@ Built on two production-credible Apache-2.0 Rust projects, both under Infrastack
 ## Documentation
 
 - [**Self-host install guide**](deploy/README.md) — the operator-facing deep dive: install layout, hardened systemd units, networking model, air-gapped installs, and the confidential-tier activation path.
+- [Threat model](docs/THREAT-MODEL.md) — the as-built security posture: trust boundaries, attack trees, and an explicit residual-risk register.
 - [Benchmark harness](bench/README.md) — the measurement harness (cold start, boot storm, density, exec latency, snapshot/restore).
 
 ---
