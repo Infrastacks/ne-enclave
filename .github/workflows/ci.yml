@@ -21,13 +21,11 @@ jobs:
       - uses: actions/checkout@v6
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          # `check` is the cargo-deny subcommand; the action runs
-          # `cargo deny <arguments>`. Runs all checks (advisories, bans,
-          # licenses, sources) per deny.toml — rejects AGPL/SSPL/GPL and
-          # flags known vulnerabilities. cargo-deny reads Cargo.lock
-          # metadata only (no compilation), so the toolchain pin is moot.
-          arguments: check
+        # The action's `command` input defaults to `check`, running all checks
+        # (advisories, bans, licenses, sources) per deny.toml. No `arguments`
+        # needed — passing `check` there would make it `cargo deny check check`.
+        # cargo-deny reads Cargo.lock metadata only (no compilation), so the
+        # pinned toolchain is moot for this job.
 
   lint:
     name: fmt + clippy
