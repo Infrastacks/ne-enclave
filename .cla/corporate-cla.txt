@@ -1,0 +1,88 @@
+CORPORATE CONTRIBUTOR LICENSE AGREEMENT
+NeuronEdge Enclave — Infrastacks LLC
+
+> DRAFT TEMPLATE — NOT LEGAL ADVICE. Have qualified counsel review and
+> finalize before relying on this document.
+
+This Corporate Contributor License Agreement ("Agreement") is entered into
+between the entity signing below ("You" or "Contributor") and Infrastacks LLC
+("Infrastacks"), applying to Contributions to the NeuronEdge Enclave Project
+(the "Project"). It mirrors the Individual CLA and adds the corporate
+authority representations required so that employee contributions are
+cleanly covered.
+
+1. Definitions.
+   "Contribution" has the same meaning as in the Project's Individual
+   Contributor License Agreement, and includes all original works of
+   authorship, including modifications or additions to existing works, that
+   are submitted by You or Your employees to the Project.
+
+   "Designees" means the employees, contractors, and agents of Contributor
+   who submit Contributions on behalf of Contributor.
+
+2. Grant of Copyright License. Subject to the terms and conditions of this
+   Agreement, Contributor hereby grants to Infrastacks and to recipients of
+   software distributed by the Project a perpetual, worldwide, non-exclusive,
+   no-charge, royalty-free, irrevocable copyright license to reproduce,
+   prepare derivative works of, publicly display, publicly perform, sublicense,
+   and distribute the Contributions and such derivative works.
+
+3. Grant of Patent License. Subject to the terms and conditions of this
+   Agreement, Contributor hereby grants to Infrastacks and to recipients of
+   software distributed by the Project a perpetual, worldwide, non-exclusive,
+   no-charge, royalty-free, irrevocable (except as stated in this section)
+   patent license to make, have made, use, offer to sell, sell, import, and
+   otherwise transfer the Work, where such license applies only to those
+   patent claims licensable by Contributor that are necessarily infringed by
+   its Contribution(s) alone or by combination of its Contribution(s) with
+   the Work to which such Contribution(s) was submitted. If any entity
+   institutes patent litigation against You or any other entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Contribution,
+   or the Work to which you contributed, constitutes direct or contributory
+   patent infringement, then any patent licenses granted to that entity under
+   this Agreement for that Contribution or Work shall terminate as of the date
+   such litigation is filed.
+
+4. Relicensing Authorization. Contributor agrees that Infrastacks may
+   distribute the Contributions under the Apache License, Version 2.0, or
+   under any other license that Infrastacks selects for the Project (a
+   "Change License"), provided that the Change License at the time of its
+   adoption either (a) has been approved as an open-source license by the
+   Open Source Initiative (OSI), or (b) is no more restrictive than the
+   Apache License, Version 2.0 with respect to the rights to use, copy,
+   modify, merge, distribute, and sublicense the code. This Section 4 survives
+   termination of this Agreement and is irrevocable.
+
+5. Corporate Authority. Contributor represents that (a) it is duly organized
+   and validly existing under the laws of its jurisdiction; (b) the individual
+   executing this Agreement on its behalf is duly authorized to do so; and
+   (c) Contributor holds the rights to the Contributions submitted by its
+   Designees and has the full right, power, and authority to grant the
+   licenses set forth herein.
+
+6. Designation of Designees. Contributor shall maintain a current list of its
+   Designees authorized to submit Contributions on its behalf and shall
+   promptly update the list with the Project. Contributions by individuals
+   not on the current Designee list will be treated as individual
+   Contributions requiring a separate Individual CLA.
+
+7. Disclaimer. Unless required by applicable law or agreed to in writing, the
+   Contributions are provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied, including, without
+   limitation, any warranties or conditions of TITLE, NON-INFRINGEMENT,
+   MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE.
+
+Please sign:
+
+Corporation name: ______________________________________
+Signatory name:   ______________________________________
+Title:            ______________________________________
+Email:            ______________________________________
+Address:          ______________________________________
+Country:          ______________________________________
+GitHub org:       ______________________________________
+Date:             ______________________________________
+
+By signing, the signatory confirms they have read and agree to the terms of
+this Corporate Contributor License Agreement and that they are authorized to
+bind the Contributor.
