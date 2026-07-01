@@ -19,10 +19,20 @@ This product includes software developed by third parties:
 
 - NVIDIA OpenShell (Apache-2.0)
   https://github.com/Infrastacks/OpenShell
-  The agent-sandbox governance layer: Landlock/seccomp/netns isolation,
-  the L7 OPA policy engine, PII detection, and supply-chain enforcement.
-  Consumed via the openshell-pii crate (privacy router) and the
-  openshell-sandbox binary (confidential tier execution substrate).
+  Upstream (NVIDIA): the agent-sandbox governance layer — Landlock/seccomp/
+  netns isolation, the L7 OPA policy engine, and the sandbox gateway.
+  Consumed as the execution substrate on the confidential tier.
+
+- Infrastacks OpenShell fork — PII detection + supply-chain enforcement
+  (Apache-2.0; https://github.com/Infrastacks/OpenShell)
+  Infrastacks additions layered on NVIDIA's OpenShell:
+    - openshell-pii          — the PII detection engine (healthcare IDs,
+                               international IDs, financial IDs, driver
+                               licenses, technical IDs; ~86 detector patterns)
+    - openshell-pii-proxy    — the L7 privacy/PII-redaction proxy
+    - openshell-supply-chain — the supply-chain policy enforcement engine
+  Founding commits: 77e69a3, 86e1556, 000a108.
+  Consumed by this runtime via the ne-privacy-router crate.
 
 - AWS Firecracker (Apache-2.0)
   https://github.com/firecracker-microvm/firecracker
