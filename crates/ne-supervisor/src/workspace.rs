@@ -510,19 +510,22 @@ impl WorkspaceManager {
             // SevSnp construction is Linux-only; IoctlSnpReportSource::open()
             // is still a Task-9 stub but the wiring is in place.
             attestation: match attestation_profile {
-                AttestationProfile::Software => Arc::new(ne_attestation::SoftwareProvider::new(
-                    attestation_signing_key,
-                ))
-                    as Arc<dyn ne_attestation::AttestationProvider>,
+                AttestationProfile::Software => {
+                    let provider: Arc<dyn ne_attestation::AttestationProvider> = Arc::new(
+                        ne_attestation::SoftwareProvider::new(attestation_signing_key),
+                    );
+                    provider
+                }
                 AttestationProfile::SevSnp => {
                     use ne_attestation::snp_source::IoctlSnpReportSource;
                     use ne_attestation::vcek::{KdsVcekFetcher, VcekCache, VcekFetcher};
-                    let source = Arc::new(IoctlSnpReportSource::open()?)
-                        as Arc<dyn ne_attestation::SnpReportSource>;
-                    let vcek =
-                        Arc::new(VcekCache::new(KdsVcekFetcher::new())) as Arc<dyn VcekFetcher>;
-                    Arc::new(ne_attestation::SevSnpProvider::new(source, vcek))
-                        as Arc<dyn ne_attestation::AttestationProvider>
+                    let source: Arc<dyn ne_attestation::SnpReportSource> =
+                        Arc::new(IoctlSnpReportSource::open()?);
+                    let vcek: Arc<dyn VcekFetcher> =
+                        Arc::new(VcekCache::new(KdsVcekFetcher::new()));
+                    let provider: Arc<dyn ne_attestation::AttestationProvider> =
+                        Arc::new(ne_attestation::SevSnpProvider::new(source, vcek));
+                    provider
                 }
             },
             attestation_nonces: Mutex::new(HashMap::new()),
@@ -1685,9 +1688,13 @@ impl WorkspaceManager {
             // Snapshot is Firecracker-vmstate-coupled; the confidential tier
             // (OpenShell) returns Unsupported in B v1 (a process-checkpoint
             // format is a later wedge). Unwrap the FC variant for the rest.
+            #[cfg(not(feature = "confidential-cvm"))]
+            let WorkspaceExec::Firecracker(instance) = exec else {
+                unreachable!()
+            };
+            #[cfg(feature = "confidential-cvm")]
             let instance = match exec {
                 WorkspaceExec::Firecracker(inst) => inst,
-                #[cfg(feature = "confidential-cvm")]
                 WorkspaceExec::OpenShell(_) => {
                     return SupervisorResponse::Error {
                         kind: SupervisorErrorKind::Unsupported,
@@ -2148,9 +2155,13 @@ impl WorkspaceManager {
 
         // Reap the old frozen FC process + chroot (outside the lock). Live
         // snapshot is FC-only, so unwrap the Firecracker variant.
+        #[cfg(not(feature = "confidential-cvm"))]
+        let WorkspaceExec::Firecracker(old_instance) = old else {
+            unreachable!()
+        };
+        #[cfg(feature = "confidential-cvm")]
         let old_instance = match old {
             WorkspaceExec::Firecracker(inst) => inst,
-            #[cfg(feature = "confidential-cvm")]
             WorkspaceExec::OpenShell(_) => {
                 warn!(workspace_id = %source_ws_id, "live hot-swap: old was OpenShell (snapshot unsupported there) — skipping FC reap");
                 return Ok(new_pid);

@@ -1,4 +1,8 @@
 [toolchain]
-channel = "stable"
+# Pinned (not "stable") so the clippy gate is reproducible across local + CI.
+# The workspace `rust-version` floor is 1.88; this is the version the gate is
+# validated against. Bump deliberately, after re-running clippy on the new
+# toolchain, to avoid releases breaking on toolchain drift.
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
