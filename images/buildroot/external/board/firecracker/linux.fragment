@@ -1,0 +1,29 @@
+# Kernel config fragment applied on top of the stock x86_64 defconfig
+# (via BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES). Forces the drivers and
+# filesystems Firecracker's virtual hardware exposes to be built INTO
+# the kernel — without an initramfs the kernel can't load modules
+# before mounting root, so anything we need at boot must be =y.
+
+# virtio transports + console
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_CONSOLE=y
+
+# virtio block (rootfs at /dev/vda)
+CONFIG_VIRTIO_BLK=y
+
+# virtio net (egress in Phase 1 once networking lands)
+CONFIG_VIRTIO_NET=y
+
+# vsock subsystem + virtio transport (host↔guest control channel)
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+
+# virtio entropy (Firecracker exposes virtio-rng to the guest)
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+
+# Filesystems for the rootfs
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_USE_FOR_EXT2=y

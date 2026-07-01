@@ -1,0 +1,6 @@
+# Kernel config fragment: IP_PNP support for ip= boot-arg autoconfiguration.
+# Enables the guest kernel to self-configure eth0 from the Firecracker-supplied
+# ip= kernel command-line argument without a DHCP client in userspace.
+
+CONFIG_IP_PNP=y
+CONFIG_IP_PNP_DHCP=n

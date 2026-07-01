@@ -1,0 +1,8 @@
+# Busybox config fragment: enable the httpd applet + CGI execution.
+# Required as the in-guest HTTP responder for the ingress e2e tests.
+# CGI is needed so the e2e can reflect injected request headers (the
+# /cgi-bin/echo script prints $HTTP_X_ENCLAVE_AUTH); without it httpd serves
+# the script as a static file.
+
+CONFIG_HTTPD=y
+CONFIG_FEATURE_HTTPD_CGI=y

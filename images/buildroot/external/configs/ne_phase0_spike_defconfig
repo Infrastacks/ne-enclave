@@ -1,0 +1,44 @@
+# NeuronEdge Enclave Phase 0 spike defconfig — minimal Firecracker-targeted
+# guest image. No bootloader, no firmware, no networking config
+# beyond what Firecracker provides via virtio.
+#
+# Mirrors the surface of Buildroot's own qemu_x86_64_defconfig so we
+# inherit the working glibc + host-headers selection. Differences:
+#   - drops QEMU host package, qemu-board patches, DHCP setup
+#   - adds our post-build hook that bakes ne-guest-agent in
+#   - drops the qemu kernel.config in favor of the kernel's stock
+#     x86_64 defconfig (slimmer custom config arrives in a follow-up
+#     iteration once the pipeline is proven)
+
+BR2_x86_64=y
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_12=y
+
+# Kernel — Firecracker boots vmlinux directly; no bootloader needed.
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="6.12.27"
+BR2_LINUX_KERNEL_USE_DEFCONFIG=y
+BR2_LINUX_KERNEL_DEFCONFIG="x86_64"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_NE_ENCLAVE_PATH)/board/firecracker/linux.fragment $(BR2_EXTERNAL_NE_ENCLAVE_PATH)/configs/linux_ip_pnp.fragment"
+BR2_LINUX_KERNEL_VMLINUX=y
+BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
+
+# Userspace — busybox only for Phase 0 spike. The guest agent
+# gets layered in via post-build script.
+BR2_PACKAGE_BUSYBOX=y
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_NE_ENCLAVE_PATH)/configs/busybox_ingress.fragment"
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_DEVTMPFS=y
+
+# Rootfs format — ext4. Firecracker mounts this as the root device.
+# 128 MiB fits the stock x86_64 kernel modules + busybox + agent
+# with comfortable headroom; a follow-up iteration with a slim
+# kernel config will let us shrink this back to ~32 MiB.
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+# BR2_TARGET_ROOTFS_TAR is not set
+
+# Post-build hook — bakes the cross-compiled ne-guest-agent into
+# the rootfs when NE_GUEST_AGENT_BIN points at a valid binary.
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_NE_ENCLAVE_PATH)/board/firecracker/post-build.sh"

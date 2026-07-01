@@ -1,0 +1,42 @@
+# NeuronEdge Enclave — reference systemd unit for the unprivileged API front door.
+#
+# Static reference copy of crates/ne/templates/ne-api.service.tmpl. `nee install`
+# writes the live copy to /etc/systemd/system/ne-api.service (identical content).
+# See deploy/README.md § "The two systemd units".
+
+[Unit]
+Description=NeuronEdge Enclave API front door (gRPC + REST)
+Documentation=https://github.com/Infrastacks/ne-enclave
+After=ne-supervisor.service
+Requires=ne-supervisor.service
+
+[Service]
+Type=simple
+ExecStart=/opt/ne-enclave/bin/nee serve-api
+EnvironmentFile=/etc/ne-enclave/ne-enclave.env
+Restart=on-failure
+RestartSec=2
+
+# Unprivileged, network-facing -> aggressive sandbox.
+User=ne
+Group=ne
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/ne-enclave
+
+# If in-process TLS is enabled (NE_TLS_CERT / NE_TLS_KEY), the cert
+# and key files must be readable by the ne user. ProtectSystem=strict +
+# ProtectHome=true above mean they should live under /etc/ne-enclave (already
+# readable) — add a ReadOnlyPaths= entry if you place them elsewhere.
+
+[Install]
+WantedBy=multi-user.target
