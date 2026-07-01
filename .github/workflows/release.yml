@@ -155,10 +155,13 @@ jobs:
             staging/SHA256SUMS
 
   # ---- Publish @neuronedge/enclave to npm ----
+  # Skipped until NPM_TOKEN is set on the repo. Set the secret and the next
+  # tag will publish; until then the binary + GitHub Release still ship.
   npm:
     name: npm publish
     runs-on: ubuntu-24.04
     needs: [gauntlet, version-check]
+    if: vars.ENABLE_SDK_PUBLISH == 'true'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -180,10 +183,12 @@ jobs:
         run: npm publish --access public
 
   # ---- Publish neuronedge-enclave to PyPI ----
+  # Skipped until PYPI_TOKEN is set on the repo (gated by the same var as npm).
   pypi:
     name: PyPI publish
     runs-on: ubuntu-24.04
     needs: [gauntlet, version-check]
+    if: vars.ENABLE_SDK_PUBLISH == 'true'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
