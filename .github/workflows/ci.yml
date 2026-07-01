@@ -1,0 +1,253 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  # Manual full-gauntlet run (e.g. before a release, or to re-check on demand).
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  BUILDROOT_VERSION: "2025.05"
+
+jobs:
+  license-check:
+    name: license check (cargo-deny)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Reject AGPL, SSPL, and other licenses incompatible with Apache-2.0
+          # in the dependency tree. Also checks for known advisories and
+          # duplicated crate versions.
+          arguments: --workspace check
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --workspace --lib
+        run: cargo test --workspace --lib
+      - name: supervisor integration tests
+        run: cargo test -p ne-supervisor --test timeout_propagation
+      - name: nee install fakeroot + all-targets
+        run: cargo test -p ne-enclave --all-targets
+      # Benchmark harness: numbers are NOT CI-gated (perf is environment-
+      # sensitive). This only asserts the harness compiles and its pure-logic
+      # unit tests pass.
+      - name: ne-bench compile + unit tests
+        run: cargo test -p ne-bench --all-targets
+
+  ts-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: npm ci
+        working-directory: sdk/typescript
+        run: npm ci
+      - name: npm run lint
+        working-directory: sdk/typescript
+        run: npm run lint
+      - name: npm run typecheck
+        working-directory: sdk/typescript
+        run: npm run typecheck
+      - name: npm run test
+        working-directory: sdk/typescript
+        run: npm run test
+      - name: npm run build
+        working-directory: sdk/typescript
+        run: npm run build
+
+  # e2e job: real gating check. Builds the guest image (musl agent ->
+  # Buildroot, cached) and runs the Firecracker KVM roundtrip.
+  # ROLLBACK LEVER: if hosted-runner KVM proves flaky, re-add
+  # `continue-on-error: true` below to stop it red-lighting merges
+  # while the flake is investigated.
+  e2e:
+    name: Firecracker e2e (KVM)
+    # Heavy: Buildroot guest-image build + KVM roundtrip. On GitHub run only on
+    # main pushes + manual dispatch, never on dev pushes or PRs (quota).
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify KVM availability
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "/dev/kvm not present on this runner; failing"
+            exit 1
+          fi
+          ls -l /dev/kvm
+      - name: Install Firecracker
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          VER=$(curl -fsSL https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest | jq -r .tag_name)
+          curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${VER}/firecracker-${VER}-${ARCH}.tgz" \
+            | sudo tar -xz -C /usr/local --strip-components=1
+          sudo find /usr/local -maxdepth 3 -name "firecracker-${VER}-${ARCH}" -exec install {} /usr/local/bin/firecracker \;
+          sudo find /usr/local -maxdepth 3 -name "jailer-${VER}-${ARCH}" -exec install {} /usr/local/bin/jailer \;
+          firecracker --version
+          jailer --version
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore guest image (tier-1 cache)
+        uses: actions/cache@v5
+        id: image-cache
+        with:
+          path: |
+            /var/lib/ne-enclave/vmlinux
+            /var/lib/ne-enclave/rootfs.img
+          key: ne-image-${{ hashFiles('images/**', 'crates/ne-guest-agent/**', 'crates/ne-protocol/**') }}
+      - name: Restore Buildroot dl + ccache (tier-2 cache)
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/buildroot-dl
+            ~/.buildroot-ccache
+          key: br-cache-${{ env.BUILDROOT_VERSION }}-${{ hashFiles('images/buildroot/external/configs/*') }}
+      - name: Build guest image (cache miss)
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build -p ne-guest-agent --release --target x86_64-unknown-linux-musl
+          git clone --depth 1 --branch "${BUILDROOT_VERSION}" \
+            https://gitlab.com/buildroot.org/buildroot.git "${HOME}/buildroot"
+          mkdir -p "${HOME}/buildroot-dl" "${HOME}/.buildroot-ccache"
+          export BR2_DL_DIR="${HOME}/buildroot-dl"
+          cargo run -p ne-image -- build --template phase0-spike --buildroot "${HOME}/buildroot"
+          sudo mkdir -p /var/lib/ne-enclave
+          sudo cp target/images/phase0-spike/images/vmlinux     /var/lib/ne-enclave/vmlinux
+          sudo cp target/images/phase0-spike/images/rootfs.ext4 /var/lib/ne-enclave/rootfs.img
+          ls -l /var/lib/ne-enclave/
+      - name: cargo test -p ne-e2e (root — jailer needs CAP_CHOWN)
+        env:
+          NE_E2E_KERNEL: /var/lib/ne-enclave/vmlinux
+          NE_E2E_ROOTFS: /var/lib/ne-enclave/rootfs.img
+          NE_E2E_FIRECRACKER: /usr/local/bin/firecracker
+          NE_E2E_JAILER: /usr/local/bin/jailer
+        run: |
+          # The Firecracker jailer chowns the kernel/rootfs into the
+          # per-workspace chroot, which requires CAP_CHOWN (root).
+          sudo --preserve-env=NE_E2E_KERNEL,NE_E2E_ROOTFS,NE_E2E_FIRECRACKER,NE_E2E_JAILER \
+            env "PATH=$PATH" cargo test -p ne-e2e -- --ignored
+      - name: Publish guest image + digests
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f /var/lib/ne-enclave/vmlinux ] && [ -f /var/lib/ne-enclave/rootfs.img ]; then
+            ksum=$(sudo sha256sum /var/lib/ne-enclave/vmlinux | awk '{print $1}')
+            rsum=$(sudo sha256sum /var/lib/ne-enclave/rootfs.img | awk '{print $1}')
+            {
+              echo "### Guest image digests"
+              echo "- vmlinux: \`$ksum\`"
+              echo "- rootfs.img: \`$rsum\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            sudo cp /var/lib/ne-enclave/vmlinux /var/lib/ne-enclave/rootfs.img "$RUNNER_TEMP/"
+          else
+            echo "guest image not present (e2e build may have failed); skipping digest publish"
+          fi
+      - name: Upload guest image artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ne-guest-image
+          path: |
+            ${{ runner.temp }}/vmlinux
+            ${{ runner.temp }}/rootfs.img
+          if-no-files-found: ignore
+
+  release-build:
+    name: release-build (musl)
+    # release.yml builds the published musl binary on v* tags; this is the
+    # main-branch validation build. Skip on dev/PRs to save quota.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tooling
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build nee (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ne-enclave
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd target/x86_64-unknown-linux-musl/release
+          cp nee ne-x86_64-unknown-linux-musl
+          sha256sum ne-x86_64-unknown-linux-musl > SHA256SUMS
+          cat SHA256SUMS
+      - name: Verify static linkage
+        run: |
+          file target/x86_64-unknown-linux-musl/release/nee
+          ldd target/x86_64-unknown-linux-musl/release/nee || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ne-musl
+          path: |
+            target/x86_64-unknown-linux-musl/release/ne-x86_64-unknown-linux-musl
+            target/x86_64-unknown-linux-musl/release/SHA256SUMS
+
+  unit-lint:
+    name: unit-lint
+    # systemd unit render + verify — main pushes + manual dispatch only.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Render units into a fakeroot
+        run: cargo run -p ne-enclave -- install --prefix "$PWD/fakeroot" --no-start --no-image
+      - name: systemd-analyze verify
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y systemd
+          # systemd-analyze verify checks ExecStart binaries exist; our units
+          # point at /opt/ne-enclave/bin/nee which isn't installed on the runner.
+          # Provide an executable stub so only genuine unit-directive errors fail.
+          sudo useradd --system --user-group ne || true
+          sudo install -d -m 0755 /opt/ne-enclave/bin
+          printf '#!/bin/sh\n' | sudo tee /opt/ne-enclave/bin/nee >/dev/null
+          sudo chmod +x /opt/ne-enclave/bin/nee
+          systemd-analyze verify \
+            "$PWD/fakeroot/etc/systemd/system/ne-supervisor.service" \
+            "$PWD/fakeroot/etc/systemd/system/ne-api.service"

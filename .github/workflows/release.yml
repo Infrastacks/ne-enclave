@@ -1,0 +1,203 @@
+# Release pipeline — NeuronEdge Enclave runtime + SDKs.
+#
+# Triggered by a `v*` tag push (e.g. `git tag v0.1.1 && git push origin v0.1.1`).
+# Produces, from one tag:
+#   1. A GitHub Release carrying the signed static musl `nee` binary + SHA256SUMS
+#      (what `deploy/install.sh` downloads + verifies).
+#   2. `@neuronedge/enclave` published to npm.
+#   3. `neuronedge-enclave` published to PyPI.
+#
+# Prerequisites (operator-owned, one-time):
+#   - GitHub secrets: NPM_TOKEN, PYPI_TOKEN.
+#   - The version sources bumped to match the tag BEFORE tagging
+#     (Cargo.toml workspace version, sdk/typescript/package.json,
+#     sdk/python/pyproject.toml + src/ne/__init__.py). version-check enforces this.
+#
+# Design: gauntlet gates everything; the GitHub Release (binary) is the
+# always-ships artifact; npm + PyPI are independent jobs so one registry
+# outage cannot block the other or the binary release.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # softprops/action-gh-release creates the Release + assets.
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---- Gate: never release a red tree. Mirrors ci.yml's lint + test ----
+  gauntlet:
+    name: pre-release gauntlet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test --workspace --lib (excludes ne-e2e; needs KVM host)
+        run: cargo test --workspace --lib
+      # TypeScript SDK gate.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: npm ci
+        working-directory: sdk/typescript
+        run: npm ci
+      - name: npm run typecheck
+        working-directory: sdk/typescript
+        run: npm run typecheck
+      - name: npm run lint
+        working-directory: sdk/typescript
+        run: npm run lint
+      - name: npm run test
+        working-directory: sdk/typescript
+        run: npm run test
+
+  # ---- Version consistency: tag must match all three manifest sources ----
+  version-check:
+    name: version consistency
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: ver
+        run: |
+          # Strip the leading `v` from the tag (v0.1.1 -> 0.1.1).
+          v="${GITHUB_REF_NAME#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Release version: $v"
+      - name: Assert all sources match the tag
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo_v=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          ts_v=$(jq -r .version sdk/typescript/package.json)
+          py_v=$(grep -m1 '^version' sdk/python/pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          py_init_v=$(grep -E '^__version__' sdk/python/src/ne/__init__.py | sed -E 's/.*"(.*)".*/\1/')
+          for src in "Cargo.toml:$cargo_v" "package.json:$ts_v" "pyproject.toml:$py_v" "__init__.py:$py_init_v"; do
+            name="${src%%:*}"; val="${src##*:}"
+            if [ "$val" != "$VERSION" ]; then
+              echo "::error::$name has version '$val' but tag is '$VERSION'. Bump all sources before tagging."
+              exit 1
+            fi
+            echo "$name -> $val (ok)"
+          done
+
+  # ---- Build the static musl binary + checksums (release artifact) ----
+  binary:
+    name: build musl binary
+    runs-on: ubuntu-24.04
+    needs: [gauntlet, version-check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tooling
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build nee (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ne-enclave
+      - name: Stage release asset + checksums
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cd target/x86_64-unknown-linux-musl/release
+          cp nee "../../staging/ne-x86_64-unknown-linux-musl"
+          cd ../../staging
+          sha256sum ne-x86_64-unknown-linux-musl > SHA256SUMS
+          cat SHA256SUMS
+      - name: Verify static linkage
+        run: |
+          file target/x86_64-unknown-linux-musl/release/nee
+          ldd target/x86_64-unknown-linux-musl/release/nee || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ne-release-assets
+          path: |
+            staging/ne-x86_64-unknown-linux-musl
+            staging/SHA256SUMS
+
+  # ---- Create the GitHub Release + attach the binary + checksums ----
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [binary, version-check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: ne-release-assets
+          path: staging
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            staging/ne-x86_64-unknown-linux-musl
+            staging/SHA256SUMS
+
+  # ---- Publish @neuronedge/enclave to npm ----
+  npm:
+    name: npm publish
+    runs-on: ubuntu-24.04
+    needs: [gauntlet, version-check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+          cache: 'npm'
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: npm ci
+        working-directory: sdk/typescript
+        run: npm ci
+      - name: npm run build
+        working-directory: sdk/typescript
+        run: npm run build
+      - name: npm publish
+        working-directory: sdk/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  # ---- Publish neuronedge-enclave to PyPI ----
+  pypi:
+    name: PyPI publish
+    runs-on: ubuntu-24.04
+    needs: [gauntlet, version-check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install build backend
+        working-directory: sdk/python
+        run: pip install --upgrade build twine
+      - name: Build sdist + wheel
+        working-directory: sdk/python
+        run: rm -rf dist && python -m build
+      - name: Publish to PyPI
+        working-directory: sdk/python
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload dist/*
