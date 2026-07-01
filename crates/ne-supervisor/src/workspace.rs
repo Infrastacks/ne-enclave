@@ -1689,9 +1689,7 @@ impl WorkspaceManager {
             // (OpenShell) returns Unsupported in B v1 (a process-checkpoint
             // format is a later wedge). Unwrap the FC variant for the rest.
             #[cfg(not(feature = "confidential-cvm"))]
-            let WorkspaceExec::Firecracker(instance) = exec else {
-                unreachable!()
-            };
+            let WorkspaceExec::Firecracker(instance) = exec;
             #[cfg(feature = "confidential-cvm")]
             let instance = match exec {
                 WorkspaceExec::Firecracker(inst) => inst,
@@ -2156,9 +2154,7 @@ impl WorkspaceManager {
         // Reap the old frozen FC process + chroot (outside the lock). Live
         // snapshot is FC-only, so unwrap the Firecracker variant.
         #[cfg(not(feature = "confidential-cvm"))]
-        let WorkspaceExec::Firecracker(old_instance) = old else {
-            unreachable!()
-        };
+        let WorkspaceExec::Firecracker(old_instance) = old;
         #[cfg(feature = "confidential-cvm")]
         let old_instance = match old {
             WorkspaceExec::Firecracker(inst) => inst,
