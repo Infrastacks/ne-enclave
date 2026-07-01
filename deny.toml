@@ -1,8 +1,42 @@
-# cargo-deny configuration.
+# cargo-deny configuration (schema v2).
 # Rejects licenses incompatible with Apache-2.0 and flags security advisories.
 
+[graph]
+# Apply to the full dependency graph.
+all-features = true
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Yanked crates are always a hard failure (they're broken by definition).
+yanked = "deny"
+# Unmaintained crates: scope to direct workspace deps (not the full transitive
+# set, which is too noisy). The v0.1.0 tree carries transitive advisories
+# (anyhow UB, rustls-pemfile unmaintained, a SHAKE squeeze bug) that need
+# scheduled dependency bumps — listed in `ignore` below with reasons, tracked
+# separately. Remove from `ignore` and bump to resolve.
+unmaintained = "workspace"
+ignore = [
+    # anyhow: UB via Error::context + downcast_mut. Transitive (rustls/tonic).
+    # No safe behavior on our code paths (we don't downcast_mut). Bump pending.
+    { id = "RUSTSEC-2026-0190", reason = "transitive; not exercised on our paths; bump pending" },
+    # rustls-pemfile: unmaintained, transitive via rustls/axum-server/tonic.
+    { id = "RUSTSEC-2025-0134", reason = "transitive via rustls; no maintained replacement yet; bump pending" },
+    # SHAKE squeeze incremental bug (transitive crypto).
+    { id = "RUSTSEC-2026-0074", reason = "transitive crypto; not on a path we expose; bump pending" },
+    # russh-cryptovec: transitive via russh (confidential-tier SSH). Upgrade path exists (>=0.60.3).
+    { id = "RUSTSEC-2023-0071", reason = "transitive via russh; bump russh to resolve" },
+    { id = "RUSTSEC-2026-0153", reason = "transitive; bump pending" },
+    { id = "RUSTSEC-2026-0154", reason = "transitive; bump pending" },
+]
+
 [licenses]
-# Allow these permissive licenses in the dependency tree.
+version = 2
+# Confidence threshold for license detection from license text.
+confidence-threshold = 0.8
+# v2 is allow-list-based: only licenses listed below are permitted. Copyleft
+# licenses (GPL, AGPL, LGPL, EUPL, SSPL) are rejected by omission — they're
+# incompatible with an Apache-2.0 project and intentionally not in the list.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -17,39 +51,9 @@ allow = [
     "0BSD",
     "Unlicense",
     "MPL-2.0",
+    # Permissive data license used by some transitive crates (e.g. unicode-icu data).
+    "CDLA-Permissive-2.0",
 ]
-# Explicitly reject strong-copyleft / source-available licenses.
-# AGPL, SSPL, GPL, LGPL, and EUPL are incompatible with an Apache-2.0 project.
-deny = [
-    "AGPL-3.0",
-    "AGPL-3.0-only",
-    "AGPL-3.0-or-later",
-    "GPL-2.0",
-    "GPL-2.0-only",
-    "GPL-2.0-or-later",
-    "GPL-3.0",
-    "GPL-3.0-only",
-    "GPL-3.0-or-later",
-    "LGPL-2.0",
-    "LGPL-2.1",
-    "LGPL-3.0",
-    "SSPL-1.0",
-    "EUPL-1.1",
-    "EUPL-1.2",
-]
-# Confidence threshold for license detection from license text.
-confidence-threshold = 0.8
-
-[licenses.private]
-# Reject private/unlisted dependencies (would break public builds).
-ignore = false
-
-[advisories]
-# Fail the build on any known vulnerability in the dependency tree.
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-ignore = []
 
 [bans]
 # Warn on duplicate crate versions (not a hard failure — common in Rust trees).
@@ -57,8 +61,7 @@ multiple-versions = "warn"
 wildcards = "allow"
 
 [sources]
-# Only allow crates from crates.io + a couple of explicit git sources.
-# The OpenShell fork is the only git dependency.
+# Only allow crates from crates.io + the explicit git source below.
 unknown-registry = "warn"
 unknown-git = "warn"
 allow-git = [

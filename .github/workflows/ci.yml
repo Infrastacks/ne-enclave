@@ -22,10 +22,12 @@ jobs:
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          # Reject AGPL, SSPL, and other licenses incompatible with Apache-2.0
-          # in the dependency tree. Also checks for known advisories and
-          # duplicated crate versions.
-          arguments: --workspace check
+          # `check` is the cargo-deny subcommand; the action runs
+          # `cargo deny <arguments>`. Runs all checks (advisories, bans,
+          # licenses, sources) per deny.toml — rejects AGPL/SSPL/GPL and
+          # flags known vulnerabilities. cargo-deny reads Cargo.lock
+          # metadata only (no compilation), so the toolchain pin is moot.
+          arguments: check
 
   lint:
     name: fmt + clippy
