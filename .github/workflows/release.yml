@@ -124,14 +124,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p staging
-          cd target/x86_64-unknown-linux-musl/release
-          cp nee "../../staging/ne-x86_64-unknown-linux-musl"
-          cd ../../staging
-          sha256sum ne-x86_64-unknown-linux-musl > SHA256SUMS
+          cp target/x86_64-unknown-linux-musl/release/nee staging/ne-x86_64-unknown-linux-musl
+          sha256sum staging/ne-x86_64-unknown-linux-musl > staging/SHA256SUMS
           # Stage install.sh as a release asset so the curl one-liner
           # (curl .../releases/latest/download/install.sh) resolves.
-          cp ../deploy/install.sh staging/install.sh
-          cat SHA256SUMS
+          cp deploy/install.sh staging/install.sh
+          cat staging/SHA256SUMS
       - name: Verify static linkage
         run: |
           file target/x86_64-unknown-linux-musl/release/nee
