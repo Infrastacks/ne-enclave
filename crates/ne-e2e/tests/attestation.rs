@@ -98,7 +98,7 @@ async fn attestation_generate_verify_replay() {
     cfg.state_dir = state_dir.clone();
     // network stays None: attestation is purely in-process (measurement
     // is computed from the FC launch config, no vsock interaction needed).
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit.clone()));
+    let mgr = Arc::new(WorkspaceManager::new(cfg, audit.clone()).expect("workspace manager"));
 
     // --- Step 1: Create ws-att ---
     let create_resp = mgr

@@ -170,7 +170,7 @@ async fn ingress_routes_to_guest_service() {
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
     cfg.network = Some(network);
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit));
+    let mgr = Arc::new(WorkspaceManager::new(cfg, audit).expect("workspace manager"));
 
     // --- Step 1: Create ws-ing (networked, port 8080 exposed with header injection) ---
     let create_resp = mgr

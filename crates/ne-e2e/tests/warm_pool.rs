@@ -226,7 +226,7 @@ async fn warm_pool_hit_is_fast_distinct_and_refills() {
         max_in_flight: 2,
     });
     let audit = AuditLog::open(&state_dir).await.expect("audit");
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit));
+    let mgr = Arc::new(WorkspaceManager::new(cfg, audit).expect("workspace manager"));
     mgr.spawn_refill();
 
     // Pool fills to target.
@@ -320,7 +320,7 @@ async fn warm_pool_miss_falls_back_to_fork() {
         max_in_flight: 1,
     });
     let audit = AuditLog::open(&state_dir).await.expect("audit");
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit));
+    let mgr = Arc::new(WorkspaceManager::new(cfg, audit).expect("workspace manager"));
     mgr.spawn_refill();
 
     // Empty pool: create(tier) must still return a ready, identity-reset workspace.

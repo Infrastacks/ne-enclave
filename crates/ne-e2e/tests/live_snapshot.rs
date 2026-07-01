@@ -88,7 +88,7 @@ async fn live_snapshot_source_survives_and_is_consistent() {
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
     let audit = AuditLog::open(&state_dir).await.expect("audit");
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit));
+    let mgr = Arc::new(WorkspaceManager::new(cfg, audit).expect("workspace manager"));
 
     // --- Step 1: Create ws-a (cold boot) ---
     let create_resp = mgr
