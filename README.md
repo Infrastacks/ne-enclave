@@ -2,7 +2,7 @@
 
 **The open-source, hardware-attested execution boundary for AI agents.**
 
-Autonomous agents run code, install packages, call APIs, and touch sensitive data. NeuronEdge Enclave gives each agent a **hardware-isolated, governed sandbox** — with optional **confidential computing** (AMD SEV-SNP) so even the host operator can't read the agent's memory.
+Autonomous agents run code, install packages, call APIs, and touch sensitive data. NeuronEdge Enclave gives each agent a **governed sandbox** — a Firecracker microVM (own kernel) on the standard tier, or an OpenShell sandbox inside a hardware-attested SEV-SNP CVM on the confidential tier.
 
 Apache-2.0. Self-hosted. Rust top-to-bottom.
 
@@ -21,9 +21,9 @@ Agent frameworks (LangChain, Mastra, CrewAI, custom) need somewhere safe to exec
 - **Managed sandbox clouds (E2B, Modal)** — solve isolation but move your data to someone else's infrastructure. Regulated enterprises (finance, healthcare, government) can't approve them: data residency, DPAs, attestation gaps.
 - **No boundary** — agents run on the developer's laptop or a shared CI runner. The blast radius of a compromised agent is the whole machine.
 
-NeuronEdge Enclave is the **fourth option**: a Firecracker-microVM runtime you self-host, where every workspace gets its own kernel — plus an optional confidential mode where the workspace runs inside an encrypted, hardware-attested CVM that even the cloud operator can't read.
+NeuronEdge Enclave is the **fourth option**: a self-hosted runtime where every workspace gets its own kernel (standard tier, Firecracker microVM) — or, in confidential mode, runs directly inside a hardware-attested SEV-SNP CVM with OpenShell shared-kernel isolation, so even the cloud operator can't read its memory.
 
-**The wedge:** *hardware-attested agent execution, deployable on customer-owned infrastructure, Apache-2.0.*
+**The wedge:** *a hardware-attested execution boundary, deployable on customer-owned infrastructure, Apache-2.0.*
 
 ---
 
@@ -42,7 +42,7 @@ A Rust runtime that creates, controls, snapshots, and destroys Firecracker-backe
 | Warm pool (pre-forked microVMs, ~2ms pool-hit create) | ✅ Shipping |
 | Host-based ingress routing (`{port}-{wsid}.{domain}`) | ✅ Shipping |
 | Single-binary self-host install + hardened systemd units | ✅ Shipping |
-| **Confidential mode** (AMD SEV-SNP, single-CVM-direct, attested key release) | ✅ **Verified on Azure DCasv5 silicon** |
+| **Confidential mode** (AMD SEV-SNP, single-CVM-direct, attestation-gated key release) | ✅ **Verified on Azure DCasv5 silicon** |
 | Intel TDX confidential mode | ⏳ Planned |
 | Per-microVM hardware attestation (bare-metal SNP) | ⏳ Future (v2) |
 
@@ -148,7 +148,7 @@ The full, as-built threat model — trust boundaries, attack trees, and an expli
 
 ## Status
 
-**The OSS runtime is feature-complete for a v0.1 release** (the standard tier + the confidential tier, verified on silicon). What's tracked for v0.2+:
+**The OSS runtime is feature-complete for a v0.1 release** (the standard tier + the confidential tier, verified on Azure DCasv5 silicon). What's tracked for v0.2+:
 
 - Intel TDX confidential mode (needs DCesv5 silicon)
 - Per-workspace hardware attestation (bare-metal SEV-SNP, the v2 premium tier)

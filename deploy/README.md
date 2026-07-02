@@ -196,13 +196,17 @@ host that is itself a SEV-SNP confidential VM (e.g. Azure DCasv5):
    The supervisor detects the CVM via `/dev/sev-guest` (GCP/bare-metal) OR
    `/dev/tpmrm0` (Azure OpenHCL paravisor) and refuses to start if neither is
    present (fail-closed — a confidential deployment never silently falls back).
+   Note: only the Azure OpenHCL attestation arm is silicon-verified today; the
+   `/dev/sev-guest` (GCP/bare-metal) arm is implemented and unit-tested but not
+   yet validated on that silicon.
 4. `sudo systemctl restart ne-supervisor.service`.
 
 On the confidential tier, `CreateWorkspace` spawns an OpenShell sandbox in the
 CVM (not a Firecracker microVM) and governs it via the L7 OPA proxy. The
-attestation evidence + sealed-snapshot key release reuse the verified Wedge-5 path
-(verified end-to-end on Azure DCasv5, 2026-06-30: the boot-fixed AMD report bound to
-a TPM-Quote nonce, validated against the genuine AMD Milan ARK).
+attestation evidence + sealed-snapshot key release reuse the verified path
+(verified end-to-end on Azure DCasv5: the boot-fixed AMD report — whose
+REPORT_DATA carries the vTPM AK fingerprint — combined with a fresh per-request
+TPM-Quote nonce, validated against the genuine AMD Milan ARK).
 
 > **B v1 scope:** the confidential tier supports create / run-command /
 > write-file / read-file / terminate + attestation. Snapshot / restore / fork
