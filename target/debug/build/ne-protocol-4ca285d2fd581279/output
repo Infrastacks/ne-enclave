@@ -1,0 +1,4 @@
+cargo:rerun-if-changed=../../proto/ne/runtime/v1/runtime.proto
+cargo:rerun-if-changed=../../proto
+cargo:rerun-if-changed=../../proto/ne/runtime/v1/runtime.proto
+cargo:rerun-if-changed=../../proto
