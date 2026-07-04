@@ -82,3 +82,5 @@ Contributors to past advisories are named in the individual advisories.
 <!-- CLA self-test marker 2 -->
 
 <!-- marker 3 -->
+
+<!-- marker 4 - allowlist test -->
