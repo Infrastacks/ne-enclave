@@ -42,7 +42,7 @@ jobs:
           path-to-signatures: "cla-signatures/version1/cla.json"
           path-to-document: "https://github.com/Infrastacks/ne-enclave/blob/main/CLA.md"
           branch: "cla-signatures"
-          allowlist: murali-raju,Infrastacks,dependabot[bot],github-actions[bot]
+          allowlist: murraju,Infrastacks,dependabot[bot],github-actions[bot]
 
           # Create the signature branch if it doesn't exist.
           create-file-if-not-exist: true
