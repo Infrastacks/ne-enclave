@@ -11,8 +11,14 @@ process for getting changes merged.
    passes before review. See the engineering standards below.
 2. **Sign the CLA.** Every contributor must agree to the
    [Contributor License Agreement](CLA.md) before a pull request can be
-   merged. See the "Why a CLA" section in `CLA.md` — it preserves the
-   project's licensing flexibility.
+   merged. The bot (`CLA Assistant`) posts a sign-off comment on your PR
+   automatically. To sign, comment on the PR with exactly:
+   > I have read the CLA Document and I hereby sign the CLA
+
+   The signature is stored in the `cla-signatures` branch. You only sign
+   once — subsequent PRs are recognized automatically. Make sure the email
+   address on your commits is linked to your GitHub account, or the bot
+   can't attribute the signature to you.
 3. **No strong-copyleft dependencies.** Do not introduce code under AGPL,
    SSPL, or other licenses incompatible with Apache-2.0. CI rejects these.
 4. **Clean-room discipline for competing projects.** See below.
