@@ -76,3 +76,5 @@ fragment, deny-by-default egress, and the least-privilege image build.
 
 We are grateful to the security researchers who report issues responsibly.
 Contributors to past advisories are named in the individual advisories.
+
+<!-- CLA self-test marker (will be reverted) -->
