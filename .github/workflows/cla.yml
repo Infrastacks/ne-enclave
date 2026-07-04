@@ -33,20 +33,16 @@ jobs:
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Personal access token used only to commit signatures to the
-          # cla-signatures branch. Create a fine-grained PAT with
-          # contents:write for this repo and add it as CLA_ASSISTANT_ACCESS_TOKEN.
-          # Until set, signatures are stored in the run's local checkout.
-          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_ASSISTANT_ACCESS_TOKEN }}
+          # The action needs a token with contents:write to commit signatures
+          # to the cla-signatures branch. The default GITHUB_TOKEN works for
+          # same-repo commits (no PAT needed). To enable cross-repo signature
+          # storage later, add a CLA_ASSISTANT_ACCESS_TOKEN secret instead.
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: "cla-signatures/version1/cla.json"
           path-to-document: "https://github.com/Infrastacks/ne-enclave/blob/main/CLA.md"
           branch: "cla-signatures"
           allowlist: murali-raju,Infrastacks,dependabot[bot],github-actions[bot]
-
-          # Status check that branch protection requires.
-          remote-organization-name: Infrastacks
-          remote-repository-name: ne-enclave
 
           # Create the signature branch if it doesn't exist.
           create-file-if-not-exist: true
