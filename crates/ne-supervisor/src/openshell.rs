@@ -30,6 +30,7 @@ mod imp {
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::Arc;
+    use std::sync::LazyLock;
     use std::time::Duration;
 
     use ne_protocol::guest::{CommandCompleted, GuestResponse};
@@ -38,6 +39,31 @@ mod imp {
     use tracing::{debug, info, warn};
 
     use super::preface::{PrefaceMaterial, build_nssh1_preface, random_preface_token};
+
+    /// Cap on captured SSH exec output per stream. Parity with the Firecracker
+    /// tier's guest-agent `MAX_CMD_OUTPUT_BYTES` (1 MiB). Override via env.
+    static MAX_EXEC_OUTPUT_BYTES: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NE_MAX_EXEC_OUTPUT_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024 * 1024)
+    });
+
+    /// Append `data` to `buf` but never let `buf` exceed `cap`. Returns true if
+    /// output was dropped (truncation occurred on this or a prior call).
+    fn push_capped(buf: &mut Vec<u8>, data: &[u8], cap: usize) -> bool {
+        if buf.len() >= cap {
+            return true;
+        }
+        let room = cap - buf.len();
+        if data.len() <= room {
+            buf.extend_from_slice(data);
+            false
+        } else {
+            buf.extend_from_slice(&data[..room]);
+            true
+        }
+    }
 
     /// Errors from controlling an OpenShell sandbox.
     #[derive(Debug, thiserror::Error)]
@@ -353,16 +379,23 @@ mod imp {
             .map_err(|e| OpenShellError::Ssh(e.to_string()))?;
 
         // Drain stdout/stderr until the channel closes; capture exit code.
+        // Cap accumulation at MAX_EXEC_OUTPUT_BYTES per stream — an
+        // authenticated client running e.g. `cat /dev/zero` must not be able
+        // to OOM the shared supervisor by draining into unbounded Vecs.
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut truncated = false;
         let mut exit_code: i32 = -1;
+        let cap = *MAX_EXEC_OUTPUT_BYTES;
         let elapsed_start = std::time::Instant::now();
         let drain = async {
             while let Some(msg) = channel.wait().await {
                 match msg {
-                    russh::ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
+                    russh::ChannelMsg::Data { ref data } => {
+                        truncated |= push_capped(&mut stdout, data, cap);
+                    }
                     russh::ChannelMsg::ExtendedData { ref data, .. } => {
-                        stderr.extend_from_slice(data)
+                        truncated |= push_capped(&mut stderr, data, cap);
                     }
                     russh::ChannelMsg::ExitStatus { exit_status } => {
                         exit_code = i32::try_from(exit_status).unwrap_or(-1);
@@ -389,9 +422,7 @@ mod imp {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             exit_code,
             elapsed_ms,
-            // The SSH exec channel doesn't truncate (no guest-agent cap);
-            // the full stream was drained.
-            truncated: false,
+            truncated,
         }))
     }
 
@@ -519,6 +550,21 @@ mod imp {
     // Re-export the public surface at the module root.
     pub use self::Sandbox as OpenShellSandbox;
     pub type LaunchError = OpenShellError;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn push_capped_truncates_at_limit() {
+            let mut buf = Vec::new();
+            assert!(!push_capped(&mut buf, b"hello", 10));
+            assert_eq!(buf.len(), 5);
+            // Second push crosses the cap: only 5 more bytes are kept.
+            assert!(push_capped(&mut buf, b"world!!!", 10));
+            assert_eq!(buf.len(), 10);
+        }
+    }
 }
 
 // ---- Pure NSSH1 preface construction (compiles on every platform; Mac-testable) ----
