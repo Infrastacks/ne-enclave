@@ -2137,6 +2137,7 @@ dependencies = [
  "ne-ingress",
  "ne-protocol",
  "ne-seal",
+ "ne-supervisor",
  "nix 0.29.0",
  "pkcs8 0.11.0-rc.11",
  "rand 0.8.6",

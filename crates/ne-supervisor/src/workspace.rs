@@ -95,6 +95,19 @@ pub enum WorkspaceExec {
     OpenShell(Box<crate::openshell::Sandbox>),
 }
 
+/// How `snapshot()`'s finalize step should resolve the source's lifecycle
+/// state once the identity-verified registry re-lock is held. See
+/// [`WorkspaceManager::finalize_snapshot_state`].
+#[cfg(target_os = "linux")]
+enum SnapshotFinalize {
+    /// Set the given state; no Firecracker call.
+    Set(WorkspaceState),
+    /// Resume the VM in place (inside the verified critical section, so the
+    /// PATCH can never hit a replacement boot's reused socket) and record
+    /// `Running` — or `Paused` if the resume fails.
+    ResumeInPlace,
+}
+
 /// Pure decision: which [`WorkspaceExec`] variant does the given profile route to?
 ///
 /// Extracted so the routing table is unit-testable on macOS (no CVM needed).
@@ -1812,16 +1825,31 @@ impl WorkspaceManager {
 
     /// Snapshot a workspace.
     ///
-    /// Locking strategy: hold the guard for the firecracker pause, `snapshot_create`,
-    /// and resume calls (they borrow the instance and are quick API calls), then drop
-    /// the guard before the copy-out, hashing, and signing (which only need the artifact
-    /// paths and don't touch the instance). This keeps the lock window narrow.
+    /// Locking strategy (audit C2): the global `instances` mutex is held only
+    /// for the brief lookup/validate/capture step — where the FC socket + chroot
+    /// paths and metadata are copied out and the transient `Snapshotting` state
+    /// is set — then the guard is DROPPED. The pause → memory-dump → resume
+    /// sequence (multi-GiB, seconds) runs entirely unlocked against those
+    /// captured paths, so it no longer head-of-line-blocks every other
+    /// supervisor op. The lock is re-acquired only briefly at finalize to
+    /// resolve the tracked state back to `Running`/`Paused`, guarded by an
+    /// existence re-check (the wedge-7.1 resurrection guard): if the workspace
+    /// was terminated mid-dump it is NOT reinserted. The subsequent copy-out,
+    /// hashing, and signing need only the artifact paths and stay unlocked.
     pub async fn snapshot(&self, req: SnapshotRequest) -> SupervisorResponse {
-        // Step 1: lock, get instance metadata + artifact paths; run FC calls under lock.
+        // Step 1: brief lock — look up + validate + capture FC socket/chroot
+        // paths + metadata, set the transient `Snapshotting` state, then DROP
+        // the guard. The multi-GiB memory dump (Steps 2-4) runs entirely
+        // UNLOCKED against the captured paths, so it no longer head-of-line-
+        // blocks every other supervisor op on the global `instances` mutex
+        // (audit C2).
         let (
             source_ws_id,
-            mem_in_chroot,
-            vmstate_in_chroot,
+            boot_id,
+            api_socket,
+            jailer_chroot,
+            uid,
+            gid,
             guest_vsock_cid,
             vcpu_count,
             mem_size_mib,
@@ -1856,6 +1884,22 @@ impl WorkspaceManager {
                 }
             };
 
+            // Reject a re-entrant snapshot: another dump for this id is already
+            // in flight (its state was left `Snapshotting` under a prior lock and
+            // it hasn't been finalized yet). Two concurrent `/snapshot/create`
+            // calls against the same FC socket would corrupt each other's dump.
+            // This guard is also what makes the unlocked window below safe from a
+            // second snapshot mutating the source mid-dump.
+            if instance.lifecycle_state == WorkspaceState::Snapshotting {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::SnapshotFailed,
+                    message: format!(
+                        "snapshot already in progress for workspace {}",
+                        req.workspace_id
+                    ),
+                };
+            }
+
             // Live snapshot requires a running source (it keeps the source live).
             if req.live && instance.lifecycle_state != WorkspaceState::Running {
                 return SupervisorResponse::Error {
@@ -1882,61 +1926,27 @@ impl WorkspaceManager {
                 };
             }
 
-            // Step 2: if running, pause first.
             let was_running = instance.lifecycle_state == WorkspaceState::Running;
-            if was_running {
-                if let Err(e) = crate::firecracker::pause(instance).await {
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::SnapshotFailed,
-                        message: format!("pre-snapshot pause failed: {e}"),
-                    };
-                }
-                instance.lifecycle_state = WorkspaceState::Paused;
-            }
 
-            // Step 3: create the snapshot inside the chroot.
-            let arts = match crate::firecracker::snapshot_create(instance).await {
-                Ok(a) => a,
-                Err(e) => {
-                    // If we paused it, try to restore running state.
-                    if was_running {
-                        let _ = crate::firecracker::resume(instance).await;
-                        instance.lifecycle_state = WorkspaceState::Running;
-                    }
-                    self.audit_emit(
-                        EventType::SnapshotFailed,
-                        Some(req.workspace_id.clone()),
-                        serde_json::json!({ "error": e.to_string() }),
-                    )
-                    .await;
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::SnapshotFailed,
-                        message: e.to_string(),
-                    };
-                }
-            };
+            // Mark the transient state under the lock so any concurrent op that
+            // does look up this id (a re-entrant snapshot, a future status probe)
+            // sees "dump in flight". It is resolved back to Running/Paused at
+            // finalize — or dropped entirely if the workspace is terminated
+            // mid-dump (resurrection guard). It never leaks as a terminal state.
+            instance.lifecycle_state = WorkspaceState::Snapshotting;
 
-            // Step 4: Non-live path keeps today's behavior (in-place resume). The live path
-            // intentionally leaves the source PAUSED here — live_hot_swap replaces it
-            // with a fresh, reachable process after the guard is dropped.
-            // Only flip the tracked state back to Running when resume actually
-            // succeeds — on resume failure FC is still frozen, so the map must
-            // honestly report Paused rather than lie that it is Running.
-            if was_running && !req.live {
-                match crate::firecracker::resume(instance).await {
-                    Ok(()) => instance.lifecycle_state = WorkspaceState::Running,
-                    Err(e) => {
-                        warn!(workspace_id = %req.workspace_id, error = %e,
-                              "post-snapshot resume failed — workspace left paused");
-                    }
-                }
-            }
-
-            // Capture everything we need before dropping the guard.
+            // Capture everything we need before dropping the guard — including
+            // the per-boot identity token: the socket/chroot paths below are
+            // id-derived and would collide with a terminate→recreate of the
+            // same id, so every later re-acquire must verify the token, not
+            // just the id (ABA guard).
             (
                 instance.workspace_id.clone(),
-                arts.mem_in_chroot,
-                arts.vmstate_in_chroot,
+                instance.boot_id.clone(),
+                instance.api_socket_host.clone(),
+                instance.jailer_chroot.clone(),
+                instance.jailer_uid,
+                instance.jailer_gid,
                 instance.guest_vsock_cid,
                 instance.vcpu_count,
                 instance.mem_size_mib,
@@ -1946,7 +1956,110 @@ impl WorkspaceManager {
                 was_running,
             )
         };
-        // Guard dropped — from here we only use paths + metadata.
+        // Guard dropped — the pause + dump below run UNLOCKED against the
+        // captured paths. What can still happen to this workspace meanwhile:
+        // only a `terminate` can remove it from the registry (in-place
+        // pause/resume are deferred/Unsupported, and a re-entrant snapshot is
+        // rejected above by the Snapshotting guard). A concurrent terminate
+        // kills the FC process + reaps its chroot, which makes our unlocked FC
+        // calls fail (handled as a dump failure). Worse, a terminate→recreate
+        // of the SAME id boots a NEW VM behind the SAME id-derived paths —
+        // which is why finalize (and the in-place resume) go through
+        // `finalize_snapshot_state`, which verifies the captured `boot_id`
+        // before touching anything: it never resurrects a terminated
+        // workspace and never mutates (or resumes) a replacement boot.
+
+        // Step 2: if the source was running, pause it (unlocked).
+        if was_running && let Err(e) = crate::firecracker::pause_at(&api_socket).await {
+            // Pause never took — the VM is still running. Restore the tracked
+            // state (identity-guarded) and fail.
+            self.finalize_snapshot_state(
+                &source_ws_id,
+                &boot_id,
+                SnapshotFinalize::Set(WorkspaceState::Running),
+            )
+            .await;
+            self.audit_emit(
+                EventType::SnapshotFailed,
+                Some(source_ws_id.clone()),
+                serde_json::json!({ "error": format!("pre-snapshot pause failed: {e}") }),
+            )
+            .await;
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::SnapshotFailed,
+                message: format!("pre-snapshot pause failed: {e}"),
+            };
+        }
+
+        // Step 3: dump the (now paused) guest memory + vmstate into the chroot
+        // (unlocked — this is the multi-GiB, seconds-long operation that used to
+        // hold the global lock).
+        let arts = match crate::firecracker::snapshot_create_at(
+            &api_socket,
+            &jailer_chroot,
+            uid,
+            gid,
+            mem_size_mib,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                // Best-effort resume if we paused it (under the identity-
+                // verified lock, so it can never PATCH a replacement boot's
+                // reused socket), restoring the tracked state honestly
+                // (Running only if the resume actually succeeds), then fail.
+                let action = if was_running {
+                    SnapshotFinalize::ResumeInPlace
+                } else {
+                    SnapshotFinalize::Set(WorkspaceState::Paused)
+                };
+                self.finalize_snapshot_state(&source_ws_id, &boot_id, action)
+                    .await;
+                self.audit_emit(
+                    EventType::SnapshotFailed,
+                    Some(source_ws_id.clone()),
+                    serde_json::json!({ "error": e.to_string() }),
+                )
+                .await;
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::SnapshotFailed,
+                    message: e.to_string(),
+                };
+            }
+        };
+
+        // Step 4: resolve the source's post-dump state under the identity-
+        // verified re-lock (`finalize_snapshot_state`).
+        //  - non-live + was_running: resume in place → Running (Paused if the
+        //    resume fails; the map must not lie about a still-frozen VM). The
+        //    resume PATCH runs inside the verified critical section so it can
+        //    never hit a reused socket owned by a replacement boot.
+        //  - non-live + already paused: stays Paused (never resumed).
+        //  - live: intentionally leave the source PAUSED — `live_hot_swap` (after
+        //    the artifact is signed, below) replaces it with a fresh, reachable
+        //    process, so resuming this frozen one here would be wasted work.
+        let action = if was_running && !req.live {
+            SnapshotFinalize::ResumeInPlace
+        } else {
+            SnapshotFinalize::Set(WorkspaceState::Paused)
+        };
+        let finalized = self
+            .finalize_snapshot_state(&source_ws_id, &boot_id, action)
+            .await;
+        if !finalized {
+            // Terminated (or terminated-and-recreated) mid-dump: do NOT touch
+            // the registry. The dump itself completed, so fall through to
+            // Step 5+ to attempt the copy-out/hash/sign — but note the dump
+            // files live in the (id-derived) chroot until the copy-out, and a
+            // concurrent terminate reaps that chroot: if it won that race the
+            // copy below fails gracefully as SnapshotFailed rather than
+            // producing an artifact. The live path below skips the hot-swap
+            // either way.
+            info!(workspace_id = %source_ws_id,
+                  "source boot gone during snapshot; attempting artifact finalize without touching the registry");
+        }
+        // From here we only use the captured paths + metadata.
 
         // Step 5: allocate snapshot id + create destination dir.
         let snapshot_id = ulid::Ulid::new().to_string();
@@ -1968,8 +2081,8 @@ impl WorkspaceManager {
         // The chroot files are written by FC (as jailer_uid); the supervisor
         // runs as root and can read them.
         let copy_result = async {
-            tokio::fs::copy(&mem_in_chroot, dest.join("mem")).await?;
-            tokio::fs::copy(&vmstate_in_chroot, dest.join("vmstate")).await?;
+            tokio::fs::copy(&arts.mem_in_chroot, dest.join("mem")).await?;
+            tokio::fs::copy(&arts.vmstate_in_chroot, dest.join("vmstate")).await?;
             Ok::<(), std::io::Error>(())
         }
         .await;
@@ -2052,7 +2165,23 @@ impl WorkspaceManager {
         // comes back Running + reachable. Fail-closed — on swap failure the source
         // is left Paused and the (valid, signed) artifact persists.
         if req.live {
-            match self.live_hot_swap(&source_ws_id, &snapshot_id).await {
+            // If finalize already saw the source boot gone/replaced, don't boot
+            // a restore only to discard it — short-circuit to the same
+            // fail-closed error the swap's own identity check would produce.
+            // Either way the (valid, signed) artifact persists.
+            let swap_result = if finalized {
+                self.live_hot_swap(&source_ws_id, &boot_id, &snapshot_id)
+                    .await
+            } else {
+                Err((
+                    SupervisorErrorKind::WorkspaceNotFound,
+                    format!(
+                        "source {source_ws_id} was terminated during live snapshot; \
+                         hot-swap skipped"
+                    ),
+                ))
+            };
+            match swap_result {
                 Ok(new_pid) => {
                     info.firecracker_pid = Some(new_pid);
                 }
@@ -2103,6 +2232,78 @@ impl WorkspaceManager {
         )
         .await;
         SupervisorResponse::SnapshotCreated(info)
+    }
+
+    /// Re-acquire the registry lock and resolve `workspace_id`'s lifecycle
+    /// state after an unlocked snapshot window — but ONLY if the entry still
+    /// refers to the SAME boot this snapshot captured (identity-token check;
+    /// the wedge-7.1 resurrection guard, hardened against ABA).
+    ///
+    /// Existence alone is NOT enough: the FC socket/chroot paths are fully
+    /// id-derived, so a terminate→recreate of the same id during the unlocked
+    /// dump registers a NEW, Running VM behind the SAME paths. Mutating (or
+    /// resuming) that replacement based on the id string would mislabel a
+    /// live guest as Paused — poisoning later snapshots (a non-live snapshot
+    /// would skip the pause and dump a running guest; a live snapshot would
+    /// be spuriously rejected). So: `get_mut` → compare `boot_id` → only then
+    /// touch. On `None` OR token mismatch, leave the map untouched and return
+    /// `false`; never reinsert, never relabel, never resume.
+    ///
+    /// `SnapshotFinalize::ResumeInPlace` issues the resume PATCH *inside* the
+    /// verified critical section, so it can never land on a replacement
+    /// boot's reused socket. Holding the lock across this flat-timeout
+    /// control call (µs in practice) is deliberate — it is the only way to
+    /// make socket ownership and registry membership atomic, and it is a
+    /// strict subset of the pre-C2 lock window (which held pause + multi-GiB
+    /// dump + resume).
+    async fn finalize_snapshot_state(
+        &self,
+        workspace_id: &str,
+        boot_id: &str,
+        action: SnapshotFinalize,
+    ) -> bool {
+        let mut guard = self.instances.lock().await;
+        let Some(exec) = guard.get_mut(workspace_id) else {
+            warn!(workspace_id = %workspace_id,
+                  "workspace terminated during snapshot; not resurrecting");
+            return false;
+        };
+        // Snapshot is Firecracker-only; the FC variant is boxed (field access
+        // auto-derefs through the box).
+        #[cfg(not(feature = "confidential-cvm"))]
+        let WorkspaceExec::Firecracker(instance) = exec;
+        #[cfg(feature = "confidential-cvm")]
+        let instance = match exec {
+            WorkspaceExec::Firecracker(inst) => inst,
+            WorkspaceExec::OpenShell(_) => {
+                // The id now points at a different backend entirely — by
+                // definition not the boot this snapshot captured. Leave it.
+                warn!(workspace_id = %workspace_id,
+                      "snapshot finalize: id now owned by an OpenShell workspace; leaving untouched");
+                return false;
+            }
+        };
+        if instance.boot_id != boot_id {
+            warn!(workspace_id = %workspace_id,
+                  "workspace was terminated and recreated during snapshot; leaving the new boot untouched");
+            return false;
+        }
+        instance.lifecycle_state = match action {
+            SnapshotFinalize::Set(state) => state,
+            SnapshotFinalize::ResumeInPlace => {
+                match crate::firecracker::resume_at(&instance.api_socket_host).await {
+                    Ok(()) => WorkspaceState::Running,
+                    Err(e) => {
+                        // Honest state: on resume failure FC is still frozen,
+                        // so report Paused rather than lie.
+                        warn!(workspace_id = %workspace_id, error = %e,
+                              "post-snapshot resume failed — workspace left paused");
+                        WorkspaceState::Paused
+                    }
+                }
+            }
+        };
+        true
     }
 
     /// Shared fork/restore boot: verify the artifact (signature + hashes,
@@ -2311,6 +2512,7 @@ impl WorkspaceManager {
     async fn live_hot_swap(
         &self,
         source_ws_id: &str,
+        source_boot_id: &str,
         snapshot_id: &str,
     ) -> Result<u32, (SupervisorErrorKind, String)> {
         // Provisional id doubles as the new jailer chroot id; the swap rewrites the
@@ -2349,45 +2551,51 @@ impl WorkspaceManager {
 
         let new_pid = instance.firecracker_pid;
 
-        // Swap under the registry mutex (atomic w.r.t. the mutex only). The source
-        // id may have been removed concurrently during our lock-free boot window
-        // (a concurrent terminate). If so, do NOT resurrect it: tear the fresh
-        // instance down and fail. The signed artifact still persists, so
-        // fail-closed holds.
-        let old = {
+        // Swap under the registry mutex (atomic w.r.t. the mutex only). The
+        // source may have been removed — or removed AND recreated under the
+        // same id — during our lock-free boot window (a concurrent
+        // terminate/create). Existence is not enough: verify the entry still
+        // carries the boot identity this snapshot captured before removing
+        // it. Swapping out a replacement boot would silently destroy a
+        // freshly-created workspace and resurrect stale state under its id.
+        // On gone-or-replaced: tear the fresh instance down and fail; the
+        // signed artifact still persists, so fail-closed holds.
+        let old_instance = {
             let mut guard = self.instances.lock().await;
-            let Some(old) = guard.remove(source_ws_id) else {
-                drop(guard);
-                let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
-                return Err((
-                    SupervisorErrorKind::WorkspaceNotFound,
-                    format!(
-                        "source {source_ws_id} was terminated during live snapshot; \
-                         restored instance discarded"
-                    ),
-                ));
-            };
-            let mut instance = instance;
-            instance.workspace_id = source_ws_id.to_string();
-            guard.insert(
-                source_ws_id.to_string(),
-                WorkspaceExec::Firecracker(Box::new(instance)),
-            );
-            old
-        };
-
-        // Reap the old frozen FC process + chroot (outside the lock). Live
-        // snapshot is FC-only, so unwrap the Firecracker variant.
-        #[cfg(not(feature = "confidential-cvm"))]
-        let WorkspaceExec::Firecracker(old_instance) = old;
-        #[cfg(feature = "confidential-cvm")]
-        let old_instance = match old {
-            WorkspaceExec::Firecracker(inst) => inst,
-            WorkspaceExec::OpenShell(_) => {
-                warn!(workspace_id = %source_ws_id, "live hot-swap: old was OpenShell (snapshot unsupported there) — skipping FC reap");
-                return Ok(new_pid);
+            // Remove first, token-check the removed value, and on mismatch put
+            // the SAME entry back — no await between, so the whole sequence is
+            // atomic under this one lock hold and needs no panic path.
+            match guard.remove(source_ws_id) {
+                Some(WorkspaceExec::Firecracker(inst)) if inst.boot_id == source_boot_id => {
+                    // Verified same boot — splice the fresh instance in its place.
+                    let mut instance = instance;
+                    instance.workspace_id = source_ws_id.to_string();
+                    guard.insert(
+                        source_ws_id.to_string(),
+                        WorkspaceExec::Firecracker(Box::new(instance)),
+                    );
+                    inst
+                }
+                other => {
+                    // Gone, replaced by a new boot, or a different backend:
+                    // reinsert whatever we removed and decline gracefully.
+                    if let Some(entry) = other {
+                        guard.insert(source_ws_id.to_string(), entry);
+                    }
+                    drop(guard);
+                    let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+                    return Err((
+                        SupervisorErrorKind::WorkspaceNotFound,
+                        format!(
+                            "source {source_ws_id} was terminated (or replaced by a new boot) \
+                             during live snapshot; restored instance discarded"
+                        ),
+                    ));
+                }
             }
         };
+
+        // Reap the old frozen FC process + chroot (outside the lock).
         if let Err(e) = crate::firecracker::terminate(*old_instance, Duration::from_secs(5)).await {
             warn!(workspace_id = %source_ws_id, error = %e, "live hot-swap: old source teardown failed");
         }
@@ -3157,6 +3365,130 @@ mod tests {
         cfg.state_dir = state_dir;
         WorkspaceManager::new(cfg, audit, max_workspaces, max_workspace_mem_mib)
             .expect("workspace manager")
+    }
+
+    /// Fabricate a registered Firecracker instance with a known boot token.
+    /// `child` needs a real process; a killed-on-drop `sleep` stands in for
+    /// the jailer. Paths are deliberately nonexistent — the tests below must
+    /// never reach an FC API call against them.
+    async fn insert_fake_instance(mgr: &WorkspaceManager, ws_id: &str, boot_id: &str) {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().unwrap_or(0);
+        let instance = crate::firecracker::Instance {
+            workspace_id: ws_id.to_string(),
+            boot_id: boot_id.to_string(),
+            child,
+            firecracker_pid: pid,
+            api_socket_host: "/nonexistent/api.sock".into(),
+            vsock_host_socket: "/nonexistent/vsock.sock".into(),
+            jailer_chroot: "/nonexistent/chroot".into(),
+            jailer_uid: 0,
+            jailer_gid: 0,
+            lifecycle_state: ne_protocol::supervisor::WorkspaceState::Running,
+            network_slot: None,
+            guest_vsock_cid: 3,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            kernel_boot_args: String::new(),
+            rootfs_path: "/nonexistent/rootfs".into(),
+            kernel_path: "/nonexistent/kernel".into(),
+        };
+        mgr.instances.lock().await.insert(
+            ws_id.to_string(),
+            super::WorkspaceExec::Firecracker(Box::new(instance)),
+        );
+    }
+
+    async fn fake_lifecycle_state(
+        mgr: &WorkspaceManager,
+        ws_id: &str,
+    ) -> ne_protocol::supervisor::WorkspaceState {
+        let guard = mgr.instances.lock().await;
+        match guard.get(ws_id) {
+            Some(super::WorkspaceExec::Firecracker(inst)) => inst.lifecycle_state,
+            _ => panic!("workspace {ws_id} missing from registry"),
+        }
+    }
+
+    /// The ABA guard (audit C2 follow-through): a stale snapshot finalize —
+    /// carrying the boot token of a terminated boot — must be a strict no-op
+    /// on a replacement workspace registered under the same id. Existence
+    /// alone must not be enough to mutate the entry.
+    #[tokio::test]
+    async fn snapshot_finalize_never_touches_a_replacement_boot() {
+        use ne_protocol::supervisor::WorkspaceState;
+
+        let mgr = test_manager().await;
+        // The "replacement": a fresh boot registered under ws-aba, Running.
+        insert_fake_instance(&mgr, "ws-aba", "boot-NEW").await;
+
+        // Stale finalize from a snapshot of the terminated OLD boot: must
+        // report failure and leave the replacement's state untouched.
+        let touched = mgr
+            .finalize_snapshot_state(
+                "ws-aba",
+                "boot-OLD",
+                super::SnapshotFinalize::Set(WorkspaceState::Paused),
+            )
+            .await;
+        assert!(
+            !touched,
+            "stale finalize (old boot token) must not claim success against a replacement boot"
+        );
+        assert_eq!(
+            fake_lifecycle_state(&mgr, "ws-aba").await,
+            WorkspaceState::Running,
+            "replacement boot was relabeled by a stale snapshot finalize (ABA)"
+        );
+
+        // Same for the resume-in-place flavor: the identity mismatch must
+        // short-circuit BEFORE any FC call (the fake socket path would error,
+        // but more importantly a real reused socket must never be PATCHed).
+        let touched = mgr
+            .finalize_snapshot_state("ws-aba", "boot-OLD", super::SnapshotFinalize::ResumeInPlace)
+            .await;
+        assert!(
+            !touched,
+            "stale ResumeInPlace must not touch a replacement boot"
+        );
+        assert_eq!(
+            fake_lifecycle_state(&mgr, "ws-aba").await,
+            WorkspaceState::Running
+        );
+
+        // The MATCHING token still finalizes normally.
+        let touched = mgr
+            .finalize_snapshot_state(
+                "ws-aba",
+                "boot-NEW",
+                super::SnapshotFinalize::Set(WorkspaceState::Paused),
+            )
+            .await;
+        assert!(touched, "same-boot finalize must succeed");
+        assert_eq!(
+            fake_lifecycle_state(&mgr, "ws-aba").await,
+            WorkspaceState::Paused
+        );
+
+        // And the plain resurrection guard: id absent → false, no reinsert.
+        mgr.instances.lock().await.clear();
+        let touched = mgr
+            .finalize_snapshot_state(
+                "ws-aba",
+                "boot-NEW",
+                super::SnapshotFinalize::Set(WorkspaceState::Running),
+            )
+            .await;
+        assert!(
+            !touched,
+            "finalize must not resurrect a terminated workspace"
+        );
+        assert!(
+            mgr.instances.lock().await.is_empty(),
+            "finalize must never insert"
+        );
     }
 
     #[tokio::test]

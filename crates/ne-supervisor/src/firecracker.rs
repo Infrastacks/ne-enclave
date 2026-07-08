@@ -135,6 +135,16 @@ pub struct NetworkAttachment {
 pub struct Instance {
     /// Echoes [`LaunchConfig::workspace_id`].
     pub workspace_id: String,
+    /// Unique per-boot identity token (fresh ULID stamped at spawn, in both
+    /// `launch` and `restore`). Distinguishes THIS boot of a workspace id
+    /// from any later boot registered under the same id: the jailer chroot
+    /// and API-socket paths are fully id-derived, so after a
+    /// terminate→recreate the paths collide while the process behind them
+    /// is a different VM. Lock-free flows that capture paths and later
+    /// re-acquire the registry lock (e.g. `snapshot()`'s finalize) must
+    /// compare this token before mutating the entry — the workspace-id
+    /// string alone is ABA-prone. NOT the PID (PIDs recycle).
+    pub boot_id: String,
     /// Handle to the jailer process (the actual Firecracker is a
     /// child of jailer, but jailer execs into it, so this PID is
     /// effectively Firecracker's).
@@ -485,6 +495,7 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
 
     Ok(Instance {
         workspace_id: cfg.workspace_id,
+        boot_id: ulid::Ulid::new().to_string(),
         child: jailed.child,
         firecracker_pid: jailed.firecracker_pid,
         api_socket_host: jailed.api_socket_host,
@@ -933,10 +944,14 @@ async fn api_patch<T: Serialize + Sync>(
     api_request("PATCH", socket, path, body, timeout).await
 }
 
-/// Pause a running microVM (`PATCH /vm {state:Paused}`).
-pub async fn pause(instance: &Instance) -> Result<(), LaunchError> {
+/// Pause a running microVM by API-socket path (`PATCH /vm {state:Paused}`).
+///
+/// Path-based sibling of [`pause`]: takes only the raw FC API socket so the
+/// caller can drive pause/dump/resume against captured paths without holding
+/// a borrow on (or the registry lock over) the `Instance`.
+pub async fn pause_at(api_socket: &Path) -> Result<(), LaunchError> {
     api_patch(
-        &instance.api_socket_host,
+        api_socket,
         "/vm",
         &VmStatePatch { state: "Paused" },
         Duration::from_millis(*FC_API_TIMEOUT_MS),
@@ -944,15 +959,27 @@ pub async fn pause(instance: &Instance) -> Result<(), LaunchError> {
     .await
 }
 
-/// Resume a paused microVM (`PATCH /vm {state:Resumed}`).
-pub async fn resume(instance: &Instance) -> Result<(), LaunchError> {
+/// Pause a running microVM (`PATCH /vm {state:Paused}`).
+pub async fn pause(instance: &Instance) -> Result<(), LaunchError> {
+    pause_at(&instance.api_socket_host).await
+}
+
+/// Resume a paused microVM by API-socket path (`PATCH /vm {state:Resumed}`).
+///
+/// Path-based sibling of [`resume`]; see [`pause_at`].
+pub async fn resume_at(api_socket: &Path) -> Result<(), LaunchError> {
     api_patch(
-        &instance.api_socket_host,
+        api_socket,
         "/vm",
         &VmStatePatch { state: "Resumed" },
         Duration::from_millis(*FC_API_TIMEOUT_MS),
     )
     .await
+}
+
+/// Resume a paused microVM (`PATCH /vm {state:Resumed}`).
+pub async fn resume(instance: &Instance) -> Result<(), LaunchError> {
+    resume_at(&instance.api_socket_host).await
 }
 
 /// Artifacts produced inside the chroot by `PUT /snapshot/create`.
@@ -968,26 +995,48 @@ pub struct SnapshotArtifacts {
 /// Writes mem + vmstate inside the jail chroot (FC can only write there);
 /// the caller copies them out to the snapshots dir via the returned paths.
 pub async fn snapshot_create(instance: &Instance) -> Result<SnapshotArtifacts, LaunchError> {
-    let snap_dir_in_chroot = instance.jailer_chroot.join("snapshot");
-    tokio::fs::create_dir_all(&snap_dir_in_chroot).await?;
-    // Chown the snapshot dir to jailer_uid:jailer_gid so that Firecracker
-    // (which runs as that uid/gid inside the jail) can write mem + vmstate
-    // into it. Mirrors the same chown applied to the staged kernel/rootfs
-    // in spawn_jailed_firecracker.
-    chown(
-        &snap_dir_in_chroot,
+    snapshot_create_at(
+        &instance.api_socket_host,
+        &instance.jailer_chroot,
         instance.jailer_uid,
         instance.jailer_gid,
-    )?;
+        instance.mem_size_mib,
+    )
+    .await
+}
+
+/// Create a Full snapshot of a PAUSED microVM given raw paths. Caller MUST
+/// pause first.
+///
+/// Path-based sibling of [`snapshot_create`]: takes the FC API socket, the
+/// jailer chroot, the jailer uid/gid (to chown the snapshot dir so FC can
+/// write into it), and `mem_size_mib` (so the memory-scaled API deadline is
+/// preserved — a multi-GiB dump needs headroom beyond the flat control-call
+/// timeout). Lets the caller run the dump against captured paths without
+/// borrowing the `Instance` or holding the registry lock across the dump.
+pub async fn snapshot_create_at(
+    api_socket: &Path,
+    jailer_chroot: &Path,
+    uid: u32,
+    gid: u32,
+    mem_size_mib: u32,
+) -> Result<SnapshotArtifacts, LaunchError> {
+    let snap_dir_in_chroot = jailer_chroot.join("snapshot");
+    tokio::fs::create_dir_all(&snap_dir_in_chroot).await?;
+    // Chown the snapshot dir to uid:gid so that Firecracker (which runs as
+    // that uid/gid inside the jail) can write mem + vmstate into it. Mirrors
+    // the same chown applied to the staged kernel/rootfs in
+    // spawn_jailed_firecracker.
+    chown(&snap_dir_in_chroot, uid, gid)?;
     api_put(
-        &instance.api_socket_host,
+        api_socket,
         "/snapshot/create",
         &SnapshotCreateBody {
             snapshot_type: "Full",
             snapshot_path: "/snapshot/vmstate".into(),
             mem_file_path: "/snapshot/mem".into(),
         },
-        scaled_api_timeout(instance.mem_size_mib),
+        scaled_api_timeout(mem_size_mib),
     )
     .await?;
     Ok(SnapshotArtifacts {
@@ -1576,6 +1625,7 @@ pub async fn restore(cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> 
             info!(workspace_id = %cfg.launch.workspace_id, "snapshot load sent — VM resumed");
             Ok(Instance {
                 workspace_id: cfg.launch.workspace_id,
+                boot_id: ulid::Ulid::new().to_string(),
                 child: jailed.child,
                 firecracker_pid: jailed.firecracker_pid,
                 api_socket_host: jailed.api_socket_host,

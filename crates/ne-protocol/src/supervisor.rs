@@ -423,6 +423,14 @@ pub enum WorkspaceState {
     Running,
     /// Paused (vCPUs stopped).
     Paused,
+    /// Transient: a snapshot memory dump is in flight. The vCPUs are frozen
+    /// (the VM is paused for the duration of the dump), so for any external
+    /// status report this is treated as equivalent to [`Paused`]. This is
+    /// never a terminal state — `snapshot()` sets it under the registry lock
+    /// before dropping the guard to run the dump unlocked, then re-acquires to
+    /// resolve it back to `Running`/`Paused` (or, if the workspace was
+    /// terminated mid-dump, drops it without resurrecting).
+    Snapshotting,
 }
 
 /// Termination request. The supervisor first sends `SIGTERM` to the
@@ -1047,10 +1055,19 @@ mod tests {
 
     #[test]
     fn workspace_state_roundtrips() {
-        for st in [WorkspaceState::Running, WorkspaceState::Paused] {
+        for st in [
+            WorkspaceState::Running,
+            WorkspaceState::Paused,
+            WorkspaceState::Snapshotting,
+        ] {
             let s = serde_json::to_string(&st).unwrap();
             assert_eq!(serde_json::from_str::<WorkspaceState>(&s).unwrap(), st);
         }
+        // The transient state serializes in snake_case like its siblings.
+        assert_eq!(
+            serde_json::to_string(&WorkspaceState::Snapshotting).unwrap(),
+            "\"snapshotting\""
+        );
     }
 
     #[test]
