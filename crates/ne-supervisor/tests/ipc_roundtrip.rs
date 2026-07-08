@@ -30,6 +30,8 @@ async fn ping_pong_round_trip() {
         ne_supervisor::workspace::WorkspaceManager::new(
             ne_supervisor::workspace::WorkspaceManagerConfig::dev_defaults(),
             audit.clone(),
+            1024,
+            32768,
         )
         .expect("workspace manager"),
     );
@@ -77,6 +79,8 @@ async fn invalid_json_returns_error_and_keeps_connection_alive() {
         ne_supervisor::workspace::WorkspaceManager::new(
             ne_supervisor::workspace::WorkspaceManagerConfig::dev_defaults(),
             audit.clone(),
+            1024,
+            32768,
         )
         .expect("workspace manager"),
     );

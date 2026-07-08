@@ -157,6 +157,15 @@ pub struct ServeSupervisorArgs {
     #[arg(long, env = "NE_STATE_DIR", default_value = "/var/lib/ne-enclave")]
     pub state_dir: PathBuf,
 
+    /// Max concurrent workspaces (0 = derive from host RAM). Soft ceiling —
+    /// an exhaustion backstop, not a hard quota (audit O3).
+    #[arg(long, env = "NE_MAX_WORKSPACES", default_value_t = 0)]
+    pub max_workspaces: usize,
+
+    /// Max `mem_size_mib` per workspace (0 = min(host RAM, 32768)).
+    #[arg(long, env = "NE_MAX_WORKSPACE_MEM_MIB", default_value_t = 0)]
+    pub max_workspace_mem_mib: u32,
+
     /// Enable per-workspace network plumbing.
     #[arg(long, env = "NE_ENABLE_NETWORKING", action = ArgAction::SetTrue)]
     pub enable_networking: bool,

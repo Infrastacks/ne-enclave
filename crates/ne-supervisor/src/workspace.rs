@@ -134,6 +134,17 @@ pub fn refuse_software_in_confidential_mode(confidential: bool, cvm_present: boo
     confidential && !cvm_present
 }
 
+/// Derive a safe default concurrent-workspace ceiling from host RAM: ~512 MiB
+/// nominal per VM, floored at 1, capped at 1024. Used when
+/// `NE_MAX_WORKSPACES` is unset (0 = auto). Pure + platform-independent so
+/// it's unit-testable on macOS.
+#[must_use]
+pub(crate) fn derive_max_workspaces(host_ram_mib: u64) -> usize {
+    const NOMINAL_VM_MIB: u64 = 512;
+    let n = (host_ram_mib / NOMINAL_VM_MIB).clamp(1, 1024);
+    n as usize
+}
+
 /// Per-runtime configuration that doesn't come from the request — host
 /// binary paths, jailer drop-priv uid/gid, chroot base.
 #[derive(Debug, Clone)]
@@ -204,13 +215,22 @@ impl WorkspaceManagerConfig {
 /// The supervisor's workspace registry.
 #[derive(Debug)]
 pub struct WorkspaceManager {
-    // Both fields are only consumed on Linux; kept on macOS for
-    // construction symmetry so callers (main.rs, tests) can build a
+    // All four of these fields are only consumed on Linux; kept on macOS
+    // for construction symmetry so callers (main.rs, tests) can build a
     // manager cross-platform.
     #[allow(dead_code)]
     cfg: WorkspaceManagerConfig,
     #[allow(dead_code)]
     audit: AuditLog,
+    /// Admission ceiling on concurrent registered workspaces (audit O3).
+    /// Resolved (0=auto already applied) at the arg→config→manager
+    /// boundary in `serve()`.
+    #[allow(dead_code)]
+    max_workspaces: usize,
+    /// Admission ceiling on a single workspace's `mem_size_mib` (audit O3).
+    /// Resolved the same way as `max_workspaces`.
+    #[allow(dead_code)]
+    max_workspace_mem_mib: u32,
     #[cfg(target_os = "linux")]
     instances: Mutex<HashMap<String, WorkspaceExec>>,
     #[cfg(target_os = "linux")]
@@ -351,8 +371,18 @@ impl WorkspaceManager {
     ///
     /// # Errors
     /// Never on non-Linux.
-    pub fn new(cfg: WorkspaceManagerConfig, audit: AuditLog) -> anyhow::Result<Self> {
-        Ok(Self { cfg, audit })
+    pub fn new(
+        cfg: WorkspaceManagerConfig,
+        audit: AuditLog,
+        max_workspaces: usize,
+        max_workspace_mem_mib: u32,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            cfg,
+            audit,
+            max_workspaces,
+            max_workspace_mem_mib,
+        })
     }
 
     /// Always returns [`SupervisorErrorKind::Unsupported`] on non-Linux.
@@ -512,7 +542,12 @@ impl WorkspaceManager {
     /// `anyhow::Error` if the resolved attestation provider could not be
     /// constructed (e.g. `/dev/sev-guest` open failure under the SEV-SNP
     /// profile).
-    pub fn new(cfg: WorkspaceManagerConfig, audit: AuditLog) -> anyhow::Result<Self> {
+    pub fn new(
+        cfg: WorkspaceManagerConfig,
+        audit: AuditLog,
+        max_workspaces: usize,
+        max_workspace_mem_mib: u32,
+    ) -> anyhow::Result<Self> {
         let (pool, refill_tx, refill_rx) = cfg.warm_pool.as_ref().map_or_else(
             || (None, None, Mutex::new(None)),
             |wp| {
@@ -532,6 +567,8 @@ impl WorkspaceManager {
         Ok(Self {
             cfg,
             audit,
+            max_workspaces,
+            max_workspace_mem_mib,
             instances: Mutex::new(HashMap::new()),
             pool,
             refill_tx,
@@ -576,10 +613,62 @@ impl WorkspaceManager {
         Arc::clone(&self.ingress)
     }
 
+    /// Total live Firecracker VMs this manager is responsible for: registered
+    /// `instances` PLUS warm-pool members (idle ready members and in-flight
+    /// provisions — both are real, memory-consuming FC processes even though
+    /// they are not in `instances` yet). This is the figure the
+    /// `max_workspaces` exhaustion backstop bounds (audit O3): counting only
+    /// `instances` would let a configured pool run the host `target_size` VMs
+    /// past the ceiling.
+    ///
+    /// Locking: the `instances` lock and the pool's members lock are taken
+    /// sequentially (acquire, read, release; then the other), never nested —
+    /// the reading is therefore a snapshot, which is fine for a soft ceiling.
+    async fn live_vm_count(&self) -> usize {
+        let registered = self.instances.lock().await.len();
+        let pooled = match &self.pool {
+            Some(pool) => {
+                let (available, in_flight) = pool.counts().await;
+                available + in_flight
+            }
+            None => 0,
+        };
+        registered + pooled
+    }
+
     /// Launch a new Firecracker microVM and register it under the
     /// caller-supplied `workspace_id`.
     pub async fn create(&self, req: CreateWorkspaceRequest) -> SupervisorResponse {
+        // Admission control (audit O3): reject before reserving anything —
+        // ahead of even the tier dispatch below, so both the cold-boot and
+        // warm-pool paths are covered (both flow through `create`).
+        if req.mem_size_mib > self.max_workspace_mem_mib {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidRequest,
+                message: format!(
+                    "mem_size_mib {} exceeds max {}",
+                    req.mem_size_mib, self.max_workspace_mem_mib
+                ),
+            };
+        }
+        // Soft ceiling on the COMBINED live-VM count (registered instances +
+        // warm-pool members, see `live_vm_count`): this check-then-act races
+        // the eventual insert into `instances` (done later, under separate
+        // lock acquisitions, by `register_or_teardown`), so a burst of
+        // concurrent creates can admit a few requests over the line.
+        // Acceptable for an exhaustion backstop — not a hard quota.
+        if self.live_vm_count().await >= self.max_workspaces {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::CapacityExceeded,
+                message: format!("at workspace capacity ({})", self.max_workspaces),
+            };
+        }
+
         if req.tier.is_some() {
+            // Note: adopting a pool member (`create_from_pool` hit path) is
+            // count-neutral — the VM moves from the pool tally to `instances`
+            // — so the guard above never blocks adoption unfairly; it blocks
+            // the net-new VM the subsequent refill/miss-fallback would boot.
             return self.create_from_pool(req).await;
         }
         // Claim the id for the entire cold boot (C1): a concurrent same-id
@@ -2071,6 +2160,22 @@ impl WorkspaceManager {
                 message: e.to_string(),
             })?;
 
+        // Admission control (audit O3): validate the memory size the
+        // snapshot will boot at before spawning anything. `restore`/`fork`
+        // requests don't carry a client-supplied `mem_size_mib` (unlike
+        // `create`) — the size comes from the pinned manifest — so this is
+        // the earliest point it's known, and this helper is shared by
+        // restore, fork, and pool refill provisioning.
+        if manifest.guest_identity.mem_size_mib > self.max_workspace_mem_mib {
+            return Err(SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidRequest,
+                message: format!(
+                    "snapshot {snapshot_id} mem_size_mib {} exceeds max {}",
+                    manifest.guest_identity.mem_size_mib, self.max_workspace_mem_mib
+                ),
+            });
+        }
+
         let launch_cfg = crate::firecracker::LaunchConfig {
             workspace_id: new_workspace_id.to_string(),
             kernel_image: PathBuf::from(&manifest.kernel_path),
@@ -2419,11 +2524,35 @@ impl WorkspaceManager {
         };
         let me = Arc::clone(self);
         tokio::spawn(async move {
+            // Admission control (audit O3): pool refill boots real FC VMs, so
+            // it must respect the same combined instances+pool ceiling as the
+            // request paths. At (or over) the ceiling, DEFER — skip this tick
+            // with a warn rather than erroring; the next tick / kick retries
+            // once capacity frees. Soft, like the request-path guards: the
+            // count is a snapshot and can race a concurrent create by a VM or
+            // two. `live_vm_count` includes in-flight provisions, and
+            // headroom is computed BEFORE reserving, so the `take(headroom)`
+            // below can't overshoot from this tick's own reservations.
+            let headroom = {
+                let live = me.live_vm_count().await;
+                let headroom = me.max_workspaces.saturating_sub(live);
+                if headroom == 0 {
+                    warn!(
+                        live_vms = live,
+                        max_workspaces = me.max_workspaces,
+                        "warm-pool refill deferred: at combined live-VM capacity"
+                    );
+                    return;
+                }
+                headroom
+            };
             // One RAII permit per reserved slot: the success path consumes it via
             // `complete_provision`; any failure — including a panic in the task —
             // drops it, releasing the in-flight slot so it can never leak.
+            // Permits past the ceiling headroom are dropped immediately, which
+            // releases their in-flight slots for a later, freer tick.
             let permits = pool.reserve_provisions().await;
-            for permit in permits {
+            for permit in permits.into_iter().take(headroom) {
                 let me2 = Arc::clone(&me);
                 let pool2 = Arc::clone(&pool);
                 tokio::spawn(async move {
@@ -2522,6 +2651,20 @@ impl WorkspaceManager {
 
     /// Restore a fresh workspace from a snapshot artifact.
     pub async fn restore(&self, req: RestoreRequest) -> SupervisorResponse {
+        // Admission control (audit O3): same soft ceiling as `create`, on the
+        // combined instances+warm-pool live-VM count — restore also boots a
+        // net-new VM. No mem_size_mib guard here: `RestoreRequest` carries no
+        // client-supplied memory size (it comes from the pinned snapshot
+        // manifest instead), so that check lives in `boot_from_snapshot`,
+        // applied once the manifest is loaded and before the VM is actually
+        // spawned.
+        if self.live_vm_count().await >= self.max_workspaces {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::CapacityExceeded,
+                message: format!("at workspace capacity ({})", self.max_workspaces),
+            };
+        }
+
         // Step 1: fast-fail courtesy check (re-checked under final lock).
         if self
             .instances
@@ -2607,6 +2750,19 @@ impl WorkspaceManager {
     /// guest is unreachable or `ResetIdentity` fails, the freshly-booted VM
     /// is torn down and `ForkFailed` is returned.
     pub async fn fork(&self, req: ForkRequest) -> SupervisorResponse {
+        // Admission control (audit O3): same soft ceiling as `create`, on the
+        // combined instances+warm-pool live-VM count — fork also boots a
+        // net-new VM. No mem_size_mib guard here for the same reason as
+        // `restore`: `ForkRequest` carries no client-supplied memory size; it
+        // comes from the pinned snapshot manifest and is validated in
+        // `boot_from_snapshot` instead.
+        if self.live_vm_count().await >= self.max_workspaces {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::CapacityExceeded,
+                message: format!("at workspace capacity ({})", self.max_workspaces),
+            };
+        }
+
         // Step 1: courtesy collision check.
         if self
             .instances
@@ -2976,8 +3132,19 @@ mod tests {
 
     use crate::audit::AuditLog;
 
-    /// Build a minimal `WorkspaceManager` backed by a tempdir state + audit log.
+    /// Build a minimal `WorkspaceManager` backed by a tempdir state + audit
+    /// log, with generous admission ceilings that no test here is meant to
+    /// exercise.
     async fn test_manager() -> WorkspaceManager {
+        test_manager_with_limits(1024, 32768).await
+    }
+
+    /// Like [`test_manager`] but with caller-controlled admission ceilings,
+    /// for exercising the O3 guards themselves.
+    async fn test_manager_with_limits(
+        max_workspaces: usize,
+        max_workspace_mem_mib: u32,
+    ) -> WorkspaceManager {
         let tmp = tempfile::tempdir().expect("tmpdir");
         // Leak so the audit file stays alive; bounded per-test.
         let state_dir = Box::leak(Box::new(tmp)).path().to_path_buf();
@@ -2988,7 +3155,8 @@ mod tests {
         let audit = AuditLog::open(&state_dir).await.expect("audit open");
         let mut cfg = WorkspaceManagerConfig::dev_defaults();
         cfg.state_dir = state_dir;
-        WorkspaceManager::new(cfg, audit).expect("workspace manager")
+        WorkspaceManager::new(cfg, audit, max_workspaces, max_workspace_mem_mib)
+            .expect("workspace manager")
     }
 
     #[tokio::test]
@@ -3258,6 +3426,168 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_rejects_mem_over_ceiling() {
+        let mgr = test_manager_with_limits(1024, 256).await;
+        let req = CreateWorkspaceRequest {
+            workspace_id: "ws-mem".into(),
+            kernel_image_path: "k".into(),
+            rootfs_image_path: "r".into(),
+            rootfs_read_only: true,
+            vcpu_count: 1,
+            mem_size_mib: 512,
+            guest_vsock_cid: 3,
+            kernel_boot_args: None,
+            network: None,
+            tier: None,
+        };
+        let resp = mgr.create(req).await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::InvalidRequest,
+                    ..
+                }
+            ),
+            "expected InvalidRequest, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_at_workspace_capacity() {
+        // A zero ceiling means "0 registered >= 0 allowed" is always true —
+        // exercises the count guard without needing a real boot.
+        let mgr = test_manager_with_limits(0, 32768).await;
+        let req = CreateWorkspaceRequest {
+            workspace_id: "ws-cap".into(),
+            kernel_image_path: "k".into(),
+            rootfs_image_path: "r".into(),
+            rootfs_read_only: true,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            guest_vsock_cid: 3,
+            kernel_boot_args: None,
+            network: None,
+            tier: None,
+        };
+        let resp = mgr.create(req).await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::CapacityExceeded,
+                    ..
+                }
+            ),
+            "expected CapacityExceeded, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_vm_count_includes_warm_pool_and_create_respects_it() {
+        // Manager with a pool and a combined live-VM ceiling of 2.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let state_dir = Box::leak(Box::new(tmp)).path().to_path_buf();
+        tokio::fs::create_dir_all(state_dir.join("keys"))
+            .await
+            .expect("keys dir");
+        let audit = AuditLog::open(&state_dir).await.expect("audit open");
+        let mut cfg = WorkspaceManagerConfig::dev_defaults();
+        cfg.state_dir = state_dir;
+        cfg.warm_pool = Some(crate::pool::WarmPoolConfig {
+            tier_name: "default".into(),
+            base_snapshot_id: "snap".into(),
+            target_size: 2,
+            max_in_flight: 2,
+        });
+        let mgr = WorkspaceManager::new(cfg, audit, 2, 32768).expect("workspace manager");
+        assert_eq!(mgr.live_vm_count().await, 0);
+
+        // Simulate two live pool VMs without booting anything: reserved
+        // provision permits count as in-flight, and in-flight provisions are
+        // real booting FC processes as far as the ceiling is concerned.
+        let pool = mgr.pool.clone().expect("pool configured");
+        let permits = pool.reserve_provisions().await;
+        assert_eq!(permits.len(), 2);
+        assert_eq!(mgr.live_vm_count().await, 2);
+
+        // A cold create must now be rejected: zero registered instances, but
+        // the combined instances+pool live-VM count is at the ceiling.
+        let resp = mgr
+            .create(CreateWorkspaceRequest {
+                workspace_id: "ws-pool-cap".into(),
+                kernel_image_path: "k".into(),
+                rootfs_image_path: "r".into(),
+                rootfs_read_only: true,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                guest_vsock_cid: 3,
+                kernel_boot_args: None,
+                network: None,
+                tier: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::CapacityExceeded,
+                    ..
+                }
+            ),
+            "expected CapacityExceeded, got {resp:?}"
+        );
+
+        // Dropping the permits releases the in-flight slots: the combined
+        // count returns to zero and capacity frees for the next refill tick.
+        drop(permits);
+        assert_eq!(mgr.live_vm_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_at_workspace_capacity() {
+        let mgr = test_manager_with_limits(0, 32768).await;
+        let resp = mgr
+            .restore(RestoreRequest {
+                snapshot_id: "snap".into(),
+                new_workspace_id: "ws-restore-cap".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::CapacityExceeded,
+                    ..
+                }
+            ),
+            "expected CapacityExceeded, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_at_workspace_capacity() {
+        let mgr = test_manager_with_limits(0, 32768).await;
+        let resp = mgr
+            .fork(ForkRequest {
+                snapshot_id: "snap".into(),
+                new_workspace_id: "ws-fork-cap".into(),
+                hostname: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                resp,
+                SupervisorResponse::Error {
+                    kind: S::CapacityExceeded,
+                    ..
+                }
+            ),
+            "expected CapacityExceeded, got {resp:?}"
+        );
+    }
+
     #[test]
     fn boot_args_append_guest_ip_when_networked() {
         let base = "console=ttyS0 reboot=k panic=1 pci=off";
@@ -3359,5 +3689,19 @@ mod exec_routing_tests {
             exec_backend_for_profile(AttestationProfile::SevSnp),
             "openshell"
         );
+    }
+}
+
+/// Cross-platform unit tests for the admission-control derivation (audit
+/// O3). Pure, so they run on macOS — enforcement itself is exercised in the
+/// Linux-only `tests` module below.
+#[cfg(test)]
+mod admission_tests {
+    #[test]
+    fn derive_max_workspaces_scales_and_floors() {
+        // ~512 MiB nominal per VM; never returns 0; capped at 1024.
+        assert_eq!(super::derive_max_workspaces(64), 1); // tiny host -> floor 1
+        assert_eq!(super::derive_max_workspaces(8 * 1024), 16);
+        assert_eq!(super::derive_max_workspaces(4 * 1024 * 1024), 1024); // ceiling
     }
 }

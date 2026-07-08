@@ -85,6 +85,8 @@ async fn main() -> Result<()> {
                 openshell_sandbox_binary: a.openshell_sandbox_binary,
                 api_socket_timeout_ms: a.api_socket_timeout_ms,
                 state_dir: a.state_dir,
+                max_workspaces: a.max_workspaces,
+                max_workspace_mem_mib: a.max_workspace_mem_mib,
                 enable_networking: a.enable_networking,
                 ip_binary: a.ip_binary,
                 iptables_binary: a.iptables_binary,

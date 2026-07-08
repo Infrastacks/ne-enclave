@@ -16,6 +16,39 @@ use crate::command::Dispatcher;
 use crate::ipc::{IpcServer, PeerAuth};
 use crate::workspace::{WorkspaceManager, WorkspaceManagerConfig};
 
+/// Read total host RAM in MiB from `/proc/meminfo`'s `MemTotal` line
+/// (kB → MiB). Used to resolve `NE_MAX_WORKSPACES=0` /
+/// `NE_MAX_WORKSPACE_MEM_MIB=0` ("auto") at startup (audit O3).
+///
+/// Any failure — file missing, malformed line, non-Linux host — falls back
+/// to a conservative fixed default rather than panicking or blocking
+/// startup: a missing RAM signal must never crash the supervisor, and a
+/// deliberately small default just yields a conservative (small) derived
+/// ceiling instead of an unbounded one.
+#[cfg(target_os = "linux")]
+fn read_host_ram_mib() -> u64 {
+    const FALLBACK_MIB: u64 = 2048;
+    let Ok(contents) = std::fs::read_to_string("/proc/meminfo") else {
+        return FALLBACK_MIB;
+    };
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kb_str| kb_str.parse::<u64>().ok())
+        .map(|kb| kb / 1024)
+        .filter(|&mib| mib > 0)
+        .unwrap_or(FALLBACK_MIB)
+}
+
+/// Non-Linux fallback: `/proc/meminfo` doesn't exist, so always resolve to
+/// the same conservative default `read_host_ram_mib` uses on Linux when it
+/// can't read the real value.
+#[cfg(not(target_os = "linux"))]
+fn read_host_ram_mib() -> u64 {
+    2048
+}
+
 /// Resolved supervisor configuration (mirrors the historical
 /// `ne-supervisor` CLI flags 1:1 so behavior is unchanged).
 #[derive(Debug, Clone)]
@@ -43,6 +76,14 @@ pub struct SupervisorConfig {
     pub api_socket_timeout_ms: u64,
     /// Persistent state directory (audit signing keys + JSONL audit log).
     pub state_dir: PathBuf,
+    /// Max concurrent workspaces (0 = derive from host RAM via
+    /// [`crate::workspace::derive_max_workspaces`]). Soft ceiling — an
+    /// exhaustion backstop, not a hard quota (audit O3).
+    pub max_workspaces: usize,
+    /// Max `mem_size_mib` any single workspace may request (0 = `min(host
+    /// RAM, 32768)`). Resolved once from `/proc/meminfo` in [`serve`] (audit
+    /// O3).
+    pub max_workspace_mem_mib: u32,
     /// Enable per-workspace network plumbing (netns + veth + TAP + MASQUERADE).
     pub enable_networking: bool,
     /// Path to the `ip` binary (iproute2).
@@ -238,6 +279,28 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
         );
     }
 
+    // Admission control (audit O3): resolve NE_MAX_WORKSPACES /
+    // NE_MAX_WORKSPACE_MEM_MIB "0 = auto" against host RAM, read once here
+    // rather than per-request. `derive_max_workspaces` and the mem default
+    // both key off the same reading so they stay consistent with each other.
+    let host_ram_mib = read_host_ram_mib();
+    let max_workspaces = if cfg.max_workspaces == 0 {
+        crate::workspace::derive_max_workspaces(host_ram_mib)
+    } else {
+        cfg.max_workspaces
+    };
+    let max_workspace_mem_mib = if cfg.max_workspace_mem_mib == 0 {
+        u32::try_from(host_ram_mib.min(32768)).unwrap_or(u32::MAX)
+    } else {
+        cfg.max_workspace_mem_mib
+    };
+    tracing::info!(
+        max_workspaces,
+        max_workspace_mem_mib,
+        host_ram_mib,
+        "admission control ceilings resolved"
+    );
+
     let workspaces = Arc::new(
         WorkspaceManager::new(
             WorkspaceManagerConfig {
@@ -257,6 +320,8 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
                 warm_pool,
             },
             audit.clone(),
+            max_workspaces,
+            max_workspace_mem_mib,
         )
         .context("construct workspace manager")?,
     );
@@ -370,6 +435,8 @@ mod tests {
             openshell_sandbox_binary: "/opt/ne-enclave/bin/openshell-sandbox".into(),
             api_socket_timeout_ms: 10_000,
             state_dir: "/var/lib/ne-enclave".into(),
+            max_workspaces: 0,
+            max_workspace_mem_mib: 0,
             enable_networking: false,
             ip_binary: "/usr/sbin/ip".into(),
             iptables_binary: "/usr/sbin/iptables".into(),

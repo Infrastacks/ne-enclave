@@ -97,8 +97,15 @@ mod tests {
         // this leak is bounded per-test.
         let state_dir = Box::leak(Box::new(tmp)).path().to_path_buf();
         let audit = AuditLog::open(&state_dir).await.expect("audit open");
-        let mgr = WorkspaceManager::new(WorkspaceManagerConfig::dev_defaults(), audit.clone())
-            .expect("workspace manager");
+        // Generous test ceilings: these dispatcher tests aren't exercising
+        // admission control and must not spuriously hit it.
+        let mgr = WorkspaceManager::new(
+            WorkspaceManagerConfig::dev_defaults(),
+            audit.clone(),
+            1024,
+            32768,
+        )
+        .expect("workspace manager");
         Dispatcher::new(Arc::new(mgr), audit)
     }
 
