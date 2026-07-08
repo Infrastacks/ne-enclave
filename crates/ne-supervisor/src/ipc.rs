@@ -21,11 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ne_protocol::supervisor::{SupervisorErrorKind, SupervisorRequest, SupervisorResponse};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
 use crate::command::Dispatcher;
+use crate::util::read_capped_line;
 
 /// Maximum size of a single newline-delimited IPC request frame.
 ///
@@ -176,29 +177,6 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Read one newline-delimited frame into `buf`, rejecting frames larger than
-/// `max` bytes instead of growing the buffer without bound (audit `S2-F4`).
-///
-/// Returns the number of bytes read (0 on clean EOF). A frame that reaches
-/// `max` bytes without a terminating newline yields [`ErrorKind::InvalidData`].
-async fn read_capped_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    buf: &mut String,
-    max: u64,
-) -> io::Result<usize> {
-    // Read at most `max + 1` bytes: if the newline has not arrived by then the
-    // frame is over the cap and is rejected.
-    let mut limited = reader.take(max + 1);
-    let n = limited.read_line(buf).await?;
-    if n as u64 > max {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "IPC request frame exceeds maximum size",
-        ));
-    }
-    Ok(n)
-}
-
 async fn write_one(stream: UnixStream, resp: &SupervisorResponse) -> io::Result<()> {
     let (_, mut wr) = stream.into_split();
     let mut bytes = serde_json::to_vec(resp).map_err(io::Error::other)?;
@@ -255,19 +233,6 @@ mod tests {
             .unwrap();
         assert_eq!(n, 12);
         assert_eq!(line, "hello world\n");
-    }
-
-    #[tokio::test]
-    async fn capped_line_rejects_oversized_frame() {
-        // A frame with no newline that exceeds the cap must be rejected, not
-        // grown without bound (memory DoS, audit S2-F4).
-        let data = [b'x'; 64]; // 64 bytes, no newline
-        let mut reader = BufReader::new(&data[..]);
-        let mut line = String::new();
-        let err = read_capped_line(&mut reader, &mut line, 16)
-            .await
-            .expect_err("oversized frame must error");
-        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[tokio::test]

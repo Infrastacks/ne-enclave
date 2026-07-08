@@ -33,4 +33,5 @@ pub mod seal;
 pub mod serve;
 pub mod signing;
 pub mod snapshot;
+pub mod util;
 pub mod workspace;

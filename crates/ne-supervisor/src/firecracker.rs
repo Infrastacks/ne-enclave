@@ -24,6 +24,7 @@
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -32,6 +33,16 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+
+/// Host-side cap on a single guest vsock reply frame. Matches the guest
+/// agent's own `MAX_GUEST_FRAME_BYTES` (32 MiB); the host does NOT trust the
+/// guest to honor its own cap (audit: host-OOM `DoS`). Override via env.
+static MAX_GUEST_FRAME_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("NE_MAX_GUEST_FRAME_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32 * 1024 * 1024)
+});
 
 /// Inputs to a single workspace launch. The supervisor builds this
 /// from a [`ne_protocol::supervisor::CreateWorkspaceRequest`]
@@ -477,7 +488,7 @@ async fn vsock_request_response(
         wr.write_all(format!("CONNECT {guest_port}\n").as_bytes())
             .await?;
         let mut handshake = String::new();
-        reader.read_line(&mut handshake).await?;
+        crate::util::read_capped_line(&mut reader, &mut handshake, *MAX_GUEST_FRAME_BYTES).await?;
         if !handshake.starts_with("OK ") {
             return Err(GuestRpcError::ConnectRejected(
                 handshake.trim_end().to_string(),
@@ -489,7 +500,7 @@ async fn vsock_request_response(
         wr.write_all(&body).await?;
 
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        crate::util::read_capped_line(&mut reader, &mut line, *MAX_GUEST_FRAME_BYTES).await?;
         let resp: GuestResponse = serde_json::from_str(line.trim_end())?;
         Ok::<GuestResponse, GuestRpcError>(resp)
     };
