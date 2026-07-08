@@ -723,16 +723,22 @@ impl WorkspaceManager {
                     .as_ref()
                     .and_then(|slot| slot.guest_eth_ip.parse::<std::net::Ipv4Addr>().ok())
                     .map(|guest_ip| (guest_ip, exposed_ports_from_request(&req.network)));
-                #[cfg(target_os = "linux")]
-                let registry_wsid = req.workspace_id.clone();
-                self.instances.lock().await.insert(
-                    req.workspace_id,
-                    WorkspaceExec::Firecracker(Box::new(instance)),
-                );
+                // Re-check the id under the final lock and tear the loser
+                // down (chroot + netns) on a collision — a bare insert here
+                // let two concurrent same-id creates both leak a live VM.
+                if let Err(resp) = self
+                    .register_or_teardown(
+                        &req.workspace_id,
+                        WorkspaceExec::Firecracker(Box::new(instance)),
+                    )
+                    .await
+                {
+                    return resp;
+                }
                 #[cfg(target_os = "linux")]
                 if let Some((guest_ip, ports)) = ingress_routes {
                     self.ingress
-                        .upsert_workspace(&registry_wsid, guest_ip, ports)
+                        .upsert_workspace(&req.workspace_id, guest_ip, ports)
                         .await;
                 }
                 SupervisorResponse::WorkspaceCreated(resp)
@@ -834,10 +840,17 @@ impl WorkspaceManager {
                     }),
                 )
                 .await;
-                self.instances.lock().await.insert(
-                    req.workspace_id,
-                    WorkspaceExec::OpenShell(Box::new(sandbox)),
-                );
+                // Re-check the id under the final lock and tear the loser's
+                // sandbox down on a collision instead of a bare insert.
+                if let Err(resp) = self
+                    .register_or_teardown(
+                        &req.workspace_id,
+                        WorkspaceExec::OpenShell(Box::new(sandbox)),
+                    )
+                    .await
+                {
+                    return resp;
+                }
                 SupervisorResponse::WorkspaceCreated(resp)
             }
             Err(OpenShellError::Spawn(msg)) => {
@@ -941,7 +954,13 @@ impl WorkspaceManager {
                 exec_backend: None,
                 control_socket: None,
             };
-            if let Err(resp) = self.register_or_teardown(&req.workspace_id, instance).await {
+            if let Err(resp) = self
+                .register_or_teardown(
+                    &req.workspace_id,
+                    WorkspaceExec::Firecracker(Box::new(instance)),
+                )
+                .await
+            {
                 return resp;
             }
             info!(workspace_id = %req.workspace_id, tier = %tier, "warm-pool hit");
@@ -991,7 +1010,13 @@ impl WorkspaceManager {
             exec_backend: None,
             control_socket: None,
         };
-        if let Err(resp) = self.register_or_teardown(&req.workspace_id, instance).await {
+        if let Err(resp) = self
+            .register_or_teardown(
+                &req.workspace_id,
+                WorkspaceExec::Firecracker(Box::new(instance)),
+            )
+            .await
+        {
             return resp;
         }
         self.audit_emit(
@@ -2048,31 +2073,47 @@ impl WorkspaceManager {
         }
     }
 
-    /// Register a freshly-booted instance under the final lock, re-checking
+    /// Register a freshly-booted workspace under the final lock, re-checking
     /// for an id collision (the boot above released the lock for seconds).
-    /// On collision, tear the instance down rather than leak it.
+    /// On collision, tear the loser down rather than leak it — for either
+    /// exec backend (Firecracker chroot/netns, or the OpenShell sandbox).
     async fn register_or_teardown(
         &self,
         workspace_id: &str,
-        instance: crate::firecracker::Instance,
+        exec: WorkspaceExec,
     ) -> Result<(), SupervisorResponse> {
         let mut guard = self.instances.lock().await;
         if guard.contains_key(workspace_id) {
             drop(guard);
             warn!(
                 workspace_id,
-                "lost boot race — tearing down freshly-booted instance"
+                "lost boot race — tearing down freshly-booted workspace"
             );
-            let _ = crate::firecracker::terminate(instance, Duration::from_secs(5)).await;
+            match exec {
+                WorkspaceExec::Firecracker(instance) => {
+                    // Reclaim the loser's network slot too (terminate() only
+                    // reaps the process + chroot; netns/NAT reclamation is the
+                    // caller's job — mirror the main terminate handler).
+                    let network_slot = instance.network_slot.clone();
+                    let _ = crate::firecracker::terminate(*instance, Duration::from_secs(5)).await;
+                    if let (Some(slot), Some(controller)) = (network_slot, &self.cfg.network)
+                        && let Err(e) = controller.teardown(slot).await
+                    {
+                        warn!(workspace_id, error = %e,
+                              "boot-race loser network teardown failed (resources may have leaked)");
+                    }
+                }
+                #[cfg(feature = "confidential-cvm")]
+                WorkspaceExec::OpenShell(sandbox) => {
+                    sandbox.terminate(Duration::from_secs(5)).await;
+                }
+            }
             return Err(SupervisorResponse::Error {
                 kind: SupervisorErrorKind::WorkspaceAlreadyExists,
                 message: format!("workspace {workspace_id} already exists"),
             });
         }
-        guard.insert(
-            workspace_id.to_string(),
-            WorkspaceExec::Firecracker(Box::new(instance)),
-        );
+        guard.insert(workspace_id.to_string(), exec);
         Ok(())
     }
 
@@ -2452,7 +2493,10 @@ impl WorkspaceManager {
 
         // Step 3: register under the final lock with collision re-check.
         if let Err(resp) = self
-            .register_or_teardown(&req.new_workspace_id, instance)
+            .register_or_teardown(
+                &req.new_workspace_id,
+                WorkspaceExec::Firecracker(Box::new(instance)),
+            )
             .await
         {
             return resp;
@@ -2534,7 +2578,10 @@ impl WorkspaceManager {
             guest_vsock_cid: instance.guest_vsock_cid,
         };
         if let Err(resp) = self
-            .register_or_teardown(&req.new_workspace_id, instance)
+            .register_or_teardown(
+                &req.new_workspace_id,
+                WorkspaceExec::Firecracker(Box::new(instance)),
+            )
             .await
         {
             return resp;
