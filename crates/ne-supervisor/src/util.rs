@@ -27,6 +27,21 @@ pub(crate) async fn read_capped_line<R: AsyncBufRead + Unpin>(
     Ok(n)
 }
 
+/// Parse an optional string env override into a positive integer, rejecting a
+/// zero, negative, or unparseable value by falling back to `default`. Shared by
+/// the byte-cap knobs (`NE_MAX_GUEST_FRAME_BYTES` u64, `NE_MAX_EXEC_OUTPUT_BYTES`
+/// usize) so a literal `0` cannot silently install a fail-closed cap that bricks
+/// vsock RPC / discards all exec output — parity with the timeout knobs
+/// ([`parse_ceiling`]).
+pub(crate) fn parse_positive_or<T>(raw: Option<String>, default: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    raw.and_then(|v| v.parse::<T>().ok())
+        .filter(|v| *v > T::default())
+        .unwrap_or(default)
+}
+
 /// Clamp a client-supplied `timeout_ms` so 0 ("no bound") or an
 /// over-ceiling value resolves to `ceiling`. Guarantees a wall-clock deadline.
 pub(crate) fn clamp_timeout_ms(requested: u32, ceiling: u32) -> u32 {
@@ -105,5 +120,24 @@ mod tests {
         assert_eq!(parse_ceiling(Some("0".into())), 3_600_000);
         assert_eq!(parse_ceiling(Some("not-a-number".into())), 3_600_000);
         assert_eq!(parse_ceiling(Some("120000".into())), 120_000);
+    }
+
+    // `parse_positive_or` backs the byte-cap knobs (u64 frame cap, usize exec
+    // output cap); a 0/garbage override must fall back to the default (a 0-byte
+    // cap is fail-closed but a silent footgun), and a valid value passes through.
+    #[test]
+    fn parse_positive_or_rejects_zero_and_garbage_u64() {
+        assert_eq!(parse_positive_or(None, 100_u64), 100);
+        assert_eq!(parse_positive_or(Some("0".into()), 100_u64), 100);
+        assert_eq!(parse_positive_or(Some("garbage".into()), 100_u64), 100);
+        assert_eq!(parse_positive_or(Some("512".into()), 100_u64), 512);
+    }
+
+    #[test]
+    fn parse_positive_or_rejects_zero_and_garbage_usize() {
+        assert_eq!(parse_positive_or(None, 4096_usize), 4096);
+        assert_eq!(parse_positive_or(Some("0".into()), 4096_usize), 4096);
+        assert_eq!(parse_positive_or(Some("bad".into()), 4096_usize), 4096);
+        assert_eq!(parse_positive_or(Some("8192".into()), 4096_usize), 8192);
     }
 }

@@ -664,25 +664,31 @@ impl WorkspaceManager {
                 ),
             };
         }
+        // Warm-pool dispatch runs BEFORE the net-new count ceiling below,
+        // deliberately: a pool HIT is count-neutral — the VM moves from the
+        // pool tally into `instances`, leaving `live_vm_count` unchanged — so
+        // gating adoption on the combined ceiling would starve a full pool
+        // sized near `max_workspaces`, rejecting every tier create even though
+        // adoption adds no VM. `create_from_pool` applies the ceiling itself,
+        // only on its net-new miss/fork-fallback branch.
+        if req.tier.is_some() {
+            return self.create_from_pool(req).await;
+        }
+
         // Soft ceiling on the COMBINED live-VM count (registered instances +
-        // warm-pool members, see `live_vm_count`): this check-then-act races
-        // the eventual insert into `instances` (done later, under separate
-        // lock acquisitions, by `register_or_teardown`), so a burst of
-        // concurrent creates can admit a few requests over the line.
-        // Acceptable for an exhaustion backstop — not a hard quota.
+        // warm-pool members, see `live_vm_count`), gating only NET-NEW boots:
+        // the confidential-tier spawn and the Firecracker cold boot that follow
+        // (count-neutral warm-pool adoption is handled above / inside
+        // `create_from_pool`). This check-then-act races the eventual insert
+        // into `instances` (done later, under separate lock acquisitions, by
+        // `register_or_teardown`), so a burst of concurrent creates can admit a
+        // few requests over the line. Acceptable for an exhaustion backstop —
+        // not a hard quota.
         if self.live_vm_count().await >= self.max_workspaces {
             return SupervisorResponse::Error {
                 kind: SupervisorErrorKind::CapacityExceeded,
                 message: format!("at workspace capacity ({})", self.max_workspaces),
             };
-        }
-
-        if req.tier.is_some() {
-            // Note: adopting a pool member (`create_from_pool` hit path) is
-            // count-neutral — the VM moves from the pool tally to `instances`
-            // — so the guard above never blocks adoption unfairly; it blocks
-            // the net-new VM the subsequent refill/miss-fallback would boot.
-            return self.create_from_pool(req).await;
         }
         // Claim the id for the entire cold boot (C1): a concurrent same-id
         // create fails fast here instead of racing a second boot into the
@@ -1111,7 +1117,17 @@ impl WorkspaceManager {
             return SupervisorResponse::WorkspaceCreated(resp);
         }
 
-        // Miss: synchronous fork from the tier base.
+        // Miss: synchronous fork from the tier base. This boots a NET-NEW VM
+        // (unlike the count-neutral hit/adopt path above), so it must honor the
+        // same soft combined-count ceiling the cold-boot path enforces —
+        // otherwise an empty pool at capacity would fork past `max_workspaces`.
+        if self.live_vm_count().await >= self.max_workspaces {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::CapacityExceeded,
+                message: format!("at workspace capacity ({})", self.max_workspaces),
+            };
+        }
+
         info!(workspace_id = %req.workspace_id, tier = %tier, "warm-pool miss — synchronous fork fallback");
         self.audit_emit(
             EventType::PoolMiss,

@@ -41,12 +41,11 @@ mod imp {
     use super::preface::{PrefaceMaterial, build_nssh1_preface, random_preface_token};
 
     /// Cap on captured SSH exec output per stream. Parity with the Firecracker
-    /// tier's guest-agent `MAX_CMD_OUTPUT_BYTES` (1 MiB). Override via env.
+    /// tier's guest-agent `MAX_CMD_OUTPUT_BYTES` (1 MiB). Override via
+    /// `NE_MAX_EXEC_OUTPUT_BYTES`; a 0/garbage override is rejected (falls back
+    /// to the default) — a 0-byte cap would discard every command's output.
     static MAX_EXEC_OUTPUT_BYTES: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("NE_MAX_EXEC_OUTPUT_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024 * 1024)
+        crate::util::parse_positive_or(std::env::var("NE_MAX_EXEC_OUTPUT_BYTES").ok(), 1024 * 1024)
     });
 
     /// Append `data` to `buf` but never let `buf` exceed `cap`. Returns true if
@@ -421,13 +420,12 @@ mod imp {
                 }
             }
         };
-        if timeout_ms == 0 {
-            drain.await;
-        } else {
-            tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), drain)
-                .await
-                .map_err(|_| OpenShellError::Timeout(timeout_ms))?;
-        }
+        // `timeout_ms` was clamped above against `MAX_EXEC_TIMEOUT_MS` (which is
+        // guaranteed > 0), so a client-supplied 0 becomes the ceiling and the
+        // value here is always non-zero — always enforce a wall-clock deadline.
+        tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), drain)
+            .await
+            .map_err(|_| OpenShellError::Timeout(timeout_ms))?;
         let elapsed_ms = u64::try_from(elapsed_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         handle

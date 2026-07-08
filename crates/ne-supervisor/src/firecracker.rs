@@ -36,12 +36,14 @@ use tracing::{debug, info, warn};
 
 /// Host-side cap on a single guest vsock reply frame. Matches the guest
 /// agent's own `MAX_GUEST_FRAME_BYTES` (32 MiB); the host does NOT trust the
-/// guest to honor its own cap (audit: host-OOM `DoS`). Override via env.
+/// guest to honor its own cap (audit: host-OOM `DoS`). Override via
+/// `NE_MAX_GUEST_FRAME_BYTES`; a 0/garbage override is rejected (falls back to
+/// the default) — a 0-byte cap would reject every frame and brick all vsock RPC.
 static MAX_GUEST_FRAME_BYTES: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("NE_MAX_GUEST_FRAME_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32 * 1024 * 1024)
+    crate::util::parse_positive_or(
+        std::env::var("NE_MAX_GUEST_FRAME_BYTES").ok(),
+        32 * 1024 * 1024,
+    )
 });
 
 /// Per-MiB timeout budget added on top of [`FC_API_TIMEOUT_MS`] for
@@ -585,14 +587,12 @@ async fn vsock_request_response(
         Ok::<GuestResponse, GuestRpcError>(resp)
     };
 
-    if timeout_ms == 0 {
-        // 0 disables the timeout (mirrors RunCommandRequest::timeout_ms semantics).
-        work.await
-    } else {
-        match tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), work).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(GuestRpcError::Timeout(timeout_ms)),
-        }
+    // `timeout_ms` was clamped above against `MAX_EXEC_TIMEOUT_MS` (which is
+    // guaranteed > 0), so a client-supplied 0 becomes the ceiling and the value
+    // here is always non-zero — always enforce a wall-clock deadline.
+    match tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), work).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(GuestRpcError::Timeout(timeout_ms)),
     }
 }
 
@@ -1270,9 +1270,10 @@ mod tests {
             }
         });
 
-        // timeout_ms = 0 bypasses the host-side wall clock. Wrap the
-        // whole call in an outer 2-second guard so a regression that
-        // accidentally hangs doesn't hang the test runner.
+        // timeout_ms = 0 is clamped up to MAX_EXEC_TIMEOUT_MS (the ceiling,
+        // ~1h default), so the call still completes promptly against a
+        // responsive server. Wrap the whole call in an outer 2-second guard so
+        // a regression that accidentally hangs doesn't hang the test runner.
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             vsock_request_response(&sock, 52, &GuestRequest::Ping, 0),
