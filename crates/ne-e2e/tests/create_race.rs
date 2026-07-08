@@ -14,24 +14,32 @@
 //! REAL-HARDWARE NOTE (empirical): on the blank cold path the jailer chroot is
 //! derived directly from the caller-supplied id
 //! (`{chroot_base}/firecracker/{id}/root`), so two *simultaneous* same-id boots
-//! collide destructively on that shared tree — one jailer's `pivot_root` fails
-//! (`MkdirOldRoot: File exists`) and the other loads a half-staged kernel — and
-//! BOTH fail with `LaunchFailed` before either reaches the registry window.
-//! That is itself a safe outcome (no leak, no double-winner). Depending on
-//! timing you may instead see one winner + one `WorkspaceAlreadyExists` (the
-//! courtesy `contains_key` gate). This test asserts the invariant that holds in
-//! every ordering: at most one live winner, no leaked second chroot, and any
-//! survivor is cleanly terminable. The `register_or_teardown` *teardown* branch
-//! itself is pinned by `concurrent_pool_checkout_single_winner` below (warm-pool
-//! checkout: distinct member chroots, shared final registry id).
+//! collide on that shared tree: the loser's jailer dies at mkdir/mknod
+//! (`File exists`). Two hazards were found and fixed running this test:
 //!
-//! SECOND EMPIRICAL HAZARD (found running this test): the staging collision can
-//! TRUNCATE THE SHARED SOURCE IMAGE. `stage_file` hardlinks source→chroot; the
-//! racer whose hardlink hits EEXIST falls back to a copy that opens the
-//! existing dest — the hardlink, i.e. the SAME INODE as the source — zeroing
-//! the golden vmlinux on the host. The cold test therefore stages sacrificial
-//! tempdir copies. This wants a product fix (unique per-boot chroot ids and/or
-//! unlink-before-copy in `stage_file`) — tracked in the task-5 report.
+//! 1. `stage_file` could TRUNCATE THE SHARED SOURCE IMAGE (copy-fallback wrote
+//!    through the winner's hardlinked inode) — fixed by atomic temp+rename
+//!    staging; this test pins it by asserting the staged sources stay
+//!    non-empty after the race.
+//! 2. `wait_for_socket` trusted `path.exists()` at the SHARED socket path
+//!    before checking its own child's liveness, so the loser adopted the
+//!    winner's API socket and replayed config PUTs against the winner's live
+//!    instance — fixed by polling jailer liveness first (fail-fast
+//!    `JailerExited`).
+//! 3. Even failing fast, the loser's error-path cleanup (`remove_dir_all` of
+//!    the shared id-derived tree in `launch()`) deleted the WINNER's chroot
+//!    mid-boot, killing both racers — fixed by `claim_boot` in the manager:
+//!    same-id cold boots are serialized up front, so the second racer fails
+//!    with `WorkspaceAlreadyExists` before ever booting, staging, or cleaning.
+//!
+//! Post-fix the outcome is deterministic: exactly one winner; the loser fails
+//! in microseconds with `WorkspaceAlreadyExists` (the boot claim) — the
+//! assertion also tolerates `LaunchFailed` ("jailer exited...", the fail-fast
+//! backstop) — with no leaked chroot and no cross-instance interference. The
+//! `register_or_teardown` *teardown* branch is pinned by
+//! `concurrent_pool_checkout_single_winner` below (warm-pool checkout:
+//! distinct member chroots, shared final registry id). Unique per-boot chroot
+//! ids (also de-risking same-id restore/fork races) stay a filed follow-up.
 //!
 //! `#[ignore]` by default — needs `/dev/kvm`. Run on a KVM host:
 //! ```sh
@@ -131,12 +139,11 @@ async fn concurrent_same_id_create_has_one_winner() {
         .await
         .expect("chroot dir");
 
-    // SAFETY (fixture integrity): stage this test's kernel/rootfs as COPIES in
-    // the tempdir. The destructive same-id staging collision this test provokes
-    // can truncate the SOURCE image: `stage_file` hardlinks source→chroot, so
-    // the racer whose hardlink hits EEXIST falls back to a copy that writes
-    // through the winner's hardlinked inode — zeroing the shared golden image
-    // for every later test. Sacrificial copies keep the damage in the tempdir.
+    // Fixture integrity: stage this test's kernel/rootfs as COPIES in the
+    // tempdir. Pre-5b, the same-id staging collision could truncate the SOURCE
+    // image through a hardlinked inode; stage_file is atomic now, and the
+    // race-survives-intact assertion below pins that end-to-end. The copies
+    // keep any regression's blast radius inside the tempdir.
     let kernel_copy = tmp.path().join("vmlinux");
     let rootfs_copy = tmp.path().join("rootfs.img");
     tokio::fs::copy(&kernel, &kernel_copy)
@@ -154,9 +161,10 @@ async fn concurrent_same_id_create_has_one_winner() {
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     let mgr = Arc::new(WorkspaceManager::new(cfg, audit).expect("workspace manager"));
 
-    // Fire two identical cold creates concurrently. Both pass the courtesy
-    // `contains_key` gate before either registers; the winner is decided under
-    // the final registry lock inside `register_or_teardown`.
+    // Fire two identical cold creates concurrently. The winner claims the id
+    // up front (`claim_boot`) and boots alone; the loser fails fast without
+    // ever spawning a jailer. `register_or_teardown` remains the final
+    // registry-lock backstop.
     let a = {
         let mgr = Arc::clone(&mgr);
         let (kernel, rootfs) = (kernel_copy.clone(), rootfs_copy.clone());
@@ -183,13 +191,28 @@ async fn concurrent_same_id_create_has_one_winner() {
         }
     }
 
-    // --- C1 core guarantee: NEVER two live same-id winners. ---
-    // A bare double-insert (the pre-fix bug, in the ordering where both boots
-    // succeed) would land two live workspaces under one id; that must not happen.
+    // Deterministic post-fix outcome (boot claim + atomic stage_file +
+    // fail-fast wait_for_socket): the loser is rejected at the claim and never
+    // touches the shared chroot or the winner's API socket; the winner boots
+    // normally.
+    assert_eq!(
+        created.len(),
+        1,
+        "expected exactly one WorkspaceCreated, got {created:?} (errors: {errors:?})"
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one Error, got {errors:?}"
+    );
+    let (err_kind, err_msg) = &errors[0];
     assert!(
-        created.len() <= 1,
-        "two concurrent same-id creates yielded {} winners (must be <= 1): {created:?}",
-        created.len()
+        matches!(
+            err_kind,
+            SupervisorErrorKind::LaunchFailed | SupervisorErrorKind::WorkspaceAlreadyExists
+        ),
+        "loser must fail fast (LaunchFailed: jailer exited before Firecracker came up) \
+         or lose the courtesy gate (WorkspaceAlreadyExists), got {err_kind:?}: {err_msg}"
     );
 
     // --- No leaked second chroot tree for the loser. ---
@@ -201,63 +224,54 @@ async fn concurrent_same_id_create_has_one_winner() {
         "expected at most one chroot dir for {WS_ID}, found {dirs}"
     );
 
-    if let Some(winner) = created.first() {
-        // One boot won the id. The other MUST be a graceful rejection
-        // (WorkspaceAlreadyExists, via the courtesy gate or register_or_teardown),
-        // never a silent success.
-        assert_eq!(winner.workspace_id, WS_ID);
-        assert_eq!(errors.len(), 1, "one winner => exactly one error expected");
-        let (err_kind, err_msg) = &errors[0];
-        assert_eq!(
-            *err_kind,
-            SupervisorErrorKind::WorkspaceAlreadyExists,
-            "loser paired with a winner must be WorkspaceAlreadyExists, got {err_kind:?}: {err_msg}"
-        );
-
-        // Clean up the survivor and confirm no orphaned live Firecracker /chroot.
-        let term = mgr
-            .terminate(TerminateRequest {
-                workspace_id: WS_ID.to_string(),
-                grace_period_ms: 5_000,
-            })
-            .await;
-        eprintln!("terminate winner = {term:?}");
+    // --- 5b end-to-end pin: the staged source images survive the race. ---
+    // Pre-fix, the loser's copy-fallback zeroed the source image through the
+    // winner's hardlinked inode; atomic staging must keep them intact.
+    for p in [&kernel_copy, &rootfs_copy] {
+        let len = std::fs::metadata(p)
+            .expect("staged source image exists")
+            .len();
         assert!(
-            matches!(term, SupervisorResponse::WorkspaceTerminated { .. }),
-            "winner terminate should succeed, got {term:?}"
-        );
-    } else {
-        // No winner: the two boots collided destructively on the shared
-        // id-derived chroot and both failed. That is a safe outcome — but there
-        // must be NO leaked registry entry and NO leaked chroot for the id.
-        assert_eq!(
-            errors.len(),
-            2,
-            "no winner => both responses must be errors"
-        );
-        let term = mgr
-            .terminate(TerminateRequest {
-                workspace_id: WS_ID.to_string(),
-                grace_period_ms: 5_000,
-            })
-            .await;
-        eprintln!("terminate after both-fail = {term:?}");
-        // The key security guarantee: no registry entry (hence no live,
-        // reachable workspace) survives a both-fail race. Residual chroot
-        // *directory* bytes from a partially-staged loser are covered by the
-        // global `dirs <= 1` check above and are launch()-cleanup territory,
-        // not a live-workspace leak.
-        assert!(
-            matches!(
-                term,
-                SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::WorkspaceNotFound,
-                    ..
-                }
-            ),
-            "no registry entry should survive a both-fail race, got {term:?}"
+            len > 0,
+            "staged source image {} was truncated by the race (stage_file regression)",
+            p.display()
         );
     }
+
+    // The winner is live and cleanly terminable; no orphaned Firecracker/chroot.
+    let winner = &created[0];
+    assert_eq!(winner.workspace_id, WS_ID);
+    let term = mgr
+        .terminate(TerminateRequest {
+            workspace_id: WS_ID.to_string(),
+            grace_period_ms: 5_000,
+        })
+        .await;
+    eprintln!("terminate winner = {term:?}");
+    assert!(
+        matches!(term, SupervisorResponse::WorkspaceTerminated { .. }),
+        "winner terminate should succeed, got {term:?}"
+    );
+
+    // claim must not outlive the workspace: id is reusable after terminate
+    let recreate = mgr
+        .create(cold_create_req(&kernel_copy, &rootfs_copy))
+        .await;
+    eprintln!("re-create after terminate = {recreate:?}");
+    assert!(
+        matches!(recreate, SupervisorResponse::WorkspaceCreated(_)),
+        "fresh cold create of the same id must succeed after terminate, got {recreate:?}"
+    );
+    let term = mgr
+        .terminate(TerminateRequest {
+            workspace_id: WS_ID.to_string(),
+            grace_period_ms: 5_000,
+        })
+        .await;
+    assert!(
+        matches!(term, SupervisorResponse::WorkspaceTerminated { .. }),
+        "re-created workspace terminate should succeed, got {term:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

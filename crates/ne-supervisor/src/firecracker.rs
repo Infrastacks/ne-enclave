@@ -747,11 +747,23 @@ async fn wait_for_socket(
 ) -> Result<(), LaunchError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if path.exists() {
-            return Ok(());
-        }
+        // Check jailer liveness BEFORE trusting the socket path. On a same-id
+        // cold-create race the API socket path is shared (it is derived from
+        // the id-derived chroot), so a loser whose jailer already died at
+        // mkdir/mknod would otherwise observe the WINNER's socket here,
+        // believe it booted, and replay its config PUTs against the winner's
+        // live instance (audit C1 follow-through: cross-instance interference).
+        //
+        // Residual window (accepted): the child can die right after
+        // try_wait() returns None and before the exists() check; the API
+        // replay that follows still fails gracefully at InstanceStart
+        // ("not supported after starting the microVM"). The full fix is
+        // unique per-boot chroot ids — filed as a follow-up.
         if let Some(_status) = child.try_wait()? {
             return Err(LaunchError::JailerExited);
+        }
+        if path.exists() {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(LaunchError::ApiSocketTimeout(path.to_path_buf()));

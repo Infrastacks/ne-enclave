@@ -229,6 +229,37 @@ pub struct WorkspaceManager {
     /// (replay detection). Bounded; not a durable anti-replay store.
     #[cfg(target_os = "linux")]
     attestation_nonces: Mutex<HashMap<String, NonceRing>>,
+    /// Ids with a cold boot currently in flight (claimed before the multi-
+    /// second launch, released after registration or on failure). Serializes
+    /// same-id cold creates (audit C1): the jailer chroot is derived from the
+    /// caller id, so two concurrent boots of one id destroy each other's
+    /// shared chroot tree — and the loser's error-path cleanup deletes the
+    /// winner's live tree. A `std::sync` mutex (not tokio): claims are O(1)
+    /// with no await while held, and release happens in `Drop`, which cannot
+    /// await.
+    #[cfg(target_os = "linux")]
+    booting: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// RAII claim on a workspace id while its cold boot is in flight (see
+/// [`WorkspaceManager::claim_boot`]). Releases the id on drop — after the
+/// winner has registered into `instances`, or immediately on a failed boot.
+#[cfg(target_os = "linux")]
+struct BootClaim<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    id: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BootClaim<'_> {
+    fn drop(&mut self) {
+        // Poison recovery: the set holds plain ids, so continuing past a
+        // panicked holder is safe (worst case: we clear our own claim).
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 
 /// Bounded set of recently-seen nonce hashes for one workspace.
@@ -533,6 +564,7 @@ impl WorkspaceManager {
                 }
             },
             attestation_nonces: Mutex::new(HashMap::new()),
+            booting: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -550,13 +582,16 @@ impl WorkspaceManager {
         if req.tier.is_some() {
             return self.create_from_pool(req).await;
         }
-        // ---- existing blank cold path below, unchanged ----
-        if self.instances.lock().await.contains_key(&req.workspace_id) {
-            return SupervisorResponse::Error {
-                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
-                message: format!("workspace {} already exists", req.workspace_id),
-            };
-        }
+        // Claim the id for the entire cold boot (C1): a concurrent same-id
+        // create fails fast here instead of racing a second boot into the
+        // shared id-derived chroot (destructive collision + the loser's
+        // cleanup deleting the winner's tree). Subsumes the old courtesy
+        // registry check; held across `create_confidential` too; released on
+        // every return path.
+        let _boot_claim = match self.claim_boot(&req.workspace_id).await {
+            Ok(claim) => claim,
+            Err(resp) => return resp,
+        };
 
         // Two-tier dispatch (R1): the confidential profile (SevSnp) routes to
         // the OpenShell-in-CVM substrate (single-CVM-direct, B); the software
@@ -2073,6 +2108,47 @@ impl WorkspaceManager {
         }
     }
 
+    /// Claim `workspace_id` for a cold boot, failing fast with
+    /// `WorkspaceAlreadyExists` if another cold boot of the same id is in
+    /// flight or the id is already registered (audit C1 follow-through).
+    ///
+    /// Why: the boot runs for seconds outside the registry lock and the
+    /// jailer chroot is derived from the caller id, so two concurrent same-id
+    /// boots collide destructively on the shared chroot tree — worse, the
+    /// loser's error-path cleanup (`remove_dir_all` in `launch()`) deletes
+    /// the winner's live tree. Claiming the id up front means the second
+    /// racer never boots, stages, or cleans anything at all.
+    ///
+    /// Ordering: the winner registers into `instances` BEFORE its claim is
+    /// released (the claim lives past `register_or_teardown`), so there is no
+    /// window in which neither guard covers the id.
+    async fn claim_boot(&self, workspace_id: &str) -> Result<BootClaim<'_>, SupervisorResponse> {
+        let already = |id: &str| SupervisorResponse::Error {
+            kind: SupervisorErrorKind::WorkspaceAlreadyExists,
+            message: format!("workspace {id} already exists"),
+        };
+        // Poison recovery mirrors `BootClaim::drop` (plain-id set; safe).
+        if !self
+            .booting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(workspace_id.to_string())
+        {
+            return Err(already(workspace_id));
+        }
+        // Claim first, registry check second (dropping the claim on failure);
+        // `register_or_teardown` re-checks the registry under its own lock as
+        // the final backstop.
+        let claim = BootClaim {
+            set: &self.booting,
+            id: workspace_id.to_string(),
+        };
+        if self.instances.lock().await.contains_key(workspace_id) {
+            return Err(already(workspace_id));
+        }
+        Ok(claim)
+    }
+
     /// Register a freshly-booted workspace under the final lock, re-checking
     /// for an id collision (the boot above released the lock for seconds).
     /// On collision, tear the loser down rather than leak it — for either
@@ -2913,6 +2989,36 @@ mod tests {
         let mut cfg = WorkspaceManagerConfig::dev_defaults();
         cfg.state_dir = state_dir;
         WorkspaceManager::new(cfg, audit).expect("workspace manager")
+    }
+
+    #[tokio::test]
+    async fn claim_boot_serializes_same_id_cold_boots() {
+        let mgr = test_manager().await;
+        // First claim wins.
+        let claim = mgr.claim_boot("ws-claim").await;
+        let claim = match claim {
+            Ok(c) => c,
+            Err(resp) => panic!("first claim must succeed, got {resp:?}"),
+        };
+        // A concurrent same-id claim fails fast with WorkspaceAlreadyExists.
+        match mgr.claim_boot("ws-claim").await {
+            Err(SupervisorResponse::Error { kind, .. }) => {
+                assert_eq!(kind, S::WorkspaceAlreadyExists);
+            }
+            Err(other) => panic!("unexpected error response: {other:?}"),
+            Ok(_) => panic!("second same-id claim must fail while the first is held"),
+        }
+        // Distinct ids are unaffected.
+        assert!(
+            mgr.claim_boot("ws-other").await.is_ok(),
+            "distinct id must be claimable"
+        );
+        // Releasing the claim (the failed-boot path) frees the id again.
+        drop(claim);
+        assert!(
+            mgr.claim_boot("ws-claim").await.is_ok(),
+            "id must be claimable again after release"
+        );
     }
 
     #[test]
