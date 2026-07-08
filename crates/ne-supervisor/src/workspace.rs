@@ -84,11 +84,15 @@ pub enum AttestationProfile {
 #[cfg(target_os = "linux")]
 pub enum WorkspaceExec {
     /// Standard tier: a Firecracker microVM under jailer.
-    Firecracker(crate::firecracker::Instance),
+    ///
+    /// Boxed (as is `OpenShell`): the payloads are hundreds of bytes (clippy
+    /// `large_enum_variant`), and each registry entry is created once and
+    /// then only looked up by reference.
+    Firecracker(Box<crate::firecracker::Instance>),
     /// Confidential tier (B): an OpenShell sandbox spawned in-process in the
     /// attested CVM. Only present under `feature = "confidential-cvm"`.
     #[cfg(feature = "confidential-cvm")]
-    OpenShell(crate::openshell::Sandbox),
+    OpenShell(Box<crate::openshell::Sandbox>),
 }
 
 /// Pure decision: which [`WorkspaceExec`] variant does the given profile route to?
@@ -721,10 +725,10 @@ impl WorkspaceManager {
                     .map(|guest_ip| (guest_ip, exposed_ports_from_request(&req.network)));
                 #[cfg(target_os = "linux")]
                 let registry_wsid = req.workspace_id.clone();
-                self.instances
-                    .lock()
-                    .await
-                    .insert(req.workspace_id, WorkspaceExec::Firecracker(instance));
+                self.instances.lock().await.insert(
+                    req.workspace_id,
+                    WorkspaceExec::Firecracker(Box::new(instance)),
+                );
                 #[cfg(target_os = "linux")]
                 if let Some((guest_ip, ports)) = ingress_routes {
                     self.ingress
@@ -780,8 +784,7 @@ impl WorkspaceManager {
         // hand that port to the sandbox. A tiny race window is acceptable here
         // (the supervisor is the only loopback client).
         let ssh_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .map(|l| l.local_addr().map(|a| a.port()).unwrap_or(0))
-            .unwrap_or(0);
+            .map_or(0, |l| l.local_addr().map_or(0, |a| a.port()));
         let ssh_listen_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, ssh_port));
 
         let cfg = OpenShellLaunchConfig {
@@ -831,10 +834,10 @@ impl WorkspaceManager {
                     }),
                 )
                 .await;
-                self.instances
-                    .lock()
-                    .await
-                    .insert(req.workspace_id, WorkspaceExec::OpenShell(sandbox));
+                self.instances.lock().await.insert(
+                    req.workspace_id,
+                    WorkspaceExec::OpenShell(Box::new(sandbox)),
+                );
                 SupervisorResponse::WorkspaceCreated(resp)
             }
             Err(OpenShellError::Spawn(msg)) => {
@@ -1541,7 +1544,7 @@ impl WorkspaceManager {
             }
             WorkspaceExec::Firecracker(instance) => {
                 let slot = instance.network_slot.clone();
-                let r = crate::firecracker::terminate(instance, grace).await;
+                let r = crate::firecracker::terminate(*instance, grace).await;
                 (slot, r)
             }
         };
@@ -1549,7 +1552,7 @@ impl WorkspaceManager {
         let (network_slot, firecracker_result) = match exec {
             WorkspaceExec::Firecracker(instance) => {
                 let slot = instance.network_slot.clone();
-                let r = crate::firecracker::terminate(instance, grace).await;
+                let r = crate::firecracker::terminate(*instance, grace).await;
                 (slot, r)
             }
         };
@@ -2068,7 +2071,7 @@ impl WorkspaceManager {
         }
         guard.insert(
             workspace_id.to_string(),
-            WorkspaceExec::Firecracker(instance),
+            WorkspaceExec::Firecracker(Box::new(instance)),
         );
         Ok(())
     }
@@ -2146,7 +2149,7 @@ impl WorkspaceManager {
             instance.workspace_id = source_ws_id.to_string();
             guard.insert(
                 source_ws_id.to_string(),
-                WorkspaceExec::Firecracker(instance),
+                WorkspaceExec::Firecracker(Box::new(instance)),
             );
             old
         };
@@ -2163,7 +2166,7 @@ impl WorkspaceManager {
                 return Ok(new_pid);
             }
         };
-        if let Err(e) = crate::firecracker::terminate(old_instance, Duration::from_secs(5)).await {
+        if let Err(e) = crate::firecracker::terminate(*old_instance, Duration::from_secs(5)).await {
             warn!(workspace_id = %source_ws_id, error = %e, "live hot-swap: old source teardown failed");
         }
         Ok(new_pid)

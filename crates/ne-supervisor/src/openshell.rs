@@ -68,20 +68,36 @@ mod imp {
     /// Errors from controlling an OpenShell sandbox.
     #[derive(Debug, thiserror::Error)]
     pub enum OpenShellError {
+        /// The `openshell-sandbox` binary could not be spawned (e.g. the
+        /// binary is missing or not executable).
         #[error("openshell-sandbox spawn failed: {0}")]
         Spawn(String),
+        /// The sandbox's SSH listen port never accepted a connection within
+        /// `ssh_ready_timeout` (see [`wait_for_ssh_port`]).
         #[error("openshell-sandbox SSH port {addr} did not become ready: {source}")]
         PortReady {
+            /// The `host:port` SSH listen address that was polled.
             addr: String,
+            /// The last connection attempt's I/O error, or a synthesized
+            /// `TimedOut` error if the deadline elapsed while the port kept
+            /// refusing connections.
             #[source]
             source: std::io::Error,
         },
+        /// An SSH protocol or control-channel failure (authentication,
+        /// channel open, exec, or SFTP) surfaced from `russh`.
         #[error("SSH control error: {0}")]
         Ssh(String),
+        /// The sandbox rejected the NSSH1 preface, or closed the connection
+        /// before replying "OK" — the vsock tier's connect-refused equivalent.
         #[error("command rejected by the sandbox (connect refused): {0}")]
         ConnectRejected(String),
+        /// The command or SFTP operation did not finish within the given
+        /// timeout, in milliseconds.
         #[error("command timed out after {0} ms")]
         Timeout(u32),
+        /// An I/O error not otherwise classified (e.g. writing the NSSH1
+        /// preface to the raw TCP stream).
         #[error("io: {0}")]
         Io(#[from] std::io::Error),
     }
@@ -212,7 +228,7 @@ mod imp {
             if let Some(pid) = pid {
                 use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                let _ = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM);
             }
             match tokio::time::timeout(grace, self.child.wait()).await {
                 Ok(Ok(status)) => info!(pid, ?status, "openshell-sandbox exited"),
@@ -234,7 +250,6 @@ mod imp {
                 Ok(Ok(_)) => return Ok(()),
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
-                    continue;
                 }
                 Ok(Err(e)) => {
                     return Err(OpenShellError::PortReady {
@@ -309,7 +324,7 @@ mod imp {
         let mut handle = russh::client::connect_stream(config, stream, OpenShellSshClient)
             .await
             .map_err(|e| {
-                if matches!(e, russh::Error::Disconnect { .. } | russh::Error::IO(..)) {
+                if matches!(e, russh::Error::Disconnect | russh::Error::IO(..)) {
                     OpenShellError::ConnectRejected(e.to_string())
                 } else {
                     OpenShellError::Ssh(e.to_string())
@@ -361,7 +376,7 @@ mod imp {
         args: &[String],
         timeout_ms: u32,
     ) -> Result<GuestResponse, OpenShellError> {
-        let mut handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
+        let handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
         // Open a session channel + issue exec (the binary + args joined as the
         // server's exec_request expects).
         let mut exec_line = command.to_string();
@@ -437,9 +452,8 @@ mod imp {
     ) -> Result<GuestResponse, OpenShellError> {
         let bytes_written = u64::try_from(content.len()).unwrap_or(u64::MAX);
         let work = async {
-            let mut handle =
-                connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
-            let mut channel = handle
+            let handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
+            let channel = handle
                 .channel_open_session()
                 .await
                 .map_err(|e| OpenShellError::Ssh(e.to_string()))?;
@@ -495,9 +509,8 @@ mod imp {
         timeout_ms: u32,
     ) -> Result<GuestResponse, OpenShellError> {
         let work = async {
-            let mut handle =
-                connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
-            let mut channel = handle
+            let handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
+            let channel = handle
                 .channel_open_session()
                 .await
                 .map_err(|e| OpenShellError::Ssh(e.to_string()))?;
@@ -549,6 +562,10 @@ mod imp {
 
     // Re-export the public surface at the module root.
     pub use self::Sandbox as OpenShellSandbox;
+    /// Alias for [`OpenShellError`], mirroring [`crate::firecracker::LaunchError`]
+    /// so call sites can name the confidential tier's launch/command error
+    /// analogously to the Firecracker tier's — OpenShell uses one error type
+    /// for both spawn and command failures.
     pub type LaunchError = OpenShellError;
 
     #[cfg(test)]
@@ -740,5 +757,5 @@ pub mod preface {
 #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
 pub use imp::{
     LaunchError, OpenShellError, OpenShellLaunchConfig, OpenShellSandbox as Sandbox,
-    run_command_via_ssh,
+    read_file_via_sftp, run_command_via_ssh, write_file_via_sftp,
 };
