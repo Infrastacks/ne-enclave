@@ -479,6 +479,8 @@ async fn vsock_request_response(
 ) -> Result<ne_protocol::guest::GuestResponse, GuestRpcError> {
     use ne_protocol::guest::GuestResponse;
 
+    let timeout_ms = crate::util::clamp_timeout_ms(timeout_ms, *crate::util::MAX_EXEC_TIMEOUT_MS);
+
     let work = async {
         let stream = UnixStream::connect(uds).await?;
         let (rd, mut wr) = stream.into_split();

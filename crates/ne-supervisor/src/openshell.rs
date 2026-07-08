@@ -376,6 +376,8 @@ mod imp {
         args: &[String],
         timeout_ms: u32,
     ) -> Result<GuestResponse, OpenShellError> {
+        let timeout_ms =
+            crate::util::clamp_timeout_ms(timeout_ms, *crate::util::MAX_EXEC_TIMEOUT_MS);
         let handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
         // Open a session channel + issue exec (the binary + args joined as the
         // server's exec_request expects).
