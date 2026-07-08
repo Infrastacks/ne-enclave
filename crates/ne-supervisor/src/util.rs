@@ -131,6 +131,9 @@ mod tests {
         assert_eq!(parse_positive_or(Some("0".into()), 100_u64), 100);
         assert_eq!(parse_positive_or(Some("garbage".into()), 100_u64), 100);
         assert_eq!(parse_positive_or(Some("512".into()), 100_u64), 512);
+        // A valid positive override BELOW the default must be honored, not
+        // clobbered — pins that the filter is `> 0`, not `> default`.
+        assert_eq!(parse_positive_or(Some("50".into()), 100_u64), 50);
     }
 
     #[test]
