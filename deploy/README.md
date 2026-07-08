@@ -32,6 +32,24 @@ and place both binaries at `/opt/ne-enclave/bin/` before running `nee install`.
 
 ---
 
+## Hardening / resource limits
+
+The supervisor exposes a handful of `NE_*` environment variables that bound
+resource consumption per-guest and per-host. These are operational config
+knobs — deploy-doc reference, not a security-capability claim — set them in
+`/etc/ne-enclave/ne-enclave.env` if the defaults don't fit your host.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NE_MAX_GUEST_FRAME_BYTES` | `33554432` (32 MiB) | Host-side cap on a single guest vsock reply frame; the host does not trust the guest to honor its own matching cap (host-OOM DoS backstop). |
+| `NE_MAX_EXEC_OUTPUT_BYTES` | `1048576` (1 MiB) | Cap on captured SSH exec output per stream on the confidential-tier OpenShell path. |
+| `NE_MAX_EXEC_TIMEOUT_MS` | `3600000` (1 hour) | Ceiling a client-supplied exec `timeout_ms` is clamped to. `0` or an unparseable value falls back to this default (a `0` ceiling would otherwise mean "no bound"). |
+| `NE_MAX_WORKSPACES` | `0` (auto, from host RAM) | Soft ceiling on concurrent workspaces; bounds live instances **plus** warm-pool members combined, not just running VMs. `0` derives a value from host RAM (~512 MiB nominal per VM, floored at 1, capped at 1024). |
+| `NE_MAX_WORKSPACE_MEM_MIB` | `0` (auto, from host RAM) | Ceiling on `mem_size_mib` per workspace. `0` resolves to `min(host RAM MiB, 32768)`. |
+| `NE_FC_API_TIMEOUT_MS` | `30000` (30s) | Deadline for a single Firecracker control-API call (machine-config, boot-source, drives, vsock, actions, pause/resume). `0` or an unparseable value falls back to this default. Snapshot create/load use a memory-scaled deadline instead (this value plus ~10ms per MiB of guest memory). |
+
+---
+
 ## Quick install
 
 ```sh

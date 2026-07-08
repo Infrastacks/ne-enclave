@@ -277,7 +277,7 @@ async fn r1_single_cvm_direct_round_trip() {
         },
         expected_measurement: None,
     };
-    let envelope = seal_artifacts(
+    let _envelope = seal_artifacts(
         &snap,
         &manifest,
         &signing_key,
