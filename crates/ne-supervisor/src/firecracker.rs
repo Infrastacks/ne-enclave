@@ -44,6 +44,37 @@ static MAX_GUEST_FRAME_BYTES: LazyLock<u64> = LazyLock::new(|| {
         .unwrap_or(32 * 1024 * 1024)
 });
 
+/// Per-MiB timeout budget added on top of [`FC_API_TIMEOUT_MS`] for
+/// `/snapshot/create` and `/snapshot/load`, which serialize/deserialize
+/// `mem_size_mib` MiB of guest memory to/from disk — the flat control-call
+/// deadline alone would false-positive on a large VM. ~10ms/MiB → +~40s for
+/// a 4 GiB VM.
+const PER_MIB_MS: u64 = 10;
+
+/// Parse the `NE_FC_API_TIMEOUT_MS` override. A missing, unparseable, or
+/// zero value falls back to the 30s default — 0 is rejected because a zero
+/// deadline would make `tokio::time::timeout` fire on every API call
+/// instantly (same class of bug fixed for `NE_MAX_EXEC_TIMEOUT_MS`; see
+/// `util::parse_ceiling`).
+fn parse_api_timeout_ms(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(30_000)
+}
+
+/// Default deadline for a single Firecracker control-API call
+/// (machine-config, boot-source, drives, vsock, actions, pause/resume).
+/// Snapshot/restore use [`scaled_api_timeout`] instead. Override via
+/// `NE_FC_API_TIMEOUT_MS`; a 0 or unparseable value falls back to 30s — see
+/// [`parse_api_timeout_ms`].
+static FC_API_TIMEOUT_MS: LazyLock<u64> =
+    LazyLock::new(|| parse_api_timeout_ms(std::env::var("NE_FC_API_TIMEOUT_MS").ok()));
+
+/// Memory-scaled deadline for `/snapshot/create` and `/snapshot/load`.
+fn scaled_api_timeout(mem_size_mib: u32) -> Duration {
+    Duration::from_millis(*FC_API_TIMEOUT_MS + u64::from(mem_size_mib) * PER_MIB_MS)
+}
+
 /// Inputs to a single workspace launch. The supervisor builds this
 /// from a [`ne_protocol::supervisor::CreateWorkspaceRequest`]
 /// plus its own configuration (binary paths, jailer uid/gid, etc.).
@@ -165,7 +196,11 @@ pub enum LaunchError {
     /// jailer process exited before Firecracker's API socket appeared.
     #[error("jailer exited before Firecracker came up")]
     JailerExited,
-    /// `api_socket_timeout` elapsed without the API socket appearing.
+    /// Either `api_socket_timeout` elapsed without the API socket
+    /// appearing, or (audit O2) an API request to an already-present
+    /// socket did not complete within its deadline (`NE_FC_API_TIMEOUT_MS`,
+    /// memory-scaled for snapshot/restore) — from the caller's POV both are
+    /// "the Firecracker API is unreachable within budget."
     #[error("timed out waiting for Firecracker API socket at {0}")]
     ApiSocketTimeout(PathBuf),
     /// Restore was requested for a networked workspace, which this build
@@ -350,6 +385,9 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
     // has spawned falls through to the cleanup below instead of
     // leaking the child + chroot (mirrors restore()'s cleanup).
     let staged: Result<(), LaunchError> = async {
+        // Flat control-call deadline — none of these PUTs touch guest memory
+        // (unlike snapshot/restore, which use `scaled_api_timeout`).
+        let api_timeout = Duration::from_millis(*FC_API_TIMEOUT_MS);
         api_put(
             &jailed.api_socket_host,
             "/machine-config",
@@ -357,6 +395,7 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
                 vcpu_count: cfg.vcpu_count,
                 mem_size_mib: cfg.mem_size_mib,
             },
+            api_timeout,
         )
         .await?;
         api_put(
@@ -366,6 +405,7 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
                 kernel_image_path: format!("/{}", chroot_relative(&jailed.kernel_in_chroot)?),
                 boot_args: cfg.kernel_boot_args.clone(),
             },
+            api_timeout,
         )
         .await?;
         api_put(
@@ -377,6 +417,7 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
                 is_root_device: true,
                 is_read_only: cfg.rootfs_read_only,
             },
+            api_timeout,
         )
         .await?;
         if cfg.guest_vsock_cid != 0 {
@@ -390,6 +431,7 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
                     // (= `{jailer_chroot}/vsock.sock`).
                     uds_path: "/vsock.sock".to_string(),
                 },
+                api_timeout,
             )
             .await?;
         }
@@ -406,6 +448,7 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
                     iface_id: "eth0".to_string(),
                     host_dev_name: net.tap_name.clone(),
                 },
+                api_timeout,
             )
             .await?;
         }
@@ -415,6 +458,7 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
             &Action {
                 action_type: "InstanceStart".into(),
             },
+            api_timeout,
         )
         .await?;
         Ok(())
@@ -806,39 +850,51 @@ async fn api_request<T: Serialize + Sync>(
     socket: &Path,
     path: &str,
     body: &T,
+    timeout: Duration,
 ) -> Result<(), LaunchError> {
-    let body_bytes = serde_json::to_vec(body).map_err(io::Error::other)?;
-    let request = format!(
-        "{method} {path} HTTP/1.0\r\nHost: localhost\r\n\
-         Accept: application/json\r\nContent-Type: application/json\r\n\
-         Content-Length: {len}\r\n\r\n",
-        len = body_bytes.len(),
-    );
-    let mut stream = UnixStream::connect(socket).await?;
-    stream.write_all(request.as_bytes()).await?;
-    stream.write_all(&body_bytes).await?;
-    stream.flush().await?;
+    let work = async {
+        let body_bytes = serde_json::to_vec(body).map_err(io::Error::other)?;
+        let request = format!(
+            "{method} {path} HTTP/1.0\r\nHost: localhost\r\n\
+             Accept: application/json\r\nContent-Type: application/json\r\n\
+             Content-Length: {len}\r\n\r\n",
+            len = body_bytes.len(),
+        );
+        let mut stream = UnixStream::connect(socket).await?;
+        stream.write_all(request.as_bytes()).await?;
+        stream.write_all(&body_bytes).await?;
+        stream.flush().await?;
 
-    // Read the response using the Content-Length header. We can't rely
-    // on connection-close to signal EOF: Firecracker's HTTP impl keeps
-    // the connection open even with HTTP/1.0, and half-closing the
-    // write side prompts it to RST. Parsing Content-Length is the only
-    // path that consistently terminates.
-    let mut reader = BufReader::new(stream);
-    let (status, content_length) = read_http_head(&mut reader).await?;
-    let mut body_buf = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body_buf).await?;
-    }
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(LaunchError::ApiRequest {
-            path: path.to_string(),
-            status,
-            body: String::from_utf8_lossy(&body_buf).into_owned(),
-        })
-    }
+        // Read the response using the Content-Length header. We can't rely
+        // on connection-close to signal EOF: Firecracker's HTTP impl keeps
+        // the connection open even with HTTP/1.0, and half-closing the
+        // write side prompts it to RST. Parsing Content-Length is the only
+        // path that consistently terminates.
+        let mut reader = BufReader::new(stream);
+        let (status, content_length) = read_http_head(&mut reader).await?;
+        let mut body_buf = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body_buf).await?;
+        }
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(LaunchError::ApiRequest {
+                path: path.to_string(),
+                status,
+                body: String::from_utf8_lossy(&body_buf).into_owned(),
+            })
+        }
+    };
+    // A wedged Firecracker (hung syscall, deadlocked API thread) would
+    // otherwise stall connect/write/read forever, hanging create/snapshot/
+    // restore indefinitely (audit O2). Reuses `ApiSocketTimeout` — from the
+    // caller's POV both "socket never appeared" and "socket appeared but
+    // never answered" are the same failure: the API is unreachable within
+    // budget.
+    tokio::time::timeout(timeout, work)
+        .await
+        .unwrap_or_else(|_| Err(LaunchError::ApiSocketTimeout(socket.to_path_buf())))
 }
 
 #[inline]
@@ -846,8 +902,25 @@ async fn api_put<T: Serialize + Sync>(
     socket: &Path,
     path: &str,
     body: &T,
+    timeout: Duration,
 ) -> Result<(), LaunchError> {
-    api_request("PUT", socket, path, body).await
+    api_request("PUT", socket, path, body, timeout).await
+}
+
+/// Test-only surface onto [`api_put`]. Integration tests under `tests/`
+/// link this crate as an external dependency, so they can't see
+/// `pub(crate)`/`#[cfg(test)]` items directly — this thin `pub` wrapper,
+/// gated behind the `test-support` feature (see `Cargo.toml`), lets
+/// `tests/fc_api_timeout.rs` drive `api_put`'s deadline without widening
+/// `api_put` itself to `pub` in ordinary builds.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn api_put_for_test<T: Serialize + Sync>(
+    socket: &Path,
+    path: &str,
+    body: &T,
+    timeout: Duration,
+) -> Result<(), LaunchError> {
+    api_put(socket, path, body, timeout).await
 }
 
 #[inline]
@@ -855,8 +928,9 @@ async fn api_patch<T: Serialize + Sync>(
     socket: &Path,
     path: &str,
     body: &T,
+    timeout: Duration,
 ) -> Result<(), LaunchError> {
-    api_request("PATCH", socket, path, body).await
+    api_request("PATCH", socket, path, body, timeout).await
 }
 
 /// Pause a running microVM (`PATCH /vm {state:Paused}`).
@@ -865,6 +939,7 @@ pub async fn pause(instance: &Instance) -> Result<(), LaunchError> {
         &instance.api_socket_host,
         "/vm",
         &VmStatePatch { state: "Paused" },
+        Duration::from_millis(*FC_API_TIMEOUT_MS),
     )
     .await
 }
@@ -875,6 +950,7 @@ pub async fn resume(instance: &Instance) -> Result<(), LaunchError> {
         &instance.api_socket_host,
         "/vm",
         &VmStatePatch { state: "Resumed" },
+        Duration::from_millis(*FC_API_TIMEOUT_MS),
     )
     .await
 }
@@ -911,6 +987,7 @@ pub async fn snapshot_create(instance: &Instance) -> Result<SnapshotArtifacts, L
             snapshot_path: "/snapshot/vmstate".into(),
             mem_file_path: "/snapshot/mem".into(),
         },
+        scaled_api_timeout(instance.mem_size_mib),
     )
     .await?;
     Ok(SnapshotArtifacts {
@@ -1354,6 +1431,33 @@ mod tests {
             "dst must contain the golden content after staging"
         );
     }
+
+    // NE_FC_API_TIMEOUT_MS itself is env-dependent + process-global
+    // (LazyLock), so its parsing is tested via the pure `parse_api_timeout_ms`
+    // helper instead of racy `std::env::set_var` manipulation — mirrors
+    // `util::parse_ceiling`'s test strategy for `NE_MAX_EXEC_TIMEOUT_MS`.
+    #[test]
+    fn parse_api_timeout_ms_rejects_zero_and_garbage() {
+        assert_eq!(parse_api_timeout_ms(None), 30_000);
+        assert_eq!(parse_api_timeout_ms(Some("0".into())), 30_000);
+        assert_eq!(parse_api_timeout_ms(Some("not-a-number".into())), 30_000);
+        assert_eq!(parse_api_timeout_ms(Some("5000".into())), 5_000);
+    }
+
+    #[test]
+    fn scaled_api_timeout_adds_per_mib_budget() {
+        let base = *FC_API_TIMEOUT_MS;
+        assert_eq!(
+            scaled_api_timeout(0),
+            Duration::from_millis(base),
+            "zero-MiB VM should see exactly the flat control-call deadline"
+        );
+        assert_eq!(
+            scaled_api_timeout(4096),
+            Duration::from_millis(base + 4096 * PER_MIB_MS),
+            "a 4 GiB VM should get the flat deadline plus its memory-scaled budget"
+        );
+    }
 }
 
 /// Memory backend descriptor for `PUT /snapshot/load`.
@@ -1460,6 +1564,7 @@ pub async fn restore(cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> 
                 enable_diff_snapshots: false,
                 resume_vm: true,
             },
+            scaled_api_timeout(cfg.launch.mem_size_mib),
         )
         .await?;
         Ok(())

@@ -23,6 +23,13 @@ path = "src/lib.rs"
 [features]
 default = []
 confidential-cvm = ["dep:russh", "dep:russh-sftp", "dep:async-trait", "dep:pkcs8"]
+# Exposes a thin `pub` test-hook around `firecracker::api_put` (otherwise
+# private) so integration tests under `tests/` — which link the crate as an
+# external dependency and can't see `pub(crate)`/`#[cfg(test)]` items — can
+# drive its timeout directly (audit O2). No production impact: mirrors
+# `ne-attestation`'s `test-support` feature (see its Cargo.toml). Off by
+# default.
+test-support = []
 
 [dependencies]
 ne-protocol = { path = "../ne-protocol" }
@@ -77,6 +84,9 @@ pkcs8 = { version = "=0.11.0-rc.11", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Enable our own `test-support` feature so `tests/fc_api_timeout.rs` can call
+# the `api_put` test-hook (see the `test-support` feature comment above).
+ne-supervisor = { path = ".", features = ["test-support"] }
 # Note: the integration tests (dns_filter_e2e, firecracker_lifecycle,
 # run_command_e2e) spawn the fused `nee` binary. Since `nee` is a
 # bin-only crate, Cargo does not expose CARGO_BIN_EXE_nee through a
