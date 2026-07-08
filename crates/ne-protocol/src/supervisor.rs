@@ -671,6 +671,9 @@ pub enum SupervisorErrorKind {
     /// `Create` named a warm-pool tier that this supervisor was not
     /// configured with.
     TierNotFound,
+    /// The supervisor is at its configured workspace-count ceiling and cannot
+    /// admit another workspace (host-exhaustion backstop; audit O3).
+    CapacityExceeded,
     /// The target workspace has no network configuration and therefore
     /// cannot participate in ingress routing.
     WorkspaceNotNetworked,
@@ -1187,5 +1190,13 @@ mod tests {
         assert!(s.contains(r#""status":"pool_status""#), "tag = {s}");
         let back: SupervisorResponse = serde_json::from_str(&s).expect("de");
         assert_eq!(back, SupervisorResponse::PoolStatus(info));
+    }
+
+    #[test]
+    fn capacity_exceeded_serializes_snake_case() {
+        let json = serde_json::to_string(&SupervisorErrorKind::CapacityExceeded).unwrap();
+        assert_eq!(json, "\"capacity_exceeded\"");
+        let back: SupervisorErrorKind = serde_json::from_str("\"capacity_exceeded\"").unwrap();
+        assert_eq!(back, SupervisorErrorKind::CapacityExceeded);
     }
 }
