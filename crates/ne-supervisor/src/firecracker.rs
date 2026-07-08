@@ -682,15 +682,45 @@ fn is_valid_jailer_id(id: &str) -> bool {
 
 /// Stage `src` at `dst`. Prefers a hardlink (same filesystem, free);
 /// falls back to a copy if hardlinking fails (cross-fs or no perms).
+///
+/// Stages into a unique temp file in `dst`'s directory, then atomically
+/// `rename`s it over `dst`. This is required for safety under concurrent
+/// same-`dst` callers (e.g. two same-id `create`s sharing one chroot path):
+/// the previous implementation staged in place — `if dst.exists() {
+/// remove_file }` → `hard_link` → fallback `copy` — which has a TOCTOU
+/// window. Two racers can both observe `!dst.exists()`; the loser's
+/// `hard_link` then fails `EEXIST` (the winner already created it) and
+/// falls to `copy(src, dst)`. Since `dst` is by then a hardlink to `src`,
+/// `copy`'s truncate-on-open zeroes the shared inode — destroying `src`
+/// too (observed for real as a 0-byte `vmlinux`). Staging into a fresh,
+/// call-unique temp name means the copy fallback only ever opens an inode
+/// this call itself created, and `rename` replaces `dst` without ever
+/// opening it — so no call can write through an inode it didn't create,
+/// under any interleaving.
 async fn stage_file(src: &Path, dst: &Path) -> io::Result<()> {
-    if dst.exists() {
-        tokio::fs::remove_file(dst).await?;
+    let tmp_name = format!(
+        "{}.tmp-{}",
+        dst.file_name().and_then(|n| n.to_str()).unwrap_or("stage"),
+        ulid::Ulid::new()
+    );
+    let tmp = dst.with_file_name(tmp_name);
+
+    let result: io::Result<()> = async {
+        if tokio::fs::hard_link(src, &tmp).await.is_err() {
+            tokio::fs::copy(src, &tmp).await?;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).await?;
+        }
+        tokio::fs::rename(&tmp, dst).await?;
+        Ok(())
     }
-    if tokio::fs::hard_link(src, dst).await.is_err() {
-        tokio::fs::copy(src, dst).await?;
-        tokio::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644)).await?;
+    .await;
+
+    if result.is_err() {
+        // Best-effort cleanup: the temp file is call-unique, so removing it
+        // here can never race with or affect another caller's staging.
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
-    Ok(())
+    result
 }
 
 /// chown via the nix crate (no unsafe in this crate).
@@ -1194,6 +1224,100 @@ mod tests {
             GuestResponse::IdentityReset { hostname, .. } => assert_eq!(hostname, "fork-a"),
             other => panic!("expected IdentityReset, got {other:?}"),
         }
+    }
+
+    /// Regression test for the golden-image corruption bug: two concurrent
+    /// `stage_file` calls racing on the SAME `dst` path (the exact shape of
+    /// the wedge-A `create_race` gauntlet, where two same-id creates derive
+    /// the identical chroot path). Pre-fix, `stage_file` staged in place —
+    /// `if dst.exists() { remove_file }` → `hard_link` → fallback `copy` —
+    /// which has a TOCTOU window: both racers can observe `!dst.exists()`,
+    /// one wins the hardlink, the other's `hard_link` then fails EEXIST and
+    /// falls to `copy(src, dst)`. Since `dst` is now a hardlink to `src`
+    /// (the winner's link), `copy`'s truncate-on-open zeroes the shared
+    /// inode — i.e. it destroys `src` too. This was observed for real as a
+    /// 0-byte `vmlinux` / "Unable to read elf header" during the Task 5
+    /// KVM gauntlet.
+    ///
+    /// The fix stages into a unique per-call temp file and atomically
+    /// renames over `dst`, so no call ever opens a pre-existing inode for
+    /// writing. This test races many same-dst `stage_file` calls repeatedly
+    /// and asserts `src`'s content is never disturbed — regardless of
+    /// whether any individual racer surfaces a (benign-looking, but itself
+    /// symptomatic of the same missing-atomicity defect) transient error,
+    /// the load-bearing safety property is that `src` is never touched. It
+    /// fails reliably against the pre-fix implementation (reproduces
+    /// corruption or a staging error within a handful of iterations) and
+    /// passes deterministically post-fix.
+    #[tokio::test]
+    async fn stage_file_concurrent_same_dst_never_corrupts_source() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let src = tmp.path().join("golden.img");
+        let golden = b"GOLDEN-KERNEL-IMAGE-DO-NOT-TRUNCATE-ME".to_vec();
+        tokio::fs::write(&src, &golden).await.expect("write src");
+        let dst = tmp.path().join("staged.img");
+
+        let mut any_racer_failed = false;
+        for iter in 0..200 {
+            let _ = tokio::fs::remove_file(&dst).await;
+
+            // Exactly two racers on the identical dst path — the literal
+            // shape of the reported race (two concurrent same-id creates
+            // sharing one chroot dst path).
+            let (r1, r2) = tokio::join!(stage_file(&src, &dst), stage_file(&src, &dst));
+            if r1.is_err() || r2.is_err() {
+                // Pre-fix, the unsynchronized exists/remove/hard_link/copy
+                // sequence can also surface a bare ENOENT/EEXIST from the
+                // losing racer instead of (or in addition to) truncating
+                // src on any given run — both are symptoms of the same
+                // missing-atomicity defect, so record and keep going
+                // rather than stopping at the first one.
+                any_racer_failed = true;
+            }
+
+            let src_now = tokio::fs::read(&src).await.expect("read src");
+            assert_eq!(
+                src_now, golden,
+                "iter {iter}: golden source image was corrupted by a concurrent \
+                 stage_file race (copy-onto-own-hardlink truncation)"
+            );
+        }
+        assert!(
+            !any_racer_failed,
+            "stage_file returned an error under concurrent same-dst staging — \
+             the staging sequence is not safe under this race"
+        );
+    }
+
+    /// Defense-in-depth: even a single `stage_file` call that happens to
+    /// find `dst` already hardlinked to `src` (e.g. left behind by a prior
+    /// staging attempt) must never truncate through that shared inode.
+    /// The fixed implementation never opens `dst` for writing at all — it
+    /// only ever renames a freshly-created temp file over it.
+    #[tokio::test]
+    async fn stage_file_preexisting_hardlink_dst_leaves_source_intact() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let src = tmp.path().join("golden.img");
+        let golden = b"ANOTHER-GOLDEN-IMAGE-PAYLOAD".to_vec();
+        tokio::fs::write(&src, &golden).await.expect("write src");
+
+        let dst = tmp.path().join("staged.img");
+        tokio::fs::hard_link(&src, &dst)
+            .await
+            .expect("pre-link dst to src (simulate a prior racer's win)");
+
+        stage_file(&src, &dst).await.expect("stage_file");
+
+        let src_now = tokio::fs::read(&src).await.expect("read src");
+        assert_eq!(
+            src_now, golden,
+            "source must survive staging onto a pre-linked dst"
+        );
+        let dst_now = tokio::fs::read(&dst).await.expect("read dst");
+        assert_eq!(
+            dst_now, golden,
+            "dst must contain the golden content after staging"
+        );
     }
 }
 
