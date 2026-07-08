@@ -341,79 +341,102 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
         return Err(LaunchError::RootfsNotFound(cfg.rootfs_image));
     }
 
-    let jailed = spawn_jailed_firecracker(&cfg).await?;
+    let mut jailed = spawn_jailed_firecracker(&cfg).await?;
 
     // Configure the microVM. The order here matters: machine-config
     // sets vCPU/memory budgets, boot-source loads the kernel, drives
     // attach storage, vsock adds the guest-host channel, actions
-    // boots.
-    api_put(
-        &jailed.api_socket_host,
-        "/machine-config",
-        &MachineConfig {
-            vcpu_count: cfg.vcpu_count,
-            mem_size_mib: cfg.mem_size_mib,
-        },
-    )
-    .await?;
-    api_put(
-        &jailed.api_socket_host,
-        "/boot-source",
-        &BootSource {
-            kernel_image_path: format!("/{}", chroot_relative(&jailed.kernel_in_chroot)?),
-            boot_args: cfg.kernel_boot_args.clone(),
-        },
-    )
-    .await?;
-    api_put(
-        &jailed.api_socket_host,
-        "/drives/rootfs",
-        &Drive {
-            drive_id: "rootfs".into(),
-            path_on_host: format!("/{}", chroot_relative(&jailed.rootfs_in_chroot)?),
-            is_root_device: true,
-            is_read_only: cfg.rootfs_read_only,
-        },
-    )
-    .await?;
-    if cfg.guest_vsock_cid != 0 {
+    // boots. Staged in an inner block so any failure after the jailer
+    // has spawned falls through to the cleanup below instead of
+    // leaking the child + chroot (mirrors restore()'s cleanup).
+    let staged: Result<(), LaunchError> = async {
         api_put(
             &jailed.api_socket_host,
-            "/vsock",
-            &Vsock {
-                guest_cid: cfg.guest_vsock_cid,
-                // `uds_path` is relative to Firecracker's chroot. From
-                // the host's POV the same file is `vsock_host_socket`
-                // (= `{jailer_chroot}/vsock.sock`).
-                uds_path: "/vsock.sock".to_string(),
+            "/machine-config",
+            &MachineConfig {
+                vcpu_count: cfg.vcpu_count,
+                mem_size_mib: cfg.mem_size_mib,
             },
         )
         .await?;
-    }
-    if let Some(net) = &cfg.network {
-        // Wire the guest's eth0 to the TAP we provisioned in the
-        // workspace netns. iface_id is the kernel-side name the
-        // guest sees (eth0 by convention); host_dev_name is the
-        // host-visible TAP, which Firecracker (now inside the
-        // netns) sees by its raw name.
         api_put(
             &jailed.api_socket_host,
-            "/network-interfaces/eth0",
-            &NetworkInterface {
-                iface_id: "eth0".to_string(),
-                host_dev_name: net.tap_name.clone(),
+            "/boot-source",
+            &BootSource {
+                kernel_image_path: format!("/{}", chroot_relative(&jailed.kernel_in_chroot)?),
+                boot_args: cfg.kernel_boot_args.clone(),
             },
         )
         .await?;
+        api_put(
+            &jailed.api_socket_host,
+            "/drives/rootfs",
+            &Drive {
+                drive_id: "rootfs".into(),
+                path_on_host: format!("/{}", chroot_relative(&jailed.rootfs_in_chroot)?),
+                is_root_device: true,
+                is_read_only: cfg.rootfs_read_only,
+            },
+        )
+        .await?;
+        if cfg.guest_vsock_cid != 0 {
+            api_put(
+                &jailed.api_socket_host,
+                "/vsock",
+                &Vsock {
+                    guest_cid: cfg.guest_vsock_cid,
+                    // `uds_path` is relative to Firecracker's chroot. From
+                    // the host's POV the same file is `vsock_host_socket`
+                    // (= `{jailer_chroot}/vsock.sock`).
+                    uds_path: "/vsock.sock".to_string(),
+                },
+            )
+            .await?;
+        }
+        if let Some(net) = &cfg.network {
+            // Wire the guest's eth0 to the TAP we provisioned in the
+            // workspace netns. iface_id is the kernel-side name the
+            // guest sees (eth0 by convention); host_dev_name is the
+            // host-visible TAP, which Firecracker (now inside the
+            // netns) sees by its raw name.
+            api_put(
+                &jailed.api_socket_host,
+                "/network-interfaces/eth0",
+                &NetworkInterface {
+                    iface_id: "eth0".to_string(),
+                    host_dev_name: net.tap_name.clone(),
+                },
+            )
+            .await?;
+        }
+        api_put(
+            &jailed.api_socket_host,
+            "/actions",
+            &Action {
+                action_type: "InstanceStart".into(),
+            },
+        )
+        .await?;
+        Ok(())
     }
-    api_put(
-        &jailed.api_socket_host,
-        "/actions",
-        &Action {
-            action_type: "InstanceStart".into(),
-        },
-    )
-    .await?;
+    .await;
+
+    if let Err(e) = staged {
+        // Kill the jailer child FIRST, then reap the chroot tree — never
+        // remove a chroot still in use by a live jailer (mirrors
+        // restore()'s cleanup). Without this, a transient config error
+        // (e.g. a bad mem_size_mib) permanently poisons the workspace-id:
+        // jailer refuses to reuse an existing chroot dir, so every
+        // subsequent launch with the same id fails with JailerExited.
+        let _ = jailed.child.start_kill();
+        let _ = jailed.child.wait().await;
+        let workspace_root = jailed
+            .jailer_chroot
+            .parent()
+            .unwrap_or(&jailed.jailer_chroot);
+        let _ = tokio::fs::remove_dir_all(workspace_root).await;
+        return Err(e);
+    }
     info!(workspace_id = %cfg.workspace_id, "InstanceStart sent");
 
     Ok(Instance {
