@@ -394,6 +394,9 @@ fn apply_directory_policy(
             nix::unistd::fchown(fd, Some(uid), Some(gid))
                 .with_context(|| format!("fchown {} {user}:{group}", path.display()))?;
         }
+        // `mode_t` is `u32` on Linux but narrower on some Unix targets, so the
+        // checked conversion is intentionally an identity conversion on Linux.
+        #[allow(clippy::useless_conversion)]
         let mode = mode
             .try_into()
             .context("directory mode does not fit mode_t")?;

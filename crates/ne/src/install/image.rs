@@ -254,6 +254,9 @@ fn harden_entry_policy(path: &Path, directory: bool, mode: u32, fakeroot: bool) 
             )
             .with_context(|| format!("fchown {} root:root", path.display()))?;
         }
+        // `mode_t` is `u32` on Linux but narrower on some Unix targets, so the
+        // checked conversion is intentionally an identity conversion on Linux.
+        #[allow(clippy::useless_conversion)]
         let mode = mode.try_into().context("image mode does not fit mode_t")?;
         fchmod(fd, Mode::from_bits_truncate(mode))
             .with_context(|| format!("fchmod {} {mode:o}", path.display()))?;
