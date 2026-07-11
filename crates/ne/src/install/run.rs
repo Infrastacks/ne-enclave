@@ -39,8 +39,7 @@ pub struct InstallOptions {
 pub fn install(opts: InstallOptions) -> Result<()> {
     let l = &opts.layout;
 
-    // 1. Directories (always safe to create).
-    for d in [
+    let managed_dirs = [
         l.bin_dir(),
         l.etc_dir(),
         l.state_dir(),
@@ -50,15 +49,16 @@ pub fn install(opts: InstallOptions) -> Result<()> {
         l.jailer_base(),
         l.systemd_dir(),
         l.run_dir(),
-    ] {
-        if opts.dry_run {
-            tracing::info!("[dry-run] mkdir -p {}", d.display());
-        } else {
-            fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
-        }
+    ];
+
+    // Inspect the complete legacy layout before any path-following filesystem
+    // mutation. A service-owned state directory from an older install may
+    // contain attacker-created symlinks.
+    if !opts.dry_run {
+        validate_existing_directory_chains(l.root(), &managed_dirs)?;
     }
 
-    // 2. Service user/group (real installs only); resolve uid after creation.
+    // 1. Service user/group (real installs only); resolve uid after creation.
     let ne_uid = if opts.fakeroot || opts.dry_run {
         opts.ne_uid
     } else {
@@ -66,9 +66,27 @@ pub fn install(opts: InstallOptions) -> Result<()> {
         resolve_uid_after_creation("ne")
     };
 
-    // 2b. Apply directory ownership + modes (real installs only).
-    if !opts.fakeroot && !opts.dry_run {
-        apply_ownership(l)?;
+    // 2. Lock down the legacy state parent before creating or changing any
+    // child beneath it. Once root:ne 0750, the API identity cannot swap the
+    // preflighted children during the rest of the upgrade.
+    if !opts.dry_run {
+        ensure_directory_chain(l.root(), &l.state_dir())?;
+        apply_directory_policy(&l.state_dir(), "root", "ne", 0o750, opts.fakeroot)?;
+    }
+
+    // 3. Create each remaining component one directory at a time, validating
+    // existing entries with symlink_metadata instead of following them.
+    for d in managed_dirs {
+        if opts.dry_run {
+            tracing::info!("[dry-run] mkdir -p {}", d.display());
+        } else {
+            ensure_directory_chain(l.root(), &d)?;
+        }
+    }
+
+    // 3b. Apply exact directory policies through no-follow handles on Linux.
+    if !opts.dry_run {
+        apply_ownership(l, opts.fakeroot)?;
     }
     if !opts.dry_run {
         image::harden_store(&l.images_dir(), opts.fakeroot)?;
@@ -118,6 +136,97 @@ pub fn install(opts: InstallOptions) -> Result<()> {
     }
 
     print_next_steps(&opts);
+    Ok(())
+}
+
+/// Prepare only the state/image-store portion of the layout for a direct
+/// `nee image import`. The state parent is secured before the store is opened.
+pub fn prepare_image_store(l: &Layout, fakeroot: bool) -> Result<()> {
+    let paths = [l.state_dir(), l.images_dir()];
+    validate_existing_directory_chains(l.root(), &paths)?;
+    ensure_directory_chain(l.root(), &l.state_dir())?;
+    apply_directory_policy(&l.state_dir(), "root", "ne", 0o750, fakeroot)?;
+    ensure_directory_chain(l.root(), &l.images_dir())?;
+    apply_directory_policy(&l.images_dir(), "root", "root", 0o755, fakeroot)?;
+    image::harden_store(&l.images_dir(), fakeroot)
+}
+
+fn validate_existing_directory_chains(
+    root: &std::path::Path,
+    targets: &[std::path::PathBuf],
+) -> Result<()> {
+    validate_directory(root)?;
+    for target in targets {
+        let relative = target.strip_prefix(root).with_context(|| {
+            format!(
+                "{} is outside install root {}",
+                target.display(),
+                root.display()
+            )
+        })?;
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => anyhow::ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "managed directory component {} is a symlink or non-directory",
+                    current.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspect {}", current.display()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_directory(path: &std::path::Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "managed directory {} is a symlink or non-directory",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_directory_chain(root: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    let relative = target.strip_prefix(root).with_context(|| {
+        format!(
+            "{} is outside install root {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "managed directory component {} is a symlink or non-directory",
+                current.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        validate_directory(&current)?;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("mkdir {}", current.display()));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -241,35 +350,73 @@ fn resolve_uid_after_creation(_name: &str) -> u32 {
     0
 }
 
-/// Apply the owner + mode from [`dir_ownership`] to each managed
-/// directory that exists under the layout root. Real installs only
-/// (requires root); never called on the fakeroot path.
-#[cfg(target_os = "linux")]
-fn apply_ownership(l: &Layout) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+/// Apply the owner + mode from [`dir_ownership`] to each managed directory.
+fn apply_ownership(l: &Layout, fakeroot: bool) -> Result<()> {
     for (abs, (user, group), mode) in dir_ownership() {
         let path = l.root().join(abs.trim_start_matches('/'));
-        if !path.exists() {
-            continue;
-        }
-        let uid = nix::unistd::User::from_name(user)
-            .with_context(|| format!("looking up user {user}"))?
-            .map(|u| u.uid);
-        let gid = nix::unistd::Group::from_name(group)
-            .with_context(|| format!("looking up group {group}"))?
-            .map(|g| g.gid);
-        nix::unistd::chown(&path, uid, gid)
-            .with_context(|| format!("chown {} {user}:{group}", path.display()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("chmod {} {mode:o}", path.display()))?;
+        apply_directory_policy(&path, user, group, mode, fakeroot)?;
     }
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps)]
-fn apply_ownership(_l: &Layout) -> Result<()> {
-    Ok(())
+#[cfg(unix)]
+fn apply_directory_policy(
+    path: &std::path::Path,
+    user: &str,
+    group: &str,
+    mode: u32,
+    fakeroot: bool,
+) -> Result<()> {
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::{Mode, fchmod};
+
+    let fd = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "open managed directory {} without following symlinks",
+            path.display()
+        )
+    })?;
+    let result = (|| {
+        if !fakeroot {
+            let uid = nix::unistd::User::from_name(user)
+                .with_context(|| format!("looking up user {user}"))?
+                .map(|entry| entry.uid)
+                .ok_or_else(|| anyhow::anyhow!("required install user {user} does not exist"))?;
+            let gid = nix::unistd::Group::from_name(group)
+                .with_context(|| format!("looking up group {group}"))?
+                .map(|entry| entry.gid)
+                .ok_or_else(|| anyhow::anyhow!("required install group {group} does not exist"))?;
+            nix::unistd::fchown(fd, Some(uid), Some(gid))
+                .with_context(|| format!("fchown {} {user}:{group}", path.display()))?;
+        }
+        let mode = mode
+            .try_into()
+            .context("directory mode does not fit mode_t")?;
+        fchmod(fd, Mode::from_bits_truncate(mode))
+            .with_context(|| format!("fchmod {} {mode:o}", path.display()))?;
+        Ok(())
+    })();
+    let close_result = nix::unistd::close(fd).context("close managed directory handle");
+    result.and(close_result)
+}
+
+#[cfg(not(unix))]
+fn apply_directory_policy(
+    path: &std::path::Path,
+    _user: &str,
+    _group: &str,
+    mode: u32,
+    _fakeroot: bool,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    validate_directory(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {} {mode:o}", path.display()))
 }
 
 fn systemctl(args: &[&str]) -> Result<()> {

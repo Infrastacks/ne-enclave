@@ -6,7 +6,8 @@
 #![allow(unreachable_pub)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Seek, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -59,17 +60,113 @@ pub fn import_artifact(
 ) -> Result<PathBuf> {
     // Validate before reading the source or creating any store directory.
     validate_sha256(expected_hex)?;
-    verify_sha256(src, expected_hex)?;
-    let dir = images_dir.join(kind).join(expected_hex);
-    fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("chmod {} 755", dir.display()))?;
+    let expected_filename = match kind {
+        "kernels" => "vmlinux",
+        "rootfs" => "rootfs.img",
+        _ => anyhow::bail!("invalid managed image kind {kind:?}"),
+    };
+    anyhow::ensure!(
+        filename == expected_filename,
+        "invalid filename for managed {kind} artifact"
+    );
+
+    validate_directory(images_dir)?;
+    let mut source = fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = source
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", src.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let got = hex::encode(hasher.finalize());
+    anyhow::ensure!(
+        got == expected_hex,
+        "checksum mismatch for {}: expected {}, got {}",
+        src.display(),
+        expected_hex,
+        got
+    );
+    source
+        .rewind()
+        .with_context(|| format!("rewind {}", src.display()))?;
+
+    let kind_dir = ensure_store_child_directory(images_dir, kind)?;
+    let dir = ensure_store_child_directory(&kind_dir, expected_hex)?;
     let dest = dir.join(filename);
-    fs::copy(src, &dest)
-        .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
-    fs::set_permissions(&dest, fs::Permissions::from_mode(0o444))
-        .with_context(|| format!("chmod {} 444", dest.display()))?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(&dest)
+        .with_context(|| format!("create new managed artifact {}", dest.display()))?;
+    let publish = (|| -> Result<()> {
+        std::io::copy(&mut source, &mut output)
+            .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+        output
+            .flush()
+            .with_context(|| format!("flush {}", dest.display()))?;
+        output
+            .sync_all()
+            .with_context(|| format!("sync {}", dest.display()))?;
+        output
+            .set_permissions(fs::Permissions::from_mode(0o444))
+            .with_context(|| format!("chmod {} 444", dest.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        drop(output);
+        let cleanup = fs::remove_file(&dest);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "remove failed import artifact {}: {cleanup}",
+                dest.display()
+            ))),
+        };
+    }
     Ok(dest)
+}
+
+fn validate_directory(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "managed image directory {} is a symlink or non-directory",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_store_child_directory(parent: &Path, child: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !child.is_empty() && child.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "invalid managed image directory component {child:?}"
+    );
+    let path = parent.join(child);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "managed image directory {} is a symlink or non-directory",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                validate_directory(&path)?;
+            }
+            Err(error) => return Err(error).with_context(|| format!("mkdir {}", path.display())),
+        },
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {} 755", path.display()))?;
+    Ok(path)
 }
 
 /// Recursively enforce the managed store's non-writable install posture.
@@ -87,9 +184,7 @@ fn harden_entry(path: &Path, fakeroot: bool) -> Result<()> {
         path.display()
     );
     if metadata.is_dir() {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("chmod {} 755", path.display()))?;
-        harden_owner(path, fakeroot)?;
+        harden_entry_policy(path, true, 0o755, fakeroot)?;
         for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
             harden_entry(&entry?.path(), fakeroot)?;
         }
@@ -99,30 +194,48 @@ fn harden_entry(path: &Path, fakeroot: bool) -> Result<()> {
             "managed image store contains non-regular file {}",
             path.display()
         );
-        fs::set_permissions(path, fs::Permissions::from_mode(0o444))
-            .with_context(|| format!("chmod {} 444", path.display()))?;
-        harden_owner(path, fakeroot)?;
+        harden_entry_policy(path, false, 0o444, fakeroot)?;
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn harden_owner(path: &Path, fakeroot: bool) -> Result<()> {
-    if !fakeroot {
-        nix::unistd::chown(
-            path,
-            Some(nix::unistd::Uid::from_raw(0)),
-            Some(nix::unistd::Gid::from_raw(0)),
+#[cfg(unix)]
+fn harden_entry_policy(path: &Path, directory: bool, mode: u32, fakeroot: bool) -> Result<()> {
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::{Mode, fchmod};
+
+    let mut flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW;
+    if directory {
+        flags |= OFlag::O_DIRECTORY;
+    }
+    let fd = open(path, flags, Mode::empty()).with_context(|| {
+        format!(
+            "open managed image path {} without following symlinks",
+            path.display()
         )
-        .with_context(|| format!("chown {} root:root", path.display()))?;
-    }
-    Ok(())
+    })?;
+    let result = (|| {
+        if !fakeroot {
+            nix::unistd::fchown(
+                fd,
+                Some(nix::unistd::Uid::from_raw(0)),
+                Some(nix::unistd::Gid::from_raw(0)),
+            )
+            .with_context(|| format!("fchown {} root:root", path.display()))?;
+        }
+        let mode = mode.try_into().context("image mode does not fit mode_t")?;
+        fchmod(fd, Mode::from_bits_truncate(mode))
+            .with_context(|| format!("fchmod {} {mode:o}", path.display()))?;
+        Ok(())
+    })();
+    let close_result = nix::unistd::close(fd).context("close managed image handle");
+    result.and(close_result)
 }
 
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps)]
-fn harden_owner(_path: &Path, _fakeroot: bool) -> Result<()> {
-    Ok(())
+#[cfg(not(unix))]
+fn harden_entry_policy(path: &Path, _directory: bool, mode: u32, _fakeroot: bool) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {} {mode:o}", path.display()))
 }
 
 /// The default guest image shipped with this release. Digests are filled
@@ -179,6 +292,7 @@ mod tests {
         fs::write(&src, b"kernel-bytes").unwrap();
         let digest = sha256_file(&src).unwrap();
         let images = dir.path().join("images");
+        fs::create_dir(&images).unwrap();
         let dest = import_artifact(&images, "kernels", "vmlinux", &src, &digest).unwrap();
         assert!(dest.ends_with(format!("kernels/{digest}/vmlinux")));
         assert!(dest.exists());
@@ -210,5 +324,46 @@ mod tests {
             );
             assert!(!images.exists(), "invalid digest mutated the image store");
         }
+    }
+
+    #[test]
+    fn import_rejects_existing_destination_symlink_without_touching_target() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("vmlinux");
+        fs::write(&src, b"new-kernel").unwrap();
+        let digest = sha256_file(&src).unwrap();
+        let images = dir.path().join("images");
+        let digest_dir = images.join("kernels").join(&digest);
+        fs::create_dir_all(&digest_dir).unwrap();
+        let sentinel = dir.path().join("sentinel");
+        fs::write(&sentinel, b"must-not-change").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o640)).unwrap();
+        let before = fs::metadata(&sentinel).unwrap();
+        symlink(&sentinel, digest_dir.join("vmlinux")).unwrap();
+
+        assert!(import_artifact(&images, "kernels", "vmlinux", &src, &digest).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must-not-change");
+        let after = fs::metadata(&sentinel).unwrap();
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+    }
+
+    #[test]
+    fn import_rejects_existing_regular_artifact_without_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("vmlinux");
+        fs::write(&src, b"new-kernel").unwrap();
+        let digest = sha256_file(&src).unwrap();
+        let images = dir.path().join("images");
+        let digest_dir = images.join("kernels").join(&digest);
+        fs::create_dir_all(&digest_dir).unwrap();
+        let dest = digest_dir.join("vmlinux");
+        fs::write(&dest, b"existing").unwrap();
+
+        assert!(import_artifact(&images, "kernels", "vmlinux", &src, &digest).is_err());
+        assert_eq!(fs::read(dest).unwrap(), b"existing");
     }
 }

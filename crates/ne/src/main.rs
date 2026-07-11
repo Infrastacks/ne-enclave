@@ -165,6 +165,7 @@ async fn main() -> Result<()> {
                 let fakeroot = prefix.is_some();
                 let root = prefix.unwrap_or_else(|| "/".into());
                 let layout = install::layout::Layout::new(root);
+                install::run::prepare_image_store(&layout, fakeroot)?;
                 install::image::import_artifact(
                     &layout.images_dir(),
                     "kernels",
