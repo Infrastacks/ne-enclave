@@ -51,18 +51,24 @@ async fn wait_for_guest(vsock_uds: &Path) {
 
 /// Build a non-networked LaunchConfig for the given id (CID is always 3 — the
 /// inherited snapshot CID; that's the point of the spike).
-fn cfg_for(
+async fn cfg_for(
     id: &str,
-    kernel: &Path,
-    rootfs: &Path,
+    image_store: &Path,
+    kernel_sha256: &str,
+    rootfs_sha256: &str,
     firecracker: &Path,
     jailer: &Path,
     chroot_base: &Path,
 ) -> LaunchConfig {
+    let verified_images = ne_supervisor::image::ImageStore::new(image_store.to_path_buf())
+        .resolve_pair(kernel_sha256, rootfs_sha256)
+        .await
+        .expect("resolve managed fork images");
     LaunchConfig {
         workspace_id: id.to_string(),
-        kernel_image: kernel.to_path_buf(),
-        rootfs_image: rootfs.to_path_buf(),
+        kernel_sha256: kernel_sha256.to_string(),
+        rootfs_sha256: rootfs_sha256.to_string(),
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -96,19 +102,26 @@ async fn fork_two_concurrent_reachable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().to_path_buf();
     let state_dir = tmp.path().to_path_buf();
+    let image_store = tmp.path().join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &kernel, &rootfs);
     tokio::fs::create_dir_all(state_dir.join("keys"))
         .await
         .expect("keys dir");
 
     // --- Build a source snapshot from a throwaway ws ---
-    let inst = launch(cfg_for(
-        "fork-src",
-        &kernel,
-        &rootfs,
-        &firecracker,
-        &jailer,
-        &chroot_base,
-    ))
+    let inst = launch(
+        cfg_for(
+            "fork-src",
+            &image_store,
+            &kernel_sha256,
+            &rootfs_sha256,
+            &firecracker,
+            &jailer,
+            &chroot_base,
+        )
+        .await,
+    )
     .await
     .expect("launch src");
     wait_for_guest(&inst.vsock_host_socket.clone()).await;
@@ -135,7 +148,8 @@ async fn fork_two_concurrent_reachable() {
         SNAPSHOT_ID,
         &inst.workspace_id,
         &fc_version,
-        &inst.rootfs_path.clone(),
+        &inst.kernel_sha256,
+        &inst.rootfs_sha256,
         GuestIdentity {
             hostname: inst.workspace_id.clone(),
             mac: "unset".into(),
@@ -144,7 +158,6 @@ async fn fork_two_concurrent_reachable() {
             mem_size_mib: inst.mem_size_mib,
         },
         &inst.kernel_boot_args.clone(),
-        &inst.kernel_path.clone(),
     )
     .await
     .expect("write_manifest");
@@ -155,10 +168,26 @@ async fn fork_two_concurrent_reachable() {
 
     // --- Restore TWO forks concurrently from the one snapshot ---
     let restore_one = |id: &str| {
-        let cfg = cfg_for(id, &kernel, &rootfs, &firecracker, &jailer, &chroot_base);
+        let id = id.to_string();
+        let image_store = image_store.clone();
+        let kernel_sha256 = kernel_sha256.clone();
+        let rootfs_sha256 = rootfs_sha256.clone();
+        let firecracker = firecracker.clone();
+        let jailer = jailer.clone();
+        let chroot_base = chroot_base.clone();
         let mem = snap_dir.join("mem");
         let vmstate = snap_dir.join("vmstate");
         async move {
+            let cfg = cfg_for(
+                &id,
+                &image_store,
+                &kernel_sha256,
+                &rootfs_sha256,
+                &firecracker,
+                &jailer,
+                &chroot_base,
+            )
+            .await;
             restore(RestoreLaunchConfig {
                 launch: cfg,
                 mem_source: mem,
@@ -247,19 +276,26 @@ async fn fork_two_concurrent_distinct_identity() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().to_path_buf();
     let state_dir = tmp.path().to_path_buf();
+    let image_store = tmp.path().join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &kernel, &rootfs);
     tokio::fs::create_dir_all(state_dir.join("keys"))
         .await
         .expect("keys dir");
 
     // Build the source snapshot.
-    let inst = launch(cfg_for(
-        "fork2-src",
-        &kernel,
-        &rootfs,
-        &firecracker,
-        &jailer,
-        &chroot_base,
-    ))
+    let inst = launch(
+        cfg_for(
+            "fork2-src",
+            &image_store,
+            &kernel_sha256,
+            &rootfs_sha256,
+            &firecracker,
+            &jailer,
+            &chroot_base,
+        )
+        .await,
+    )
     .await
     .expect("launch src");
     wait_for_guest(&inst.vsock_host_socket.clone()).await;
@@ -286,7 +322,8 @@ async fn fork_two_concurrent_distinct_identity() {
         snap_id,
         &inst.workspace_id,
         &fc_version,
-        &inst.rootfs_path.clone(),
+        &inst.kernel_sha256,
+        &inst.rootfs_sha256,
         GuestIdentity {
             hostname: inst.workspace_id.clone(),
             mac: "unset".into(),
@@ -295,7 +332,6 @@ async fn fork_two_concurrent_distinct_identity() {
             mem_size_mib: inst.mem_size_mib,
         },
         &inst.kernel_boot_args.clone(),
-        &inst.kernel_path.clone(),
     )
     .await
     .expect("write_manifest");
@@ -306,12 +342,28 @@ async fn fork_two_concurrent_distinct_identity() {
 
     // Fork twice concurrently: restore + reset identity, mirroring fork().
     let fork_one = |id: &str, host: &str, mid: &str| {
-        let cfg = cfg_for(id, &kernel, &rootfs, &firecracker, &jailer, &chroot_base);
+        let id = id.to_string();
+        let image_store = image_store.clone();
+        let kernel_sha256 = kernel_sha256.clone();
+        let rootfs_sha256 = rootfs_sha256.clone();
+        let firecracker = firecracker.clone();
+        let jailer = jailer.clone();
+        let chroot_base = chroot_base.clone();
         let mem = snap_dir.join("mem");
         let vmstate = snap_dir.join("vmstate");
         let host = host.to_string();
         let mid = mid.to_string();
         async move {
+            let cfg = cfg_for(
+                &id,
+                &image_store,
+                &kernel_sha256,
+                &rootfs_sha256,
+                &firecracker,
+                &jailer,
+                &chroot_base,
+            )
+            .await;
             let f = restore(RestoreLaunchConfig {
                 launch: cfg,
                 mem_source: mem,

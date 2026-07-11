@@ -111,8 +111,8 @@ async fn sev_snp_silicon_key_release_round_trip() {
         firecracker_version: "1.7.0".into(),
         mem_sha256: hex_sha256(plaintext_mem),
         vmstate_sha256: hex_sha256(plaintext_vmstate),
-        rootfs_path: "/r".into(),
-        rootfs_sha256: "c".into(),
+        kernel_sha256: "bb".repeat(32),
+        rootfs_sha256: "cc".repeat(32),
         guest_identity: GuestIdentity {
             hostname: "h".into(),
             mac: "06:00:00:00:00:01".into(),
@@ -121,7 +121,6 @@ async fn sev_snp_silicon_key_release_round_trip() {
             mem_size_mib: 128,
         },
         kernel_boot_args: "console=ttyS0".into(),
-        kernel_path: "/k".into(),
         signer_pubkey_b64: String::new(),
         signature_b64: String::new(),
     };

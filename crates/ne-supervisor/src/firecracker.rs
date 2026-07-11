@@ -41,13 +41,13 @@ pub struct LaunchConfig {
     /// Opaque identifier for the workspace; jailer uses this as the
     /// chroot subdirectory name.
     pub workspace_id: String,
-    /// Host path to the guest kernel image (uncompressed vmlinux).
-    pub kernel_image: PathBuf,
-    /// Host path to the guest rootfs image.
-    pub rootfs_image: PathBuf,
-    /// Retained, verified source handles for a cold create. Snapshot restore
-    /// temporarily uses the managed paths above until manifest v5 lands.
-    pub verified_images: Option<VerifiedImagePair>,
+    /// Canonical managed kernel content identity.
+    pub kernel_sha256: String,
+    /// Canonical managed rootfs content identity.
+    pub rootfs_sha256: String,
+    /// Retained, verified source handles. All launch and restore paths must
+    /// resolve these before any workspace tree is claimed.
+    pub verified_images: VerifiedImagePair,
     /// Whether to mount the rootfs read-only inside the guest.
     pub rootfs_read_only: bool,
     /// Number of vCPUs to give the guest.
@@ -122,8 +122,7 @@ pub struct Instance {
     pub network_slot: Option<crate::network::NetworkSlot>,
     // --- Snapshot manifest metadata ---
     // These fields are captured at launch/restore time and written into
-    // the snapshot manifest so `restore()` can reconstruct a full `LaunchConfig`
-    // without a per-request kernel image location.
+    // the snapshot manifest so `restore()` can reconstruct a full launch.
     /// vsock CID assigned to the guest (from `LaunchConfig::guest_vsock_cid`).
     pub guest_vsock_cid: u32,
     /// vCPU count (from `LaunchConfig::vcpu_count`).
@@ -132,10 +131,10 @@ pub struct Instance {
     pub mem_size_mib: u32,
     /// Kernel command-line arguments (from `LaunchConfig::kernel_boot_args`).
     pub kernel_boot_args: String,
-    /// Host path to the rootfs image (from `LaunchConfig::rootfs_image`).
-    pub rootfs_path: PathBuf,
-    /// Host path to the kernel image (from `LaunchConfig::kernel_image`).
-    pub kernel_path: PathBuf,
+    /// Canonical managed kernel content identity.
+    pub kernel_sha256: String,
+    /// Canonical managed rootfs content identity.
+    pub rootfs_sha256: String,
 }
 
 /// Errors returned by [`launch`].
@@ -147,12 +146,6 @@ pub enum LaunchError {
     /// Verified image staging failed.
     #[error(transparent)]
     Image(#[from] ImageError),
-    /// `kernel_image` did not exist or was not a regular file.
-    #[error("kernel image not found: {0}")]
-    KernelNotFound(PathBuf),
-    /// `rootfs_image` did not exist or was not a regular file.
-    #[error("rootfs image not found: {0}")]
-    RootfsNotFound(PathBuf),
     /// `workspace_id` contained a character not in `[a-zA-Z0-9-]` (the
     /// jailer ID grammar).
     #[error("workspace_id {0:?} is not a valid jailer id ([a-zA-Z0-9-]{{1,64}})")]
@@ -233,43 +226,15 @@ async fn spawn_jailed_firecracker(
     let outcome: Result<JailedFirecracker, LaunchError> = async {
         let kernel_in_chroot = jailer_chroot.join("vmlinux");
         let rootfs_in_chroot = jailer_chroot.join("rootfs.img");
-        let stage_result = if let Some(images) = cfg.verified_images.as_mut() {
-            stage_verified_pair(
-                images,
-                &kernel_in_chroot,
-                &rootfs_in_chroot,
-                cfg.rootfs_read_only,
-                cfg.jailer_uid,
-                cfg.jailer_gid,
-            )
-            .await
-            .map_err(LaunchError::from)
-        } else {
-            // Transitional restore-only path. Task 3 resolves snapshot digests
-            // through ImageStore and removes this branch.
-            async {
-                stage_restore_file(
-                    &cfg.kernel_image,
-                    &kernel_in_chroot,
-                    0o400,
-                    cfg.jailer_uid,
-                    cfg.jailer_gid,
-                )
-                .await?;
-                stage_restore_file(
-                    &cfg.rootfs_image,
-                    &rootfs_in_chroot,
-                    if cfg.rootfs_read_only { 0o400 } else { 0o600 },
-                    cfg.jailer_uid,
-                    cfg.jailer_gid,
-                )
-                .await?;
-                Ok::<(), io::Error>(())
-            }
-            .await
-            .map_err(LaunchError::from)
-        };
-        stage_result?;
+        stage_verified_pair(
+            &mut cfg.verified_images,
+            &kernel_in_chroot,
+            &rootfs_in_chroot,
+            cfg.rootfs_read_only,
+            cfg.jailer_uid,
+            cfg.jailer_gid,
+        )
+        .await?;
 
         // Host-side path to the vsock UDS. Firecracker (running inside
         // the jailer chroot) creates this file at the `uds_path` we pass
@@ -376,15 +341,6 @@ pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
     if !is_valid_jailer_id(&cfg.workspace_id) {
         return Err(LaunchError::InvalidWorkspaceId(cfg.workspace_id));
     }
-    if cfg.verified_images.is_none() {
-        if !cfg.kernel_image.is_file() {
-            return Err(LaunchError::KernelNotFound(cfg.kernel_image));
-        }
-        if !cfg.rootfs_image.is_file() {
-            return Err(LaunchError::RootfsNotFound(cfg.rootfs_image));
-        }
-    }
-
     let mut jailed = spawn_jailed_firecracker(&mut cfg).await?;
 
     // Configure the microVM. The order here matters: machine-config
@@ -495,8 +451,8 @@ pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
         vcpu_count: cfg.vcpu_count,
         mem_size_mib: cfg.mem_size_mib,
         kernel_boot_args: cfg.kernel_boot_args,
-        rootfs_path: cfg.rootfs_image,
-        kernel_path: cfg.kernel_image,
+        kernel_sha256: cfg.kernel_sha256,
+        rootfs_sha256: cfg.rootfs_sha256,
     })
 }
 
@@ -735,44 +691,6 @@ pub async fn terminate(mut instance: Instance, grace: Duration) -> Result<(), Te
 /// jailer's exit code.
 fn is_valid_jailer_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-/// Transitional snapshot-restore staging. Cold creates never use this path;
-/// Task 3 replaces it with verified manifest digest resolution.
-async fn stage_restore_file(
-    src: &Path,
-    dst: &Path,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-) -> io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    use tokio::io::AsyncWriteExt as _;
-
-    let mut source = tokio::fs::File::open(src).await?;
-    let mut destination = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(dst)
-        .await?;
-    if let Err(error) = async {
-        tokio::io::copy(&mut source, &mut destination).await?;
-        destination.flush().await?;
-        chown(dst, uid, gid)?;
-        tokio::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).await
-    }
-    .await
-    {
-        return match tokio::fs::remove_file(dst).await {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(io::Error::other(format!(
-                "primary staging failure: {error}; removing partially staged restore artifact: \
-                 {cleanup_error}"
-            ))),
-        };
-    }
-    Ok(())
 }
 
 /// chown via the nix crate (no unsafe in this crate).
@@ -1298,7 +1216,7 @@ struct SnapshotLoadBody {
 /// Inputs to restore a workspace from a snapshot artifact.
 pub struct RestoreLaunchConfig {
     /// Reuses the cold-boot [`LaunchConfig`] fields (binaries, `chroot_base`,
-    /// jailer uid/gid, rootfs path, kernel path, timeouts). `network` MUST
+    /// jailer uid/gid, verified managed images, and timeouts). `network` MUST
     /// be `None` for this wedge — networked restore is not supported (FC
     /// records the host TAP name in vmstate; restoring into a different
     /// `workspace_id` would reference a non-existent TAP).
@@ -1410,8 +1328,8 @@ pub async fn restore(mut cfg: RestoreLaunchConfig) -> Result<Instance, LaunchErr
                 vcpu_count: cfg.launch.vcpu_count,
                 mem_size_mib: cfg.launch.mem_size_mib,
                 kernel_boot_args: cfg.launch.kernel_boot_args,
-                rootfs_path: cfg.launch.rootfs_image,
-                kernel_path: cfg.launch.kernel_image,
+                kernel_sha256: cfg.launch.kernel_sha256,
+                rootfs_sha256: cfg.launch.rootfs_sha256,
             })
         }
         Err(e) => {

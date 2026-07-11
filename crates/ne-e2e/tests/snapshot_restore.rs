@@ -90,6 +90,9 @@ async fn snapshot_restore_roundtrip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().to_path_buf();
     let state_dir = tmp.path().to_path_buf();
+    let image_store = tmp.path().join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &kernel, &rootfs);
 
     // Create the keys subdir for the signing key.
     let keys_dir = state_dir.join("keys");
@@ -98,10 +101,15 @@ async fn snapshot_restore_roundtrip() {
         .expect("create keys dir");
 
     // --- Step 1: Launch ws-A ---
+    let verified_images = ne_supervisor::image::ImageStore::new(image_store.clone())
+        .resolve_pair(&kernel_sha256, &rootfs_sha256)
+        .await
+        .expect("resolve source images");
     let cfg_a = LaunchConfig {
         workspace_id: "snap-src".to_string(),
-        kernel_image: kernel.clone(),
-        rootfs_image: rootfs.clone(),
+        kernel_sha256: kernel_sha256.clone(),
+        rootfs_sha256: rootfs_sha256.clone(),
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -170,10 +178,10 @@ async fn snapshot_restore_roundtrip() {
         SNAPSHOT_ID,
         &inst_a.workspace_id,
         &fc_version,
-        &inst_a.rootfs_path.clone(),
+        &inst_a.kernel_sha256,
+        &inst_a.rootfs_sha256,
         guest_identity,
         &inst_a.kernel_boot_args.clone(),
-        &inst_a.kernel_path.clone(),
     )
     .await
     .expect("write_manifest");
@@ -187,10 +195,15 @@ async fn snapshot_restore_roundtrip() {
     verify_artifact(&snap_dir).await.expect("verify_artifact");
 
     // --- Step 8: Restore into ws-B ---
+    let verified_images = ne_supervisor::image::ImageStore::new(image_store)
+        .resolve_pair(&kernel_sha256, &rootfs_sha256)
+        .await
+        .expect("resolve restore images");
     let cfg_b = LaunchConfig {
         workspace_id: "snap-dst".to_string(),
-        kernel_image: kernel.clone(),
-        rootfs_image: rootfs.clone(),
+        kernel_sha256,
+        rootfs_sha256,
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -272,10 +285,13 @@ async fn in_place_resume_breaks_vsock_known_limitation() {
     assert!(jailer.is_file(), "jailer not found at {}", jailer.display());
 
     let tmp = tempfile::tempdir().expect("tempdir");
+    let (kernel_sha256, rootfs_sha256, verified_images) =
+        ne_e2e::resolve_managed_images(&tmp.path().join("images"), &kernel, &rootfs).await;
     let cfg = LaunchConfig {
         workspace_id: "in-place-resume-limitation".to_string(),
-        kernel_image: kernel.clone(),
-        rootfs_image: rootfs.clone(),
+        kernel_sha256,
+        rootfs_sha256,
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,

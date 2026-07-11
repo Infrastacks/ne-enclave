@@ -285,24 +285,77 @@ fn is_valid_workspace_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Compute the v1 configuration measurement for a running instance.
-/// Hashes the launch configuration (no per-request file IO, so the
-/// warm-pool create path is unaffected). Swapping kernel/rootfs paths
-/// for content digests is a follow-up.
-#[cfg(target_os = "linux")]
-fn measure_config(inst: &crate::firecracker::Instance) -> ne_attestation::Measurement {
+/// Compute the v1 configuration measurement from stable launch metadata.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn configuration_measurement(
+    vcpu_count: u8,
+    mem_size_mib: u32,
+    kernel_boot_args: &str,
+    networked: bool,
+    kernel_sha256: &str,
+    rootfs_sha256: &str,
+) -> ne_attestation::Measurement {
     use sha2::{Digest, Sha256};
     let canonical = serde_json::json!({
-        "vcpu_count": inst.vcpu_count,
-        "mem_size_mib": inst.mem_size_mib,
-        "kernel_boot_args": inst.kernel_boot_args,
-        "networked": inst.network_slot.is_some(),
-        "kernel_path": inst.kernel_path.to_string_lossy(),
-        "rootfs_path": inst.rootfs_path.to_string_lossy(),
+        "vcpu_count": vcpu_count,
+        "mem_size_mib": mem_size_mib,
+        "kernel_boot_args": kernel_boot_args,
+        "networked": networked,
+        "kernel_sha256": kernel_sha256,
+        "rootfs_sha256": rootfs_sha256,
     });
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     let digest = Sha256::digest(&bytes);
     ne_attestation::Measurement(digest.into())
+}
+
+/// Compute the v1 configuration measurement for a running instance.
+/// Hashes stable launch metadata without per-request file I/O.
+#[cfg(target_os = "linux")]
+fn measure_config(inst: &crate::firecracker::Instance) -> ne_attestation::Measurement {
+    configuration_measurement(
+        inst.vcpu_count,
+        inst.mem_size_mib,
+        &inst.kernel_boot_args,
+        inst.network_slot.is_some(),
+        &inst.kernel_sha256,
+        &inst.rootfs_sha256,
+    )
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::configuration_measurement;
+
+    #[test]
+    fn configuration_measurement_binds_both_image_digests() {
+        let baseline = configuration_measurement(
+            2,
+            512,
+            "console=ttyS0",
+            false,
+            &"11".repeat(32),
+            &"22".repeat(32),
+        );
+        let other_kernel = configuration_measurement(
+            2,
+            512,
+            "console=ttyS0",
+            false,
+            &"33".repeat(32),
+            &"22".repeat(32),
+        );
+        let other_rootfs = configuration_measurement(
+            2,
+            512,
+            "console=ttyS0",
+            false,
+            &"11".repeat(32),
+            &"44".repeat(32),
+        );
+        assert_ne!(baseline, other_kernel);
+        assert_ne!(baseline, other_rootfs);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -702,19 +755,9 @@ impl WorkspaceManager {
 
         let cfg = crate::firecracker::LaunchConfig {
             workspace_id: req.workspace_id.clone(),
-            kernel_image: self
-                .cfg
-                .image_store
-                .join("kernels")
-                .join(&req.kernel_sha256)
-                .join("vmlinux"),
-            rootfs_image: self
-                .cfg
-                .image_store
-                .join("rootfs")
-                .join(&req.rootfs_sha256)
-                .join("rootfs.img"),
-            verified_images: Some(verified_images),
+            kernel_sha256: req.kernel_sha256.clone(),
+            rootfs_sha256: req.rootfs_sha256.clone(),
+            verified_images,
             rootfs_read_only: req.rootfs_read_only,
             vcpu_count: req.vcpu_count,
             mem_size_mib: req.mem_size_mib,
@@ -1743,8 +1786,8 @@ impl WorkspaceManager {
             vcpu_count,
             mem_size_mib,
             kernel_boot_args,
-            rootfs_path,
-            kernel_path,
+            kernel_sha256,
+            rootfs_sha256,
             was_running,
         ) = {
             let mut guard = self.instances.lock().await;
@@ -1858,8 +1901,8 @@ impl WorkspaceManager {
                 instance.vcpu_count,
                 instance.mem_size_mib,
                 instance.kernel_boot_args.clone(),
-                instance.rootfs_path.clone(),
-                instance.kernel_path.clone(),
+                instance.kernel_sha256.clone(),
+                instance.rootfs_sha256.clone(),
                 was_running,
             )
         };
@@ -1942,10 +1985,10 @@ impl WorkspaceManager {
             &snapshot_id,
             &source_ws_id,
             &fc_version,
-            &rootfs_path,
+            &kernel_sha256,
+            &rootfs_sha256,
             guest_identity,
             &kernel_boot_args,
-            &kernel_path,
         )
         .await
         {
@@ -2070,18 +2113,25 @@ impl WorkspaceManager {
         // (the only legitimate producer of a snapshot here) rather than the key
         // embedded in the untrusted manifest — closes the self-signed forgery
         // class on the restore/fork trust path.
-        let manifest = crate::snapshot::verify_artifact_pinned(&dir, &self.audit.verifying_key())
-            .await
-            .map_err(|e| SupervisorResponse::Error {
+        let (manifest, verified_images) = crate::snapshot::verify_and_resolve_images(
+            &dir,
+            &self.audit.verifying_key(),
+            &ImageStore::new(self.cfg.image_store.clone()),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::snapshot::SnapshotRestoreError::Artifact(error) => SupervisorResponse::Error {
                 kind: SupervisorErrorKind::InvalidSnapshot,
-                message: e.to_string(),
-            })?;
+                message: error.to_string(),
+            },
+            crate::snapshot::SnapshotRestoreError::Image(error) => image_error_response(error),
+        })?;
 
         let launch_cfg = crate::firecracker::LaunchConfig {
             workspace_id: new_workspace_id.to_string(),
-            kernel_image: PathBuf::from(&manifest.kernel_path),
-            rootfs_image: PathBuf::from(&manifest.rootfs_path),
-            verified_images: None,
+            kernel_sha256: manifest.kernel_sha256.clone(),
+            rootfs_sha256: manifest.rootfs_sha256.clone(),
+            verified_images,
             rootfs_read_only: true,
             vcpu_count: manifest.guest_identity.vcpu_count,
             mem_size_mib: manifest.guest_identity.mem_size_mib,

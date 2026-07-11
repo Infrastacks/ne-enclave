@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Snapshot artifact orchestration: copy FC output out of the jail chroot,
-//! stream-hash mem/vmstate/rootfs, sign the manifest with the host key,
+//! stream-hash mem/vmstate, bind the managed image digests, sign with the host key,
 //! and write/verify `manifest.json`.
 
 use std::path::{Path, PathBuf};
@@ -35,6 +35,17 @@ pub enum SnapshotError {
     Serde(#[from] serde_json::Error),
 }
 
+/// Failure while authenticating a snapshot and resolving its managed images.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotRestoreError {
+    /// Snapshot signature, serialization, or artifact verification failed.
+    #[error(transparent)]
+    Artifact(#[from] SnapshotError),
+    /// A managed image could not be resolved or verified.
+    #[error(transparent)]
+    Image(#[from] crate::image::ImageError),
+}
+
 /// Stream the SHA-256 of a file as lowercase hex without buffering it whole.
 pub async fn sha256_hex(path: &Path) -> Result<String, SnapshotError> {
     let mut file = tokio::fs::File::open(path).await?;
@@ -65,17 +76,17 @@ pub async fn write_manifest(
     snapshot_id: &str,
     created_from_workspace_id: &str,
     firecracker_version: &str,
-    rootfs_path: &Path,
+    kernel_sha256: &str,
+    rootfs_sha256: &str,
     guest_identity: GuestIdentity,
     kernel_boot_args: &str,
-    kernel_path: &Path,
 ) -> Result<SnapshotInfo, SnapshotError> {
     let mem_path = snapshot_dir.join("mem");
     let vmstate_path = snapshot_dir.join("vmstate");
     let mem_sha256 = sha256_hex(&mem_path).await?;
     let vmstate_sha256 = sha256_hex(&vmstate_path).await?;
-    let rootfs_sha256 = sha256_hex(rootfs_path).await?;
-    // rootfs is referenced by path, not copied — excluded from artifact size
+    // Managed images remain in the supervisor-owned content-addressed store and
+    // are therefore excluded from the snapshot artifact size.
     let size_bytes = tokio::fs::metadata(&mem_path).await?.len()
         + tokio::fs::metadata(&vmstate_path).await?.len();
 
@@ -86,11 +97,10 @@ pub async fn write_manifest(
         firecracker_version: firecracker_version.to_string(),
         mem_sha256: mem_sha256.clone(),
         vmstate_sha256: vmstate_sha256.clone(),
-        rootfs_path: rootfs_path.display().to_string(),
-        rootfs_sha256,
+        kernel_sha256: kernel_sha256.to_string(),
+        rootfs_sha256: rootfs_sha256.to_string(),
         guest_identity,
         kernel_boot_args: kernel_boot_args.to_string(),
-        kernel_path: kernel_path.display().to_string(),
         signer_pubkey_b64: B64.encode(signer.verifying_key().as_bytes()),
         signature_b64: String::new(),
     };
@@ -117,7 +127,7 @@ pub async fn read_manifest(snapshot_dir: &Path) -> Result<SnapshotManifest, Snap
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// **Integrity-only** end-to-end check: signature + all three file hashes.
+/// **Integrity-only** end-to-end check: signature + snapshot artifact hashes.
 ///
 /// The signature is checked against the manifest's *embedded* key, so this
 /// proves the artifact is internally self-consistent but does NOT authenticate
@@ -134,10 +144,11 @@ pub async fn verify_artifact(snapshot_dir: &Path) -> Result<SnapshotManifest, Sn
 /// Verify a snapshot artifact end-to-end against a **caller-pinned trust anchor**.
 ///
 /// The signature is checked against `expected_signer` (the host's signing key;
-/// the manifest-embedded key must equal it), then all three file hashes. This
+/// the manifest-embedded key must equal it), then both snapshot artifact hashes. This
 /// is the authenticity-bearing verifier used on the restore / fork trust path;
 /// a snapshot signed by any other key is rejected with `UntrustedSigner` before
-/// its bytes are trusted.
+/// its bytes are trusted. Managed image bytes are resolved and verified by the
+/// restore path after this artifact check succeeds.
 pub async fn verify_artifact_pinned(
     snapshot_dir: &Path,
     expected_signer: &VerifyingKey,
@@ -148,23 +159,53 @@ pub async fn verify_artifact_pinned(
     Ok(m)
 }
 
-/// Hash the `mem` / `vmstate` / `rootfs` files and compare against the
-/// manifest's recorded digests. `rootfs_path` is only opened AFTER the
-/// signature has verified, so a path in a forged manifest is never touched.
+/// Authenticate a snapshot artifact, then resolve and verify both managed
+/// images named by its signed digest pair. No workspace resources are touched.
+pub async fn verify_and_resolve_images(
+    snapshot_dir: &Path,
+    expected_signer: &VerifyingKey,
+    image_store: &crate::image::ImageStore,
+) -> Result<(SnapshotManifest, crate::image::VerifiedImagePair), SnapshotRestoreError> {
+    let manifest = verify_artifact_pinned(snapshot_dir, expected_signer).await?;
+    let images = image_store
+        .resolve_pair(&manifest.kernel_sha256, &manifest.rootfs_sha256)
+        .await?;
+    Ok((manifest, images))
+}
+
+/// Hash the `mem` and `vmstate` files and compare against the manifest.
 async fn check_artifact_hashes(
     snapshot_dir: &Path,
     m: &SnapshotManifest,
 ) -> Result<(), SnapshotError> {
     let mem_h = sha256_hex(&snapshot_dir.join("mem")).await?;
     let vm_h = sha256_hex(&snapshot_dir.join("vmstate")).await?;
-    let root_h = sha256_hex(Path::new(&m.rootfs_path)).await?;
-    manifest_matches_hashes(m, &mem_h, &vm_h, &root_h)?;
+    manifest_matches_hashes(m, &mem_h, &vm_h)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn write_managed_image(
+        store: &Path,
+        kind: crate::image::ImageKind,
+        bytes: &[u8],
+    ) -> (String, PathBuf) {
+        let digest = hex::encode(Sha256::digest(bytes));
+        let path = match kind {
+            crate::image::ImageKind::Kernel => store.join("kernels").join(&digest).join("vmlinux"),
+            crate::image::ImageKind::Rootfs => {
+                store.join("rootfs").join(&digest).join("rootfs.img")
+            }
+        };
+        tokio::fs::create_dir_all(path.parent().expect("artifact parent"))
+            .await
+            .unwrap();
+        tokio::fs::write(&path, bytes).await.unwrap();
+        (digest, path)
+    }
 
     #[tokio::test]
     async fn sha256_matches_known_vector() {
@@ -184,19 +225,15 @@ mod tests {
         tokio::fs::create_dir_all(&snap).await.unwrap();
         tokio::fs::write(snap.join("mem"), b"MEM").await.unwrap();
         tokio::fs::write(snap.join("vmstate"), b"VM").await.unwrap();
-        let rootfs = dir.path().join("rootfs.squashfs");
-        tokio::fs::write(&rootfs, b"ROOT").await.unwrap();
-
         let signer = SigningKey::from_bytes(&[3u8; 32]);
-        let kernel = dir.path().join("vmlinux");
-        tokio::fs::write(&kernel, b"KERNEL").await.unwrap();
         let info = write_manifest(
             &snap,
             &signer,
             "01J0SNAP",
             "ws-a",
             "1.7.0",
-            &rootfs,
+            &"33".repeat(32),
+            &"44".repeat(32),
             GuestIdentity {
                 hostname: "ne-enclave".into(),
                 mac: "06:00:00:00:00:01".into(),
@@ -205,7 +242,6 @@ mod tests {
                 mem_size_mib: 128,
             },
             "console=ttyS0",
-            &kernel,
         )
         .await
         .unwrap();
@@ -215,8 +251,9 @@ mod tests {
         verify_manifest_signature(&m).unwrap();
         let mem_h = sha256_hex(&snap.join("mem")).await.unwrap();
         let vm_h = sha256_hex(&snap.join("vmstate")).await.unwrap();
-        let root_h = sha256_hex(&rootfs).await.unwrap();
-        manifest_matches_hashes(&m, &mem_h, &vm_h, &root_h).unwrap();
+        assert_eq!(m.kernel_sha256, "33".repeat(32));
+        assert_eq!(m.rootfs_sha256, "44".repeat(32));
+        manifest_matches_hashes(&m, &mem_h, &vm_h).unwrap();
     }
 
     #[tokio::test]
@@ -226,18 +263,15 @@ mod tests {
         tokio::fs::create_dir_all(&snap).await.unwrap();
         tokio::fs::write(snap.join("mem"), b"MEM").await.unwrap();
         tokio::fs::write(snap.join("vmstate"), b"VM").await.unwrap();
-        let rootfs = dir.path().join("rootfs.squashfs");
-        tokio::fs::write(&rootfs, b"ROOT").await.unwrap();
         let signer = SigningKey::from_bytes(&[3u8; 32]);
-        let kernel = dir.path().join("vmlinux");
-        tokio::fs::write(&kernel, b"KERNEL").await.unwrap();
         write_manifest(
             &snap,
             &signer,
             "01J0SNAP",
             "ws-a",
             "1.7.0",
-            &rootfs,
+            &"33".repeat(32),
+            &"44".repeat(32),
             GuestIdentity {
                 hostname: "ne-enclave".into(),
                 mac: "06:00:00:00:00:01".into(),
@@ -246,7 +280,6 @@ mod tests {
                 mem_size_mib: 128,
             },
             "console=ttyS0",
-            &kernel,
         )
         .await
         .unwrap();
@@ -265,5 +298,109 @@ mod tests {
             ),
             "expected mem HashMismatch, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_resolution_rejects_missing_kernel_before_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("images");
+        tokio::fs::create_dir_all(&store).await.unwrap();
+        let (rootfs_sha256, _) =
+            write_managed_image(&store, crate::image::ImageKind::Rootfs, b"ROOT").await;
+        let kernel_sha256 = hex::encode(Sha256::digest(b"MISSING KERNEL"));
+        let snap = snapshot_dir(dir.path(), "01J0SNAP");
+        tokio::fs::create_dir_all(&snap).await.unwrap();
+        tokio::fs::write(snap.join("mem"), b"MEM").await.unwrap();
+        tokio::fs::write(snap.join("vmstate"), b"VM").await.unwrap();
+        let signer = SigningKey::from_bytes(&[3u8; 32]);
+        write_manifest(
+            &snap,
+            &signer,
+            "01J0SNAP",
+            "ws-a",
+            "1.7.0",
+            &kernel_sha256,
+            &rootfs_sha256,
+            GuestIdentity {
+                hostname: "ne-enclave".into(),
+                mac: "unset".into(),
+                guest_vsock_cid: 3,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+            },
+            "console=ttyS0",
+        )
+        .await
+        .unwrap();
+
+        let Err(error) = verify_and_resolve_images(
+            &snap,
+            &signer.verifying_key(),
+            &crate::image::ImageStore::new(store),
+        )
+        .await
+        else {
+            panic!("missing kernel must fail");
+        };
+        assert!(matches!(
+            error,
+            SnapshotRestoreError::Image(crate::image::ImageError::NotFound {
+                kind: crate::image::ImageKind::Kernel,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_resolution_rejects_mutated_rootfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("images");
+        tokio::fs::create_dir_all(&store).await.unwrap();
+        let (kernel_sha256, _) =
+            write_managed_image(&store, crate::image::ImageKind::Kernel, b"KERNEL").await;
+        let (rootfs_sha256, mutated_rootfs) =
+            write_managed_image(&store, crate::image::ImageKind::Rootfs, b"ROOT").await;
+        let snap = snapshot_dir(dir.path(), "01J0SNAP");
+        tokio::fs::create_dir_all(&snap).await.unwrap();
+        tokio::fs::write(snap.join("mem"), b"MEM").await.unwrap();
+        tokio::fs::write(snap.join("vmstate"), b"VM").await.unwrap();
+        let signer = SigningKey::from_bytes(&[3u8; 32]);
+        write_manifest(
+            &snap,
+            &signer,
+            "01J0SNAP",
+            "ws-a",
+            "1.7.0",
+            &kernel_sha256,
+            &rootfs_sha256,
+            GuestIdentity {
+                hostname: "ne-enclave".into(),
+                mac: "unset".into(),
+                guest_vsock_cid: 3,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+            },
+            "console=ttyS0",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(mutated_rootfs, b"MUTATED").await.unwrap();
+
+        let Err(error) = verify_and_resolve_images(
+            &snap,
+            &signer.verifying_key(),
+            &crate::image::ImageStore::new(store),
+        )
+        .await
+        else {
+            panic!("mutated rootfs must fail");
+        };
+        assert!(matches!(
+            error,
+            SnapshotRestoreError::Image(crate::image::ImageError::DigestMismatch {
+                kind: crate::image::ImageKind::Rootfs,
+                ..
+            })
+        ));
     }
 }

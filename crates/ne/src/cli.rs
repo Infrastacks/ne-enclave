@@ -396,7 +396,7 @@ pub struct SnapshotArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SnapshotCommand {
-    /// Verify a snapshot artifact directory (signature + mem/vmstate/rootfs hashes).
+    /// Verify a snapshot artifact directory (signature + mem/vmstate hashes).
     Verify {
         /// Path to the snapshot artifact directory (contains manifest.json).
         path: PathBuf,

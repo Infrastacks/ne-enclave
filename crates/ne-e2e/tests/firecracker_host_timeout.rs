@@ -34,11 +34,14 @@ async fn firecracker_host_timeout() {
     let jailer = env_path("NE_E2E_JAILER", "/usr/local/bin/jailer");
     let tmp = tempfile::tempdir().expect("tempdir");
     let workspace_id = format!("e2e-to-{}", std::process::id());
+    let (kernel_sha256, rootfs_sha256, verified_images) =
+        ne_e2e::resolve_managed_images(&tmp.path().join("images"), &kernel, &rootfs).await;
 
     let cfg = LaunchConfig {
         workspace_id: workspace_id.clone(),
-        kernel_image: kernel,
-        rootfs_image: rootfs,
+        kernel_sha256,
+        rootfs_sha256,
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,

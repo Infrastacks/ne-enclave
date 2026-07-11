@@ -4,7 +4,7 @@
 //! CLI-side snapshot artifact verification.
 //!
 //! Delegates to `ne_supervisor::snapshot::verify_artifact`, which checks
-//! the manifest signature and all three file hashes (mem, vmstate, rootfs).
+//! the manifest signature and both snapshot artifact hashes (mem, vmstate).
 
 #![forbid(unsafe_code)]
 

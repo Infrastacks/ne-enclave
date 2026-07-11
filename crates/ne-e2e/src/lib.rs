@@ -39,3 +39,17 @@ pub fn prepare_managed_images(
     std::fs::write(rootfs_path, rootfs_bytes).expect("managed e2e rootfs");
     (kernel_sha256, rootfs_sha256)
 }
+
+/// Populate and resolve a managed image pair for direct Firecracker e2e tests.
+pub async fn resolve_managed_images(
+    store: &std::path::Path,
+    kernel: &std::path::Path,
+    rootfs: &std::path::Path,
+) -> (String, String, ne_supervisor::image::VerifiedImagePair) {
+    let (kernel_sha256, rootfs_sha256) = prepare_managed_images(store, kernel, rootfs);
+    let images = ne_supervisor::image::ImageStore::new(store.to_path_buf())
+        .resolve_pair(&kernel_sha256, &rootfs_sha256)
+        .await
+        .expect("resolve managed e2e images");
+    (kernel_sha256, rootfs_sha256, images)
+}
