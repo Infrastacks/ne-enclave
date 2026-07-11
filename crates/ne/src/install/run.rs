@@ -24,7 +24,7 @@ pub struct InstallOptions {
     pub fakeroot: bool,
     /// Do not `systemctl enable --now` the units after rendering them.
     pub no_start: bool,
-    /// Do not fetch the default guest image (leave the env paths UNSET).
+    /// Do not fetch the default guest image.
     pub no_image: bool,
     /// Print actions without mutating the filesystem.
     pub dry_run: bool,
@@ -70,30 +70,23 @@ pub fn install(opts: InstallOptions) -> Result<()> {
     if !opts.fakeroot && !opts.dry_run {
         apply_ownership(l)?;
     }
+    if !opts.dry_run {
+        image::harden_store(&l.images_dir(), opts.fakeroot)?;
+    }
 
     // 3. Guest image (default pin), unless --no-image. Custom/air-gap
     //    images are provisioned separately via `nee image import`/`pull`.
-    let (kernel_path, rootfs_path) = if opts.no_image {
-        (
-            String::from("/var/lib/ne-enclave/images/kernels/UNSET/vmlinux"),
-            String::from("/var/lib/ne-enclave/images/rootfs/UNSET/rootfs.img"),
-        )
-    } else if opts.dry_run {
-        tracing::info!("[dry-run] fetch default guest image");
-        (
-            String::from("DRY_RUN_KERNEL"),
-            String::from("DRY_RUN_ROOTFS"),
-        )
-    } else {
-        fetch_default_image(l)?
-    };
+    if !opts.no_image {
+        if opts.dry_run {
+            tracing::info!("[dry-run] fetch default guest image");
+        } else {
+            fetch_default_image(l)?;
+            image::harden_store(&l.images_dir(), opts.fakeroot)?;
+        }
+    }
 
     // 4. Render config + units + tmpfiles.
-    let vars = RenderVars {
-        ne_uid,
-        kernel_path,
-        rootfs_path,
-    };
+    let vars = RenderVars { ne_uid };
     write_file(l.env_file(), &render::render_env(&vars), opts.dry_run)?;
     write_file(
         l.supervisor_unit(),
@@ -181,7 +174,7 @@ fn write_file(path: std::path::PathBuf, body: &str, dry_run: bool) -> Result<()>
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
 }
 
-fn fetch_default_image(l: &Layout) -> Result<(String, String)> {
+fn fetch_default_image(l: &Layout) -> Result<()> {
     let pin = &image::DEFAULT_IMAGE;
     anyhow::ensure!(
         !pin.kernel_sha256.starts_with("PLACEHOLDER"),
@@ -192,15 +185,15 @@ fn fetch_default_image(l: &Layout) -> Result<(String, String)> {
     let r = tmp.path().join("rootfs.img");
     image::curl_download(&format!("{}/vmlinux", pin.url_base), &k)?;
     image::curl_download(&format!("{}/rootfs.img", pin.url_base), &r)?;
-    let kp = image::import_artifact(&l.images_dir(), "kernels", "vmlinux", &k, pin.kernel_sha256)?;
-    let rp = image::import_artifact(
+    image::import_artifact(&l.images_dir(), "kernels", "vmlinux", &k, pin.kernel_sha256)?;
+    image::import_artifact(
         &l.images_dir(),
         "rootfs",
         "rootfs.img",
         &r,
         pin.rootfs_sha256,
     )?;
-    Ok((kp.display().to_string(), rp.display().to_string()))
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -302,8 +295,8 @@ fn print_next_steps(opts: &InstallOptions) {
 /// ("user","group"); resolved to uids at apply time.
 pub fn dir_ownership() -> Vec<(&'static str, (&'static str, &'static str), u32)> {
     vec![
-        ("/var/lib/ne-enclave", ("ne", "ne"), 0o750),
-        ("/var/lib/ne-enclave/images", ("ne", "ne"), 0o750),
+        ("/var/lib/ne-enclave", ("root", "ne"), 0o750),
+        ("/var/lib/ne-enclave/images", ("root", "root"), 0o755),
         ("/var/lib/ne-enclave/workspaces", ("ne", "ne"), 0o750),
         ("/var/lib/ne-enclave/snapshots", ("ne", "ne"), 0o750),
         ("/srv/jailer", ("root", "root"), 0o700),
@@ -329,6 +322,26 @@ mod ownership_tests {
         let t = dir_ownership();
         let e = t.iter().find(|(p, _, _)| *p == "/etc/ne-enclave").unwrap();
         assert_eq!(e.1, ("root", "ne"));
+    }
+
+    #[test]
+    fn image_store_is_root_owned_and_not_service_writable() {
+        let t = dir_ownership();
+        let state = t
+            .iter()
+            .find(|(p, _, _)| *p == "/var/lib/ne-enclave")
+            .unwrap();
+        let images = t
+            .iter()
+            .find(|(p, _, _)| *p == "/var/lib/ne-enclave/images")
+            .unwrap();
+        assert_eq!(state.1, ("root", "ne"));
+        assert_eq!(images.1, ("root", "root"));
+        assert_eq!(
+            images.2 & 0o022,
+            0,
+            "API identity must not write image store"
+        );
     }
 }
 

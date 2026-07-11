@@ -1,7 +1,7 @@
 # Secure Image Staging Design
 
-**Status:** Approved  
-**Date:** 2026-07-11  
+**Status:** Approved
+**Date:** 2026-07-11
 **Scope:** Replace caller-controlled host image paths with content-addressed image digests and eliminate hard-linked workspace artifacts.
 
 ## Problem

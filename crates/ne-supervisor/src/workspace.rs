@@ -48,6 +48,21 @@ fn image_error_response(error: ImageError) -> SupervisorResponse {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn restore_launch_error_response(error: crate::firecracker::LaunchError) -> SupervisorResponse {
+    match error {
+        crate::firecracker::LaunchError::NetworkedRestoreUnsupported => SupervisorResponse::Error {
+            kind: SupervisorErrorKind::InvalidSnapshot,
+            message: "networked snapshot restore is not supported".to_string(),
+        },
+        crate::firecracker::LaunchError::Image(error) => image_error_response(error),
+        error => SupervisorResponse::Error {
+            kind: SupervisorErrorKind::RestoreFailed,
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Short readiness probe at pool checkout — the member was proven ready at
 /// provision time; this only catches members that died while idle.
 #[cfg(target_os = "linux")]
@@ -2174,19 +2189,10 @@ impl WorkspaceManager {
             mem_source: dir.join("mem"),
             vmstate_source: dir.join("vmstate"),
         };
-        match crate::firecracker::restore(restore_cfg).await {
-            Ok(inst) => Ok((inst, manifest)),
-            Err(crate::firecracker::LaunchError::NetworkedRestoreUnsupported) => {
-                Err(SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::InvalidSnapshot,
-                    message: "networked snapshot restore is not supported".to_string(),
-                })
-            }
-            Err(e) => Err(SupervisorResponse::Error {
-                kind: SupervisorErrorKind::RestoreFailed,
-                message: e.to_string(),
-            }),
-        }
+        crate::firecracker::restore(restore_cfg)
+            .await
+            .map(|inst| (inst, manifest))
+            .map_err(restore_launch_error_response)
     }
 
     /// Register a freshly-booted instance under the final lock, re-checking
@@ -3027,6 +3033,26 @@ mod tests {
                 "for {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn restore_destination_staging_failure_is_image_stage_failed() {
+        let error = crate::firecracker::LaunchError::Image(ImageError::Stage {
+            kind: ImageKind::Rootfs,
+            digest: "ab".repeat(32),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected destination create failure",
+            ),
+        });
+        let response = restore_launch_error_response(error);
+        assert!(matches!(
+            response,
+            SupervisorResponse::Error {
+                kind: S::ImageStageFailed,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

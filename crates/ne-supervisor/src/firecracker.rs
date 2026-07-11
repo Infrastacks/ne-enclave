@@ -145,6 +145,10 @@ pub enum LaunchError {
     /// Verified image staging failed.
     #[error(transparent)]
     Image(#[from] ImageError),
+    /// Child termination or reaping failed. The owned workspace tree is left
+    /// intact because deleting it while the child may still run is unsafe.
+    #[error("{0}")]
+    TerminationFailed(String),
     /// `workspace_id` contained a character not in `[a-zA-Z0-9-]` (the
     /// jailer ID grammar).
     #[error("workspace_id {0:?} is not a valid jailer id ([a-zA-Z0-9-]{{1,64}})")]
@@ -299,9 +303,7 @@ async fn spawn_jailed_firecracker(
         // death so we don't burn the full timeout on a launch failure.
         if let Err(e) = wait_for_socket(&api_socket_host, &mut child, cfg.api_socket_timeout).await
         {
-            // Kill the child first. The claim owner performs filesystem cleanup
-            // after this inner launch attempt returns.
-            let _ = child.kill().await;
+            confirm_child_exit(&mut child, "jailer startup", &e).await?;
             return Err(e);
         }
         debug!(socket = %api_socket_host.display(), "Firecracker API socket ready");
@@ -324,6 +326,7 @@ async fn spawn_jailed_firecracker(
         Err(LaunchError::Image(image_error)) => Err(LaunchError::Image(
             claim.cleanup_image_failure(image_error).await,
         )),
+        Err(error @ LaunchError::TerminationFailed(_)) => Err(error),
         Err(other) => match claim.cleanup().await {
             Ok(()) => Err(other),
             Err(cleanup_error) => Err(LaunchError::Io(io::Error::other(format!(
@@ -422,15 +425,13 @@ pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
     }
     .await;
     if let Err(primary) = configured {
-        let _ = jailed.child.start_kill();
-        let _ = jailed.child.wait().await;
-        return match tokio::fs::remove_dir_all(&jailed.workspace_root).await {
-            Ok(()) => Err(primary),
-            Err(cleanup) => Err(LaunchError::Io(io::Error::other(format!(
-                "Firecracker configuration failed: {primary}; removing owned workspace tree: \
-                 {cleanup}"
-            )))),
-        };
+        return Err(cleanup_failed_child(
+            &mut jailed.child,
+            &jailed.workspace_root,
+            "Firecracker configuration",
+            primary,
+        )
+        .await);
     }
 
     Ok(Instance {
@@ -664,8 +665,10 @@ pub async fn terminate(mut instance: Instance, grace: Duration) -> Result<(), Te
         }
         if Instant::now() >= deadline {
             warn!(workspace_id = %instance.workspace_id, "grace expired, escalating to SIGKILL");
-            let _ = kill(pid, Signal::SIGKILL);
-            let _ = instance.child.wait().await;
+            let primary = LaunchError::Io(io::Error::other("graceful termination timed out"));
+            confirm_child_exit(&mut instance.child, "workspace termination", &primary)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
             break;
         }
         sleep(Duration::from_millis(25)).await;
@@ -683,6 +686,77 @@ pub async fn terminate(mut instance: Instance, grace: Duration) -> Result<(), Te
         warn!(workspace_id = %instance.workspace_id, error = %e, "chroot cleanup failed");
     }
     Ok(())
+}
+
+#[allow(async_fn_in_trait)]
+trait ChildControl {
+    fn try_wait_control(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
+    fn start_kill_control(&mut self) -> io::Result<()>;
+    async fn wait_control(&mut self) -> io::Result<std::process::ExitStatus>;
+}
+
+impl ChildControl for Child {
+    fn try_wait_control(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+
+    fn start_kill_control(&mut self) -> io::Result<()> {
+        self.start_kill()
+    }
+
+    async fn wait_control(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.wait().await
+    }
+}
+
+/// Confirm that a child has exited and has been reaped. Failure deliberately
+/// carries the primary operation context so callers can leave the owned tree
+/// intact without losing the original cause.
+async fn confirm_child_exit<C: ChildControl>(
+    child: &mut C,
+    context: &str,
+    primary: &LaunchError,
+) -> Result<(), LaunchError> {
+    match child.try_wait_control() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(LaunchError::TerminationFailed(format!(
+                "{context} failed: {primary}; checking child exit before cleanup failed: {error}; \
+                 owned workspace tree retained"
+            )));
+        }
+    }
+    child.start_kill_control().map_err(|error| {
+        LaunchError::TerminationFailed(format!(
+            "{context} failed: {primary}; terminating child before cleanup failed: {error}; owned \
+             workspace tree retained"
+        ))
+    })?;
+    child.wait_control().await.map_err(|error| {
+        LaunchError::TerminationFailed(format!(
+            "{context} failed: {primary}; reaping child before cleanup failed: {error}; owned \
+             workspace tree retained"
+        ))
+    })?;
+    Ok(())
+}
+
+async fn cleanup_failed_child<C: ChildControl>(
+    child: &mut C,
+    workspace_root: &Path,
+    context: &str,
+    primary: LaunchError,
+) -> LaunchError {
+    if let Err(termination) = confirm_child_exit(child, context, &primary).await {
+        return termination;
+    }
+    match tokio::fs::remove_dir_all(workspace_root).await {
+        Ok(()) => primary,
+        Err(cleanup) => LaunchError::Io(io::Error::other(format!(
+            "{context} failed: {primary}; removing owned workspace tree: {cleanup}"
+        ))),
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -974,9 +1048,110 @@ struct SnapshotCreateBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use tokio::net::UnixListener;
+
+    struct FakeChild {
+        start_kill_error: bool,
+        wait_error: bool,
+    }
+
+    impl ChildControl for FakeChild {
+        fn try_wait_control(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn start_kill_control(&mut self) -> io::Result<()> {
+            if self.start_kill_error {
+                Err(io::Error::other("injected start_kill failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn wait_control(&mut self) -> io::Result<std::process::ExitStatus> {
+            if self.wait_error {
+                Err(io::Error::other("injected wait failure"))
+            } else {
+                Ok(std::process::ExitStatus::from_raw(0))
+            }
+        }
+    }
+
+    fn injected_primary() -> LaunchError {
+        LaunchError::Io(io::Error::other("injected primary failure"))
+    }
+
+    #[tokio::test]
+    async fn cold_cleanup_keeps_tree_when_start_kill_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owned");
+        tokio::fs::create_dir(&root).await.unwrap();
+        tokio::fs::write(root.join("sentinel"), b"live")
+            .await
+            .unwrap();
+        let mut child = FakeChild {
+            start_kill_error: true,
+            wait_error: false,
+        };
+
+        let error = cleanup_failed_child(
+            &mut child,
+            &root,
+            "Firecracker configuration",
+            injected_primary(),
+        )
+        .await;
+
+        assert!(matches!(error, LaunchError::TerminationFailed(_)));
+        assert!(error.to_string().contains("injected primary failure"));
+        assert!(
+            root.join("sentinel").exists(),
+            "live child's tree was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_cleanup_keeps_tree_when_reap_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owned");
+        tokio::fs::create_dir(&root).await.unwrap();
+        tokio::fs::write(root.join("sentinel"), b"live")
+            .await
+            .unwrap();
+        let mut child = FakeChild {
+            start_kill_error: false,
+            wait_error: true,
+        };
+
+        let error =
+            cleanup_failed_child(&mut child, &root, "snapshot restore", injected_primary()).await;
+
+        assert!(matches!(error, LaunchError::TerminationFailed(_)));
+        assert!(error.to_string().contains("injected wait failure"));
+        assert!(
+            root.join("sentinel").exists(),
+            "unreaped child's tree was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_tree_only_after_confirmed_reap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owned");
+        tokio::fs::create_dir(&root).await.unwrap();
+        let mut child = FakeChild {
+            start_kill_error: false,
+            wait_error: false,
+        };
+
+        let error = cleanup_failed_child(&mut child, &root, "restore", injected_primary()).await;
+
+        assert!(matches!(error, LaunchError::Io(_)));
+        assert!(!root.exists());
+    }
 
     /// Spawn a fake vsock-style UDS server that accepts one connection,
     /// completes the `CONNECT` handshake by writing `"OK 0\n"`, then
@@ -1344,14 +1519,13 @@ pub async fn restore(mut cfg: RestoreLaunchConfig) -> Result<Instance, LaunchErr
             // chroot still in use by a live jailer), then reap the chroot tree
             // including the GB-scale mem copy we staged.
             let mut jailed = jailed;
-            let _ = jailed.child.start_kill();
-            let _ = jailed.child.wait().await;
-            match tokio::fs::remove_dir_all(&jailed.workspace_root).await {
-                Ok(()) => Err(e),
-                Err(cleanup) => Err(LaunchError::Io(io::Error::other(format!(
-                    "snapshot restore failed: {e}; removing owned workspace tree: {cleanup}"
-                )))),
-            }
+            Err(cleanup_failed_child(
+                &mut jailed.child,
+                &jailed.workspace_root,
+                "snapshot restore",
+                e,
+            )
+            .await)
         }
     }
 }

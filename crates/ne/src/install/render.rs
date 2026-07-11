@@ -9,10 +9,6 @@
 pub struct RenderVars {
     /// UID of the `ne` service account (peer-cred auth target).
     pub ne_uid: u32,
-    /// Absolute path to the default guest kernel image.
-    pub kernel_path: String,
-    /// Absolute path to the default guest rootfs image.
-    pub rootfs_path: String,
 }
 
 const ENV_TMPL: &str = include_str!("../../templates/ne-enclave.env.tmpl");
@@ -23,10 +19,7 @@ const PRIVACY_POLICY: &str = include_str!("../../templates/privacy-policy.yaml.t
 
 /// Render the `ne-enclave.env` `EnvironmentFile`, substituting all placeholders.
 pub fn render_env(v: &RenderVars) -> String {
-    ENV_TMPL
-        .replace("__NE_UID__", &v.ne_uid.to_string())
-        .replace("__KERNEL_PATH__", &v.kernel_path)
-        .replace("__ROOTFS_PATH__", &v.rootfs_path)
+    ENV_TMPL.replace("__NE_UID__", &v.ne_uid.to_string())
 }
 
 /// Render the supervisor systemd unit (no substitutions).
@@ -53,14 +46,11 @@ mod tests {
 
     #[test]
     fn env_substitutes_all_placeholders() {
-        let out = render_env(&RenderVars {
-            ne_uid: 991,
-            kernel_path: "/var/lib/ne-enclave/images/kernels/abc/vmlinux".into(),
-            rootfs_path: "/var/lib/ne-enclave/images/rootfs/def/rootfs.img".into(),
-        });
+        let out = render_env(&RenderVars { ne_uid: 991 });
         assert!(!out.contains("__"), "unsubstituted placeholder: {out}");
         assert!(out.contains("NE_SUPERVISOR_PEER_UID=991"));
-        assert!(out.contains("/images/kernels/abc/vmlinux"));
+        assert!(!out.contains("NE_KERNEL_PATH"));
+        assert!(!out.contains("NE_ROOTFS_PATH"));
         assert!(out.contains("NE_DEV_MODE=true"));
     }
 

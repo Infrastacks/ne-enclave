@@ -65,7 +65,7 @@ async fn resolver_uses_only_fixed_managed_paths() {
 
 - [ ] **Step 2: Run the focused tests and verify RED**
 
-Run: `cargo test -p ne-supervisor image::tests -- --nocapture`  
+Run: `cargo test -p ne-supervisor image::tests -- --nocapture`
 Expected: compilation fails because `ImageDigest`, `ImageStore`, and related types do not exist.
 
 - [ ] **Step 3: Implement canonical parsing and managed resolution**
@@ -176,14 +176,14 @@ Also test symlink rejection, canonical escape rejection, non-regular rejection, 
 
 `VerifiedImageFile::stage` must seek to byte zero, open the destination with `write(true).create_new(true).mode(mode)`, copy from the retained handle, flush, `chown` the destination to the jailer uid/gid, set the exact final mode, and remove the destination on any post-create error. No call to `hard_link` is permitted.
 
-Run: `cargo test -p ne-supervisor image::tests -- --nocapture`  
+Run: `cargo test -p ne-supervisor image::tests -- --nocapture`
 Expected: all image-module tests pass.
 
 - [ ] **Step 6: Run crate verification and commit**
 
-Run: `cargo fmt --all -- --check`  
-Run: `cargo clippy -p ne-supervisor --all-targets -- -D warnings`  
-Run: `cargo test -p ne-supervisor --all-targets`  
+Run: `cargo fmt --all -- --check`
+Run: `cargo clippy -p ne-supervisor --all-targets -- -D warnings`
+Run: `cargo test -p ne-supervisor --all-targets`
 Expected: all commands exit 0.
 
 Commit:
@@ -242,8 +242,8 @@ Add serialization tests for `InvalidImageDigest`, `ImageNotFound`, `ImageRejecte
 
 - [ ] **Step 2: Run protocol/API tests and verify RED**
 
-Run: `cargo test -p ne-protocol supervisor::tests`  
-Run: `cargo test -p ne-api --lib`  
+Run: `cargo test -p ne-protocol supervisor::tests`
+Run: `cargo test -p ne-api --lib`
 Expected: compile failures for missing digest fields and error variants.
 
 - [ ] **Step 3: Replace path fields end-to-end**
@@ -266,10 +266,10 @@ Warm-pool and confidential paths accept both digests empty. Reject a half-presen
 
 - [ ] **Step 6: Verify GREEN and absence of path fields**
 
-Run: `cargo test -p ne-protocol`  
-Run: `cargo test -p ne-api --all-targets`  
-Run: `cargo test -p ne-supervisor --all-targets`  
-Run: `rg -n "kernel_image_path|rootfs_image_path|hard_link\(" proto crates/ne-protocol crates/ne-api crates/ne-supervisor crates/ne`  
+Run: `cargo test -p ne-protocol`
+Run: `cargo test -p ne-api --all-targets`
+Run: `cargo test -p ne-supervisor --all-targets`
+Run: `rg -n "kernel_image_path|rootfs_image_path|hard_link\(" proto crates/ne-protocol crates/ne-api crates/ne-supervisor crates/ne`
 Expected: tests exit 0; search returns no public-contract or staging matches (historical migration documentation may be listed separately and adjudicated).
 
 - [ ] **Step 7: Commit**
@@ -324,8 +324,8 @@ Assert serialized JSON contains both digest names and contains neither `kernel_p
 
 - [ ] **Step 2: Run snapshot tests and verify RED**
 
-Run: `cargo test -p ne-protocol snapshot::tests`  
-Run: `cargo test -p ne-supervisor snapshot::tests`  
+Run: `cargo test -p ne-protocol snapshot::tests`
+Run: `cargo test -p ne-supervisor snapshot::tests`
 Expected: compile failures until the v5 fields and call sites exist.
 
 - [ ] **Step 3: Implement manifest and capture changes**
@@ -342,10 +342,10 @@ After pinned manifest verification and before `firecracker::restore`, call the s
 
 - [ ] **Step 6: Verify and commit**
 
-Run: `cargo test -p ne-protocol snapshot`  
-Run: `cargo test -p ne-supervisor --all-targets`  
-Run: `cargo test -p ne-enclave --all-targets`  
-Run: `rg -n "kernel_path|rootfs_path" crates/ne-protocol/src/snapshot.rs crates/ne-supervisor/src`  
+Run: `cargo test -p ne-protocol snapshot`
+Run: `cargo test -p ne-supervisor --all-targets`
+Run: `cargo test -p ne-enclave --all-targets`
+Run: `rg -n "kernel_path|rootfs_path" crates/ne-protocol/src/snapshot.rs crates/ne-supervisor/src`
 Expected: all tests exit 0 and search returns no snapshot/instance path fields.
 
 Commit:
@@ -380,8 +380,8 @@ Python assertions must call `create_workspace(kernel_sha256="11" * 32, rootfs_sh
 
 - [ ] **Step 2: Run SDK tests and verify RED**
 
-Run: `python3 -m pytest -q sdk/python/tests/test_client.py`  
-Run: `npm test -- --run` from `sdk/typescript`  
+Run: `python3 -m pytest -q sdk/python/tests/test_client.py`
+Run: `npm test -- --run` from `sdk/typescript`
 Expected: failures because clients still expose path parameters.
 
 - [ ] **Step 3: Regenerate bindings and update clients**
@@ -390,9 +390,9 @@ Run `sdk/python/scripts/codegen.sh` and `sdk/typescript/codegen.sh` from the rep
 
 - [ ] **Step 4: Verify generated drift and GREEN**
 
-Run: `python3 -m pytest -q sdk/python/tests/test_client.py`  
-Run from `sdk/typescript`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`  
-Run: `rg -n "kernel_image_path|rootfs_image_path|kernelImagePath|rootfsImagePath" sdk/python sdk/typescript`  
+Run: `python3 -m pytest -q sdk/python/tests/test_client.py`
+Run from `sdk/typescript`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`
+Run: `rg -n "kernel_image_path|rootfs_image_path|kernelImagePath|rootfsImagePath" sdk/python sdk/typescript`
 Expected: tests/builds exit 0 and search returns no API or generated-field matches.
 
 - [ ] **Step 5: Commit**
@@ -431,8 +431,8 @@ LangChain tests must set `NE_KERNEL_SHA256` / `NE_ROOTFS_SHA256`, assert digest 
 
 - [ ] **Step 2: Run adapter tests and verify RED**
 
-Run: `python3 -m pytest -q sdk/python-langchain/tests`  
-Run from `sdk/typescript-mastra`: `npm test -- --run`  
+Run: `python3 -m pytest -q sdk/python-langchain/tests`
+Run from `sdk/typescript-mastra`: `npm test -- --run`
 Expected: failures while adapters still read path names.
 
 - [ ] **Step 3: Update adapters and examples**
@@ -445,9 +445,9 @@ Change all create examples to use the SHA-256 values emitted by `nee image impor
 
 - [ ] **Step 5: Verify adapters and repository-wide absence**
 
-Run: `python3 -m pytest -q sdk/python-langchain/tests`  
-Run from `sdk/typescript-mastra`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`  
-Run: `rg -n "kernel_image_path|rootfs_image_path|kernelImagePath|rootfsImagePath|NE_KERNEL_IMAGE_PATH|NE_ROOTFS_IMAGE_PATH" --glob '!docs/superpowers/**' .`  
+Run: `python3 -m pytest -q sdk/python-langchain/tests`
+Run from `sdk/typescript-mastra`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`
+Run: `rg -n "kernel_image_path|rootfs_image_path|kernelImagePath|rootfsImagePath|NE_KERNEL_IMAGE_PATH|NE_ROOTFS_IMAGE_PATH" --glob '!docs/superpowers/**' .`
 Expected: adapter checks exit 0; remaining search hits exist only in an explicit release-note sentence naming removed fields, if retained.
 
 - [ ] **Step 6: Commit**
@@ -470,16 +470,16 @@ git commit -m "docs: migrate image workflows to managed digests"
 
 - [ ] **Step 1: Run formatting, lint, and all Rust targets**
 
-Run: `cargo fmt --all -- --check`  
-Run: `cargo clippy --workspace --all-targets -- -D warnings`  
-Run: `cargo test --workspace --all-targets`  
+Run: `cargo fmt --all -- --check`
+Run: `cargo clippy --workspace --all-targets -- -D warnings`
+Run: `cargo test --workspace --all-targets`
 Expected: all commands exit 0 with zero failures.
 
 - [ ] **Step 2: Run every SDK and adapter gate**
 
-Run: `python3 -m pytest -q sdk/python/tests sdk/python-langchain/tests`  
-Run from `sdk/typescript`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`  
-Run from `sdk/typescript-mastra`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`  
+Run: `python3 -m pytest -q sdk/python/tests sdk/python-langchain/tests`
+Run from `sdk/typescript`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`
+Run from `sdk/typescript-mastra`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`
 Expected: all commands exit 0.
 
 - [ ] **Step 3: Verify security invariants by search and diff**

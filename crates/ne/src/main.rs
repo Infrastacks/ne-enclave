@@ -159,6 +159,10 @@ async fn main() -> Result<()> {
                 rootfs_sha256,
                 prefix,
             } => {
+                // Validate the complete pair before either import can mutate the store.
+                install::image::validate_sha256(&kernel_sha256)?;
+                install::image::validate_sha256(&rootfs_sha256)?;
+                let fakeroot = prefix.is_some();
                 let root = prefix.unwrap_or_else(|| "/".into());
                 let layout = install::layout::Layout::new(root);
                 install::image::import_artifact(
@@ -175,6 +179,7 @@ async fn main() -> Result<()> {
                     &rootfs,
                     &rootfs_sha256,
                 )?;
+                install::image::harden_store(&layout.images_dir(), fakeroot)?;
                 Ok(())
             }
         },

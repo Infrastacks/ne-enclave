@@ -6,6 +6,7 @@
 #![allow(unreachable_pub)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -19,10 +20,23 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
-/// Verify `path` matches `expected_hex` (case-insensitive).
+/// Validate the canonical external digest grammar.
+pub fn validate_sha256(expected_hex: &str) -> Result<()> {
+    anyhow::ensure!(
+        expected_hex.len() == 64
+            && expected_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid SHA-256 digest: expected exactly 64 lowercase hexadecimal characters"
+    );
+    Ok(())
+}
+
+/// Verify `path` matches the canonical expected digest.
 pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
+    validate_sha256(expected_hex)?;
     let got = sha256_file(path)?;
-    if got.eq_ignore_ascii_case(expected_hex) {
+    if got == expected_hex {
         Ok(())
     } else {
         anyhow::bail!(
@@ -43,13 +57,72 @@ pub fn import_artifact(
     src: &Path,
     expected_hex: &str,
 ) -> Result<PathBuf> {
+    // Validate before reading the source or creating any store directory.
+    validate_sha256(expected_hex)?;
     verify_sha256(src, expected_hex)?;
     let dir = images_dir.join(kind).join(expected_hex);
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {} 755", dir.display()))?;
     let dest = dir.join(filename);
     fs::copy(src, &dest)
         .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o444))
+        .with_context(|| format!("chmod {} 444", dest.display()))?;
     Ok(dest)
+}
+
+/// Recursively enforce the managed store's non-writable install posture.
+/// Symlinks and unexpected special files fail closed rather than being followed.
+pub fn harden_store(images_dir: &Path, fakeroot: bool) -> Result<()> {
+    harden_entry(images_dir, fakeroot)
+}
+
+fn harden_entry(path: &Path, fakeroot: bool) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect managed image path {}", path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "managed image store contains symlink {}",
+        path.display()
+    );
+    if metadata.is_dir() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod {} 755", path.display()))?;
+        harden_owner(path, fakeroot)?;
+        for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+            harden_entry(&entry?.path(), fakeroot)?;
+        }
+    } else {
+        anyhow::ensure!(
+            metadata.is_file(),
+            "managed image store contains non-regular file {}",
+            path.display()
+        );
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444))
+            .with_context(|| format!("chmod {} 444", path.display()))?;
+        harden_owner(path, fakeroot)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn harden_owner(path: &Path, fakeroot: bool) -> Result<()> {
+    if !fakeroot {
+        nix::unistd::chown(
+            path,
+            Some(nix::unistd::Uid::from_raw(0)),
+            Some(nix::unistd::Gid::from_raw(0)),
+        )
+        .with_context(|| format!("chown {} root:root", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn harden_owner(_path: &Path, _fakeroot: bool) -> Result<()> {
+    Ok(())
 }
 
 /// The default guest image shipped with this release. Digests are filled
@@ -89,6 +162,7 @@ pub fn curl_download(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn verify_rejects_wrong_digest() {
@@ -108,5 +182,33 @@ mod tests {
         let dest = import_artifact(&images, "kernels", "vmlinux", &src, &digest).unwrap();
         assert!(dest.ends_with(format!("kernels/{digest}/vmlinux")));
         assert!(dest.exists());
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_eq!(
+            fs::metadata(dest.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn import_rejects_noncanonical_digest_before_mutating_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("vmlinux");
+        fs::write(&src, b"kernel-bytes").unwrap();
+        let images = dir.path().join("images");
+
+        for digest in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+            assert!(
+                import_artifact(&images, "kernels", "vmlinux", &src, &digest).is_err(),
+                "accepted {digest}"
+            );
+            assert!(!images.exists(), "invalid digest mutated the image store");
+        }
     }
 }
