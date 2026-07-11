@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use ne_protocol::guest::{GuestErrorKind, GuestResponse};
 use ne_supervisor::firecracker::{
     GuestRpcError, LaunchConfig, launch, run_command_via_vsock, terminate,
 };
@@ -76,7 +77,11 @@ async fn firecracker_host_timeout() {
     let elapsed = start.elapsed();
     match result {
         Err(GuestRpcError::Timeout(100)) => {}
-        other => panic!("expected Timeout(100), got {other:?}"),
+        Ok(GuestResponse::Error {
+            kind: GuestErrorKind::Timeout,
+            ..
+        }) => {}
+        other => panic!("expected host or guest timeout, got {other:?}"),
     }
     assert!(
         elapsed < Duration::from_millis(800),
