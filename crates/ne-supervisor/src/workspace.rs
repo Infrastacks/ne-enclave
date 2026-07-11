@@ -2989,8 +2989,9 @@ fn guest_kind_to_supervisor_kind(kind: GuestErrorKind) -> SupervisorErrorKind {
 #[cfg(target_os = "linux")]
 mod tests {
     use super::{
-        NonceRing, WorkspaceExec, WorkspaceManager, WorkspaceManagerConfig, compose_boot_args,
-        guest_kind_to_supervisor_kind, is_valid_workspace_id,
+        ImageError, ImageKind, NonceRing, PathBuf, WorkspaceExec, WorkspaceManager,
+        WorkspaceManagerConfig, compose_boot_args, guest_kind_to_supervisor_kind,
+        is_valid_workspace_id, restore_launch_error_response,
     };
     use ne_protocol::guest::GuestErrorKind as G;
     use ne_protocol::supervisor::{
