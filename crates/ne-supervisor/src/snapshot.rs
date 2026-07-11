@@ -15,6 +15,7 @@ use ne_protocol::snapshot::{
     verify_manifest_signature, verify_manifest_signature_pinned,
 };
 use ne_protocol::supervisor::SnapshotInfo;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
@@ -124,7 +125,27 @@ pub async fn write_manifest(
 /// (never silently treated as absent — the 6.6 audit lesson).
 pub async fn read_manifest(snapshot_dir: &Path) -> Result<SnapshotManifest, SnapshotError> {
     let bytes = tokio::fs::read(snapshot_dir.join("manifest.json")).await?;
-    Ok(serde_json::from_slice(&bytes)?)
+    parse_manifest(&bytes)
+}
+
+#[derive(Deserialize)]
+struct ManifestVersionEnvelope {
+    manifest_version: u32,
+}
+
+/// Parse the version envelope before the strict v5 schema so an authentic old
+/// manifest receives the stable unsupported-version error instead of a
+/// misleading missing-field serde error.
+fn parse_manifest(bytes: &[u8]) -> Result<SnapshotManifest, SnapshotError> {
+    let envelope: ManifestVersionEnvelope = serde_json::from_slice(bytes)?;
+    if envelope.manifest_version != MANIFEST_VERSION {
+        return Err(ne_protocol::snapshot::VerifyError::UnsupportedVersion {
+            got: envelope.manifest_version,
+            supported: MANIFEST_VERSION,
+        }
+        .into());
+    }
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 /// **Integrity-only** end-to-end check: signature + snapshot artifact hashes.
@@ -187,6 +208,43 @@ async fn check_artifact_hashes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authentic_v4_json(signer: &SigningKey) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "manifest_version": 4,
+            "snapshot_id": "01J0V4",
+            "created_from_workspace_id": "ws-v4",
+            "firecracker_version": "1.7.0",
+            "mem_sha256": "11",
+            "vmstate_sha256": "22",
+            "rootfs_path": "/managed/rootfs.img",
+            "rootfs_sha256": "44",
+            "guest_identity": {
+                "hostname": "ws-v4",
+                "mac": "unset",
+                "guest_vsock_cid": 3,
+                "vcpu_count": 1,
+                "mem_size_mib": 128
+            },
+            "kernel_boot_args": "console=ttyS0",
+            "kernel_path": "/managed/vmlinux",
+            "signer_pubkey_b64": B64.encode(signer.verifying_key().as_bytes()),
+            "signature_b64": ""
+        });
+        let object = value.as_object().expect("v4 object");
+        let mut canonical: std::collections::BTreeMap<String, serde_json::Value> = object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "signature_b64")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        canonical.insert(
+            "ctx".into(),
+            serde_json::Value::String(ne_protocol::snapshot::SNAPSHOT_DOMAIN_TAG.into()),
+        );
+        let signature = signer.sign(&serde_json::to_vec(&canonical).expect("v4 canonical"));
+        value["signature_b64"] = serde_json::Value::String(B64.encode(signature.to_bytes()));
+        value
+    }
 
     async fn write_managed_image(
         store: &Path,
@@ -254,6 +312,69 @@ mod tests {
         assert_eq!(m.kernel_sha256, "33".repeat(32));
         assert_eq!(m.rootfs_sha256, "44".repeat(32));
         manifest_matches_hashes(&m, &mem_h, &vm_h).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_manifest_reports_v4_before_deserializing_v5_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = SigningKey::from_bytes(&[3u8; 32]);
+        tokio::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&authentic_v4_json(&signer)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let error = read_manifest(dir.path()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotError::Verify(ne_protocol::snapshot::VerifyError::UnsupportedVersion {
+                got: 4,
+                supported: 5
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn signed_v5_with_injected_path_field_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("mem"), b"MEM")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("vmstate"), b"VM")
+            .await
+            .unwrap();
+        let signer = SigningKey::from_bytes(&[3u8; 32]);
+        write_manifest(
+            dir.path(),
+            &signer,
+            "01J0SNAP",
+            "ws-a",
+            "1.7.0",
+            &"33".repeat(32),
+            &"44".repeat(32),
+            GuestIdentity {
+                hostname: "ws-a".into(),
+                mac: "unset".into(),
+                guest_vsock_cid: 3,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+            },
+            "console=ttyS0",
+        )
+        .await
+        .unwrap();
+        let path = dir.path().join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        value["kernel_path"] = serde_json::json!("/attacker/kernel");
+        value["rootfs_path"] = serde_json::json!("/attacker/rootfs");
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap())
+            .await
+            .unwrap();
+
+        let error = verify_artifact(dir.path()).await.unwrap_err();
+        assert!(matches!(error, SnapshotError::Serde(_)));
     }
 
     #[tokio::test]

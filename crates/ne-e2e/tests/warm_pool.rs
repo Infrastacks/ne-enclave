@@ -75,12 +75,10 @@ async fn build_base_snapshot(
     src_id: &str,
 ) {
     let image_store = state_dir.join("images");
-    let (kernel_sha256, rootfs_sha256, verified_images) =
+    let (_, _, verified_images) =
         ne_e2e::resolve_managed_images(&image_store, &env.kernel, &env.rootfs).await;
     let src = launch(LaunchConfig {
         workspace_id: src_id.to_string(),
-        kernel_sha256,
-        rootfs_sha256,
         verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,

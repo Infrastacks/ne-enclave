@@ -144,9 +144,9 @@ pub struct VerifiedImageFile {
 /// A verified kernel and root filesystem pair.
 pub struct VerifiedImagePair {
     /// Verified kernel image.
-    pub kernel: VerifiedImageFile,
+    kernel: VerifiedImageFile,
     /// Verified root filesystem image.
-    pub rootfs: VerifiedImageFile,
+    rootfs: VerifiedImageFile,
 }
 
 impl ImageStore {
@@ -316,6 +316,13 @@ impl VerifiedImageFile {
             digest: self.digest.as_str().to_owned(),
             source,
         }
+    }
+}
+
+impl VerifiedImagePair {
+    /// Returns the content identities verified through the retained handles.
+    pub fn digests(&self) -> (&str, &str) {
+        (self.kernel.digest().as_str(), self.rootfs.digest().as_str())
     }
 }
 
@@ -544,6 +551,39 @@ mod tests {
         let store = ImageStore::new(temp.path().to_path_buf());
         let verified = store.resolve(ImageKind::Kernel, &digest).await.unwrap();
         assert_eq!(verified.digest().as_str(), digest);
+    }
+
+    #[tokio::test]
+    async fn verified_pair_reports_the_digests_bound_to_its_handles() {
+        use sha2::Digest as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
+        let rootfs_digest = hex::encode(sha2::Sha256::digest(b"rootfs"));
+        let kernel = dir
+            .path()
+            .join("kernels")
+            .join(&kernel_digest)
+            .join("vmlinux");
+        let rootfs = dir
+            .path()
+            .join("rootfs")
+            .join(&rootfs_digest)
+            .join("rootfs.img");
+        tokio::fs::create_dir_all(kernel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(rootfs.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(kernel, b"kernel").await.unwrap();
+        tokio::fs::write(rootfs, b"rootfs").await.unwrap();
+        let store = ImageStore::new(dir.path().to_path_buf());
+        let pair = store
+            .resolve_pair(&kernel_digest, &rootfs_digest)
+            .await
+            .unwrap();
+        assert_eq!(pair.digests(), (&*kernel_digest, &*rootfs_digest));
     }
 
     #[tokio::test]

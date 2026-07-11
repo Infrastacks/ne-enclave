@@ -309,6 +309,21 @@ fn configuration_measurement(
     ne_attestation::Measurement(digest.into())
 }
 
+/// Reject snapshot configurations that v5 cannot restore faithfully. This is
+/// pure so callers can run it before pausing a VM or allocating artifacts.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn snapshot_preflight(rootfs_read_only: bool, networked: bool) -> Result<(), &'static str> {
+    if !rootfs_read_only {
+        return Err(
+            "snapshot of writable-rootfs workspaces is not supported; create the workspace with rootfs_read_only=true",
+        );
+    }
+    if networked {
+        return Err("snapshot of networked workspaces is not supported in this build");
+    }
+    Ok(())
+}
+
 /// Compute the v1 configuration measurement for a running instance.
 /// Hashes stable launch metadata without per-request file I/O.
 #[cfg(target_os = "linux")]
@@ -325,7 +340,7 @@ fn measure_config(inst: &crate::firecracker::Instance) -> ne_attestation::Measur
 
 #[cfg(test)]
 mod measurement_tests {
-    use super::configuration_measurement;
+    use super::{configuration_measurement, snapshot_preflight};
 
     #[test]
     fn configuration_measurement_binds_both_image_digests() {
@@ -355,6 +370,21 @@ mod measurement_tests {
         );
         assert_ne!(baseline, other_kernel);
         assert_ne!(baseline, other_rootfs);
+    }
+
+    #[test]
+    fn writable_snapshot_preflight_rejects_before_state_or_artifact_changes() {
+        for live in [false, true] {
+            let lifecycle = ne_protocol::supervisor::WorkspaceState::Running;
+            let artifact_published = false;
+            let error = snapshot_preflight(false, false).unwrap_err();
+            assert_eq!(
+                error,
+                "snapshot of writable-rootfs workspaces is not supported; create the workspace with rootfs_read_only=true"
+            );
+            assert_eq!(lifecycle, ne_protocol::supervisor::WorkspaceState::Running);
+            assert!(!artifact_published, "live={live}");
+        }
     }
 }
 
@@ -755,8 +785,6 @@ impl WorkspaceManager {
 
         let cfg = crate::firecracker::LaunchConfig {
             workspace_id: req.workspace_id.clone(),
-            kernel_sha256: req.kernel_sha256.clone(),
-            rootfs_sha256: req.rootfs_sha256.clone(),
             verified_images,
             rootfs_read_only: req.rootfs_read_only,
             vcpu_count: req.vcpu_count,
@@ -1816,6 +1844,19 @@ impl WorkspaceManager {
                 }
             };
 
+            // Reject before live-state checks, pause, snapshot_create, or
+            // destination allocation. A writable rootfs may have diverged from
+            // its managed source digest and v5 intentionally has no disk-capture
+            // schema, so publishing such a snapshot would be unsound.
+            if let Err(reason) =
+                snapshot_preflight(instance.rootfs_read_only, instance.network_slot.is_some())
+            {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::SnapshotFailed,
+                    message: format!("workspace {}: {reason}", req.workspace_id),
+                };
+            }
+
             // Live snapshot requires a running source (it keeps the source live).
             if req.live && instance.lifecycle_state != WorkspaceState::Running {
                 return SupervisorResponse::Error {
@@ -1823,21 +1864,6 @@ impl WorkspaceManager {
                     message: format!(
                         "live snapshot requires a running workspace; {} is {:?}",
                         req.workspace_id, instance.lifecycle_state
-                    ),
-                };
-            }
-
-            // Reject snapshotting a networked source: restore is non-networked
-            // only (FC bakes the host TAP name into vmstate, so a restored VM
-            // would reference a TAP that doesn't exist). Fail at capture time
-            // rather than producing an artifact that can never be restored.
-            if instance.network_slot.is_some() {
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::SnapshotFailed,
-                    message: format!(
-                        "workspace {} has networking; snapshot of networked workspaces is \
-                         not supported in this build",
-                        req.workspace_id
                     ),
                 };
             }
@@ -2129,8 +2155,6 @@ impl WorkspaceManager {
 
         let launch_cfg = crate::firecracker::LaunchConfig {
             workspace_id: new_workspace_id.to_string(),
-            kernel_sha256: manifest.kernel_sha256.clone(),
-            rootfs_sha256: manifest.rootfs_sha256.clone(),
             verified_images,
             rootfs_read_only: true,
             vcpu_count: manifest.guest_identity.vcpu_count,
@@ -2959,13 +2983,13 @@ fn guest_kind_to_supervisor_kind(kind: GuestErrorKind) -> SupervisorErrorKind {
 #[cfg(target_os = "linux")]
 mod tests {
     use super::{
-        NonceRing, WorkspaceManager, WorkspaceManagerConfig, compose_boot_args,
+        NonceRing, WorkspaceExec, WorkspaceManager, WorkspaceManagerConfig, compose_boot_args,
         guest_kind_to_supervisor_kind, is_valid_workspace_id,
     };
     use ne_protocol::guest::GuestErrorKind as G;
     use ne_protocol::supervisor::{
-        CreateWorkspaceRequest, ForkRequest, RestoreRequest, SupervisorErrorKind as S,
-        SupervisorResponse, WorkspaceRef,
+        CreateWorkspaceRequest, ForkRequest, RestoreRequest, SnapshotRequest,
+        SupervisorErrorKind as S, SupervisorResponse, WorkspaceRef, WorkspaceState,
     };
 
     use crate::audit::AuditLog;
@@ -3139,6 +3163,63 @@ mod tests {
             ),
             "expected Unsupported (deferred), got {resp:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn writable_snapshot_rejection_preserves_running_state_and_publishes_nothing() {
+        let mgr = test_manager().await;
+        for live in [false, true] {
+            let id = format!("writable-{live}");
+            let child = tokio::process::Command::new("/usr/bin/true")
+                .spawn()
+                .expect("spawn harmless child");
+            mgr.instances.lock().await.insert(
+                id.clone(),
+                WorkspaceExec::Firecracker(crate::firecracker::Instance {
+                    workspace_id: id.clone(),
+                    child,
+                    firecracker_pid: 1,
+                    api_socket_host: PathBuf::from("/unused/api.sock"),
+                    vsock_host_socket: PathBuf::from("/unused/vsock.sock"),
+                    jailer_chroot: PathBuf::from("/unused/chroot"),
+                    jailer_uid: 1000,
+                    jailer_gid: 1000,
+                    lifecycle_state: WorkspaceState::Running,
+                    network_slot: None,
+                    guest_vsock_cid: 3,
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    kernel_boot_args: "console=ttyS0".into(),
+                    kernel_sha256: "11".repeat(32),
+                    rootfs_sha256: "22".repeat(32),
+                    rootfs_read_only: false,
+                }),
+            );
+
+            let response = mgr
+                .snapshot(SnapshotRequest {
+                    workspace_id: id.clone(),
+                    live,
+                })
+                .await;
+            assert!(matches!(
+                response,
+                SupervisorResponse::Error {
+                    kind: S::SnapshotFailed,
+                    ref message,
+                } if message.contains("writable-rootfs")
+            ));
+            let guard = mgr.instances.lock().await;
+            let Some(WorkspaceExec::Firecracker(instance)) = guard.get(&id) else {
+                panic!("writable instance must remain registered");
+            };
+            assert_eq!(instance.lifecycle_state, WorkspaceState::Running);
+            drop(guard);
+            assert!(
+                !mgr.cfg.state_dir.join("snapshots").exists(),
+                "live={live}: rejection must occur before artifact publication"
+            );
+        }
     }
 
     #[tokio::test]

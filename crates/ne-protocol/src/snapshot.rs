@@ -47,6 +47,7 @@ pub const SNAPSHOT_DOMAIN_TAG: &str = "ne-enclave-snapshot-v1";
 /// (nested objects are not key-sorted). Reordering fields breaks
 /// verification of existing signatures — bump `MANIFEST_VERSION` if you must.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuestIdentity {
     /// Hostname assigned to the guest.
     pub hostname: String,
@@ -62,6 +63,7 @@ pub struct GuestIdentity {
 
 /// The signed snapshot descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotManifest {
     /// Manifest schema version; must equal [`MANIFEST_VERSION`].
     pub manifest_version: u32,
@@ -421,5 +423,17 @@ mod tests {
         assert!(json.contains("\"rootfs_sha256\""));
         assert!(!json.contains(&["kernel", "path"].join("_")));
         assert!(!json.contains(&["rootfs", "path"].join("_")));
+    }
+
+    #[test]
+    fn v5_manifest_rejects_unknown_fields() {
+        let signer = SigningKey::from_bytes(&[7u8; 32]);
+        let mut value = serde_json::to_value(sample(&signer)).expect("manifest value");
+        value
+            .as_object_mut()
+            .expect("manifest object")
+            .insert("kernel_path".into(), serde_json::json!("/host/vmlinux"));
+        let error = serde_json::from_value::<SnapshotManifest>(value).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 }

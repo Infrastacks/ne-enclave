@@ -14,8 +14,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ne_attestation::{Evidence, Measurement, Nonce};
-use ne_protocol::snapshot::SnapshotManifest;
+use ne_protocol::snapshot::{MANIFEST_VERSION, SnapshotManifest};
 use rand::RngCore;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -30,6 +31,22 @@ const SEALED_MEM: &str = "mem.sealed";
 const SEALED_VMSTATE: &str = "vmstate.sealed";
 const SEAL_JSON: &str = "seal.json";
 const MANIFEST_JSON: &str = "manifest.json";
+
+#[derive(Deserialize)]
+struct ManifestVersionEnvelope {
+    manifest_version: u32,
+}
+
+fn parse_snapshot_manifest(bytes: &[u8]) -> Result<SnapshotManifest, SealError> {
+    let envelope: ManifestVersionEnvelope = serde_json::from_slice(bytes)?;
+    if envelope.manifest_version != MANIFEST_VERSION {
+        return Err(SealError::UnsupportedVersion {
+            got: envelope.manifest_version,
+            supported: MANIFEST_VERSION,
+        });
+    }
+    Ok(serde_json::from_slice(bytes)?)
+}
 
 /// SHA-256 hex of a manifest's canonical bytes (the seal↔manifest binding value).
 pub fn manifest_canonical_sha256(m: &SnapshotManifest) -> Result<String, SealError> {
@@ -233,8 +250,7 @@ pub async fn unseal_artifacts(
 ) -> Result<(), SealError> {
     // 1. Manifest (pinned to the host key).
     let manifest_bytes = tokio::fs::read(snapshot_dir.join(MANIFEST_JSON)).await?;
-    let manifest: SnapshotManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(SealError::Serde)?;
+    let manifest = parse_snapshot_manifest(&manifest_bytes)?;
     ne_protocol::snapshot::verify_manifest_signature_pinned(&manifest, host_vk)
         .map_err(|_| SealError::SignatureMismatch)?;
     // 2. Seal (pinned to the SAME host key).

@@ -66,8 +66,6 @@ async fn cfg_for(
         .expect("resolve managed fork images");
     LaunchConfig {
         workspace_id: id.to_string(),
-        kernel_sha256: kernel_sha256.to_string(),
-        rootfs_sha256: rootfs_sha256.to_string(),
         verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,

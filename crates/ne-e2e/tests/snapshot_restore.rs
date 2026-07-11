@@ -107,8 +107,6 @@ async fn snapshot_restore_roundtrip() {
         .expect("resolve source images");
     let cfg_a = LaunchConfig {
         workspace_id: "snap-src".to_string(),
-        kernel_sha256: kernel_sha256.clone(),
-        rootfs_sha256: rootfs_sha256.clone(),
         verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
@@ -201,8 +199,6 @@ async fn snapshot_restore_roundtrip() {
         .expect("resolve restore images");
     let cfg_b = LaunchConfig {
         workspace_id: "snap-dst".to_string(),
-        kernel_sha256,
-        rootfs_sha256,
         verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
@@ -285,12 +281,10 @@ async fn in_place_resume_breaks_vsock_known_limitation() {
     assert!(jailer.is_file(), "jailer not found at {}", jailer.display());
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (kernel_sha256, rootfs_sha256, verified_images) =
+    let (_, _, verified_images) =
         ne_e2e::resolve_managed_images(&tmp.path().join("images"), &kernel, &rootfs).await;
     let cfg = LaunchConfig {
         workspace_id: "in-place-resume-limitation".to_string(),
-        kernel_sha256,
-        rootfs_sha256,
         verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,

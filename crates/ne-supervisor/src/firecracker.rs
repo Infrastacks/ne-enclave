@@ -41,10 +41,6 @@ pub struct LaunchConfig {
     /// Opaque identifier for the workspace; jailer uses this as the
     /// chroot subdirectory name.
     pub workspace_id: String,
-    /// Canonical managed kernel content identity.
-    pub kernel_sha256: String,
-    /// Canonical managed rootfs content identity.
-    pub rootfs_sha256: String,
     /// Retained, verified source handles. All launch and restore paths must
     /// resolve these before any workspace tree is claimed.
     pub verified_images: VerifiedImagePair,
@@ -135,6 +131,9 @@ pub struct Instance {
     pub kernel_sha256: String,
     /// Canonical managed rootfs content identity.
     pub rootfs_sha256: String,
+    /// Whether the rootfs was launched read-only. Writable-rootfs instances
+    /// cannot be snapshotted because v5 does not capture disk mutations.
+    pub rootfs_read_only: bool,
 }
 
 /// Errors returned by [`launch`].
@@ -341,6 +340,9 @@ pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
     if !is_valid_jailer_id(&cfg.workspace_id) {
         return Err(LaunchError::InvalidWorkspaceId(cfg.workspace_id));
     }
+    let (kernel_sha256, rootfs_sha256) = cfg.verified_images.digests();
+    let kernel_sha256 = kernel_sha256.to_owned();
+    let rootfs_sha256 = rootfs_sha256.to_owned();
     let mut jailed = spawn_jailed_firecracker(&mut cfg).await?;
 
     // Configure the microVM. The order here matters: machine-config
@@ -451,8 +453,9 @@ pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
         vcpu_count: cfg.vcpu_count,
         mem_size_mib: cfg.mem_size_mib,
         kernel_boot_args: cfg.kernel_boot_args,
-        kernel_sha256: cfg.kernel_sha256,
-        rootfs_sha256: cfg.rootfs_sha256,
+        kernel_sha256,
+        rootfs_sha256,
+        rootfs_read_only: cfg.rootfs_read_only,
     })
 }
 
@@ -1253,6 +1256,9 @@ pub async fn restore(mut cfg: RestoreLaunchConfig) -> Result<Instance, LaunchErr
     if cfg.launch.network.is_some() {
         return Err(LaunchError::NetworkedRestoreUnsupported);
     }
+    let (kernel_sha256, rootfs_sha256) = cfg.launch.verified_images.digests();
+    let kernel_sha256 = kernel_sha256.to_owned();
+    let rootfs_sha256 = rootfs_sha256.to_owned();
     // Boot the jailed FC (stages rootfs+kernel, waits for api socket).
     let jailed = spawn_jailed_firecracker(&mut cfg.launch).await?;
 
@@ -1328,8 +1334,9 @@ pub async fn restore(mut cfg: RestoreLaunchConfig) -> Result<Instance, LaunchErr
                 vcpu_count: cfg.launch.vcpu_count,
                 mem_size_mib: cfg.launch.mem_size_mib,
                 kernel_boot_args: cfg.launch.kernel_boot_args,
-                kernel_sha256: cfg.launch.kernel_sha256,
-                rootfs_sha256: cfg.launch.rootfs_sha256,
+                kernel_sha256,
+                rootfs_sha256,
+                rootfs_read_only: cfg.launch.rootfs_read_only,
             })
         }
         Err(e) => {
