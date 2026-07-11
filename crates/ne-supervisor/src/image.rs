@@ -230,6 +230,17 @@ impl VerifiedImageFile {
         uid: u32,
         gid: u32,
     ) -> Result<(), ImageError> {
+        let mode_is_valid = match self.kind {
+            ImageKind::Kernel => mode == 0o400,
+            ImageKind::Rootfs => matches!(mode, 0o400 | 0o600),
+        };
+        if !mode_is_valid {
+            return Err(self.stage_error(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid mode {mode:#o} for {} image", self.kind),
+            )));
+        }
+
         self.file
             .rewind()
             .await
@@ -268,18 +279,28 @@ impl VerifiedImageFile {
     }
 }
 
-/// Stages a verified pair with a read-only kernel and writable root filesystem.
+/// Stages a verified pair with a read-only kernel and caller-selected rootfs access.
 pub async fn stage_verified_pair(
     pair: &mut VerifiedImagePair,
     kernel_destination: &Path,
     rootfs_destination: &Path,
+    rootfs_read_only: bool,
     uid: u32,
     gid: u32,
 ) -> Result<(), ImageError> {
     pair.kernel
         .stage(kernel_destination, 0o400, uid, gid)
         .await?;
-    pair.rootfs.stage(rootfs_destination, 0o600, uid, gid).await
+    let rootfs_mode = if rootfs_read_only { 0o400 } else { 0o600 };
+    if let Err(error) = pair
+        .rootfs
+        .stage(rootfs_destination, rootfs_mode, uid, gid)
+        .await
+    {
+        let _ = tokio::fs::remove_file(kernel_destination).await;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn managed_path(root: &Path, kind: ImageKind, digest: &str) -> PathBuf {
@@ -536,23 +557,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staging_applies_exact_requested_modes() {
+    async fn staging_applies_exact_valid_modes() {
         use sha2::Digest as _;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let temp = tempfile::tempdir().unwrap();
-        let bytes = b"kernel";
-        let digest = hex::encode(sha2::Sha256::digest(bytes));
-        let source = temp.path().join("kernels").join(&digest).join("vmlinux");
-        tokio::fs::create_dir_all(source.parent().unwrap())
+        let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
+        let rootfs_digest = hex::encode(sha2::Sha256::digest(b"rootfs"));
+        let kernel_source = temp
+            .path()
+            .join("kernels")
+            .join(&kernel_digest)
+            .join("vmlinux");
+        let rootfs_source = temp
+            .path()
+            .join("rootfs")
+            .join(&rootfs_digest)
+            .join("rootfs.img");
+        tokio::fs::create_dir_all(kernel_source.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&source, bytes).await.unwrap();
-        let metadata = std::fs::metadata(&source).unwrap();
+        tokio::fs::create_dir_all(rootfs_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&kernel_source, b"kernel").await.unwrap();
+        tokio::fs::write(&rootfs_source, b"rootfs").await.unwrap();
+        let metadata = std::fs::metadata(&kernel_source).unwrap();
         let store = ImageStore::new(temp.path().to_path_buf());
 
-        for (index, mode) in [0o400, 0o600].into_iter().enumerate() {
-            let mut verified = store.resolve(ImageKind::Kernel, &digest).await.unwrap();
+        for (index, (kind, digest, mode)) in [
+            (ImageKind::Kernel, &kernel_digest, 0o400),
+            (ImageKind::Rootfs, &rootfs_digest, 0o400),
+            (ImageKind::Rootfs, &rootfs_digest, 0o600),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut verified = store.resolve(kind, digest).await.unwrap();
             let destination = temp.path().join(format!("stage-{index}"));
             verified
                 .stage(&destination, mode, metadata.uid(), metadata.gid())
@@ -566,9 +607,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_staging_applies_kernel_and_rootfs_modes() {
+    async fn staging_rejects_invalid_kind_mode_before_destination_creation() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
+        let rootfs_digest = hex::encode(sha2::Sha256::digest(b"rootfs"));
+        let kernel_source = temp
+            .path()
+            .join("kernels")
+            .join(&kernel_digest)
+            .join("vmlinux");
+        let rootfs_source = temp
+            .path()
+            .join("rootfs")
+            .join(&rootfs_digest)
+            .join("rootfs.img");
+        tokio::fs::create_dir_all(kernel_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(rootfs_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&kernel_source, b"kernel").await.unwrap();
+        tokio::fs::write(&rootfs_source, b"rootfs").await.unwrap();
+        let metadata = std::fs::metadata(&kernel_source).unwrap();
+        let store = ImageStore::new(temp.path().to_path_buf());
+
+        for (index, (kind, digest, mode)) in [
+            (ImageKind::Kernel, &kernel_digest, 0o600),
+            (ImageKind::Rootfs, &rootfs_digest, 0o700),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut verified = store.resolve(kind, digest).await.unwrap();
+            let destination = temp.path().join(format!("invalid-{index}"));
+            let error = verified
+                .stage(&destination, mode, metadata.uid(), metadata.gid())
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ImageError::Stage { source, .. }
+                    if source.kind() == io::ErrorKind::InvalidInput
+            ));
+            assert!(!destination.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_staging_applies_read_only_and_writable_rootfs_modes() {
         use sha2::Digest as _;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
+        let rootfs_digest = hex::encode(sha2::Sha256::digest(b"rootfs"));
+        let kernel_source = temp
+            .path()
+            .join("kernels")
+            .join(&kernel_digest)
+            .join("vmlinux");
+        let rootfs_source = temp
+            .path()
+            .join("rootfs")
+            .join(&rootfs_digest)
+            .join("rootfs.img");
+        tokio::fs::create_dir_all(kernel_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(rootfs_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&kernel_source, b"kernel").await.unwrap();
+        tokio::fs::write(&rootfs_source, b"rootfs").await.unwrap();
+        let metadata = std::fs::metadata(&kernel_source).unwrap();
+        let store = ImageStore::new(temp.path().to_path_buf());
+
+        for (index, (rootfs_read_only, expected_rootfs_mode)) in
+            [(true, 0o400), (false, 0o600)].into_iter().enumerate()
+        {
+            let mut pair = store
+                .resolve_pair(&kernel_digest, &rootfs_digest)
+                .await
+                .unwrap();
+            let stage_dir = temp.path().join(format!("stage-{index}"));
+            let kernel_destination = stage_dir.join("vmlinux");
+            let rootfs_destination = stage_dir.join("rootfs.img");
+            tokio::fs::create_dir_all(&stage_dir).await.unwrap();
+
+            stage_verified_pair(
+                &mut pair,
+                &kernel_destination,
+                &rootfs_destination,
+                rootfs_read_only,
+                metadata.uid(),
+                metadata.gid(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                tokio::fs::read(&kernel_destination).await.unwrap(),
+                b"kernel"
+            );
+            assert_eq!(
+                tokio::fs::read(&rootfs_destination).await.unwrap(),
+                b"rootfs"
+            );
+            assert_eq!(
+                std::fs::metadata(kernel_destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+            assert_eq!(
+                std::fs::metadata(rootfs_destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                expected_rootfs_mode
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_staging_removes_created_kernel_when_rootfs_staging_fails() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::tempdir().unwrap();
         let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
@@ -596,45 +767,30 @@ mod tests {
             .resolve_pair(&kernel_digest, &rootfs_digest)
             .await
             .unwrap();
-        let kernel_destination = temp.path().join("stage/vmlinux");
-        let rootfs_destination = temp.path().join("stage/rootfs.img");
-        tokio::fs::create_dir_all(kernel_destination.parent().unwrap())
+        let stage_dir = temp.path().join("stage-failure");
+        let kernel_destination = stage_dir.join("vmlinux");
+        let rootfs_destination = stage_dir.join("rootfs.img");
+        tokio::fs::create_dir_all(&stage_dir).await.unwrap();
+        tokio::fs::write(&rootfs_destination, b"pre-existing")
             .await
             .unwrap();
 
-        stage_verified_pair(
+        let error = stage_verified_pair(
             &mut pair,
             &kernel_destination,
             &rootfs_destination,
+            false,
             metadata.uid(),
             metadata.gid(),
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(
-            tokio::fs::read(&kernel_destination).await.unwrap(),
-            b"kernel"
-        );
+        assert!(matches!(error, ImageError::Stage { .. }));
+        assert!(!kernel_destination.exists());
         assert_eq!(
             tokio::fs::read(&rootfs_destination).await.unwrap(),
-            b"rootfs"
-        );
-        assert_eq!(
-            std::fs::metadata(kernel_destination)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o400
-        );
-        assert_eq!(
-            std::fs::metadata(rootfs_destination)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
+            b"pre-existing"
         );
     }
 
