@@ -3,7 +3,10 @@
 
 //! Idempotent host provisioning.
 
-use std::fs;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 
@@ -151,11 +154,8 @@ pub fn prepare_image_store(l: &Layout, fakeroot: bool) -> Result<()> {
     image::harden_store(&l.images_dir(), fakeroot)
 }
 
-fn validate_existing_directory_chains(
-    root: &std::path::Path,
-    targets: &[std::path::PathBuf],
-) -> Result<()> {
-    validate_directory(root)?;
+fn validate_existing_directory_chains(root: &Path, targets: &[PathBuf]) -> Result<()> {
+    ensure_layout_root(root)?;
     for target in targets {
         let relative = target.strip_prefix(root).with_context(|| {
             format!(
@@ -183,7 +183,18 @@ fn validate_existing_directory_chains(
     Ok(())
 }
 
-fn validate_directory(path: &std::path::Path) -> Result<()> {
+fn ensure_layout_root(root: &Path) -> Result<()> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => validate_directory(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(root).with_context(|| format!("mkdir {}", root.display()))?;
+            validate_directory(root)
+        }
+        Err(error) => Err(error).with_context(|| format!("inspect {}", root.display())),
+    }
+}
+
+fn validate_directory(path: &Path) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
     anyhow::ensure!(
@@ -194,7 +205,7 @@ fn validate_directory(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_directory_chain(root: &std::path::Path, target: &std::path::Path) -> Result<()> {
+fn ensure_directory_chain(root: &Path, target: &Path) -> Result<()> {
     let relative = target.strip_prefix(root).with_context(|| {
         format!(
             "{} is outside install root {}",
@@ -267,10 +278,10 @@ pub fn uninstall(layout: &Layout, purge: bool, fakeroot: bool) -> Result<()> {
 pub fn doctor(l: &Layout) -> preflight::Report {
     // /dev/kvm is always the real host device, even under `--prefix`: the
     // prefix redirects install paths, not the kernel's KVM character device.
-    preflight::run_report(&l.bin_dir(), std::path::Path::new("/dev/kvm"))
+    preflight::run_report(&l.bin_dir(), Path::new("/dev/kvm"))
 }
 
-fn write_file(path: std::path::PathBuf, body: &str, dry_run: bool) -> Result<()> {
+fn write_file(path: PathBuf, body: &str, dry_run: bool) -> Result<()> {
     if dry_run {
         tracing::info!("[dry-run] write {}", path.display());
         return Ok(());
@@ -361,7 +372,7 @@ fn apply_ownership(l: &Layout, fakeroot: bool) -> Result<()> {
 
 #[cfg(unix)]
 fn apply_directory_policy(
-    path: &std::path::Path,
+    path: &Path,
     user: &str,
     group: &str,
     mode: u32,
@@ -410,7 +421,7 @@ fn apply_directory_policy(
 
 #[cfg(not(unix))]
 fn apply_directory_policy(
-    path: &std::path::Path,
+    path: &Path,
     _user: &str,
     _group: &str,
     mode: u32,

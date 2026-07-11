@@ -9,6 +9,31 @@ use ne::install::layout::Layout;
 use ne::install::run::{InstallOptions, install};
 
 #[test]
+fn fakeroot_install_creates_missing_prefix_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fakeroot");
+    assert!(!root.exists());
+    let layout = Layout::new(&root);
+
+    install(InstallOptions {
+        layout: layout.clone(),
+        fakeroot: true,
+        no_start: true,
+        no_image: true,
+        dry_run: false,
+        ne_uid: 991,
+    })
+    .expect("fakeroot install with missing prefix");
+
+    assert!(root.is_dir(), "prefix root missing: {}", root.display());
+    assert!(
+        layout.supervisor_unit().is_file(),
+        "supervisor unit missing: {}",
+        layout.supervisor_unit().display()
+    );
+}
+
+#[test]
 fn fakeroot_install_creates_layout_and_files() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
