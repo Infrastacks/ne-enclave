@@ -263,6 +263,50 @@ def test_create_workspace_passes_fields_through(fake_server) -> None:
     assert resp.firecracker_pid == 99
 
 
+def test_create_workspace_tier_omits_managed_image_digests(fake_server) -> None:
+    servicer, target = fake_server
+    seen = {}
+
+    def capture(req: runtime_pb2.CreateWorkspaceRequest) -> runtime_pb2.CreateWorkspaceResponse:
+        seen["req"] = req
+        return runtime_pb2.CreateWorkspaceResponse(workspace_id=req.workspace_id)
+
+    servicer.on_create = capture
+    with Client(target) as client:
+        client.create_workspace(
+            workspace_id="wks-py-tier",
+            vcpu_count=1,
+            mem_size_mib=256,
+            guest_vsock_cid=3,
+            tier="warm-small",
+        )
+
+    sent = seen["req"]
+    assert sent.kernel_sha256 == ""
+    assert sent.rootfs_sha256 == ""
+    assert sent.tier == "warm-small"
+
+
+@pytest.mark.parametrize(
+    "digest_kwargs",
+    [
+        {"kernel_sha256": "11" * 32},
+        {"rootfs_sha256": "22" * 32},
+    ],
+)
+def test_create_workspace_rejects_half_digest_pair(fake_server, digest_kwargs) -> None:
+    _, target = fake_server
+    with Client(target) as client, pytest.raises(ValueError, match="provided together"):
+        client.create_workspace(
+            workspace_id="wks-py-half",
+            vcpu_count=1,
+            mem_size_mib=256,
+            guest_vsock_cid=3,
+            tier="warm-small",
+            **digest_kwargs,
+        )
+
+
 def test_create_workspace_exposes_only_digest_image_parameters() -> None:
     parameters = inspect.signature(Client.create_workspace).parameters
     assert "kernel_sha256" in parameters
@@ -279,17 +323,61 @@ def test_declared_runtime_floors_support_generated_stubs() -> None:
     pyproject = (sdk_root / "pyproject.toml").read_text()
     protobuf_source = (sdk_root / "src/ne/runtime/v1/runtime_pb2.py").read_text()
 
-    grpc_floor = re.search(r'"grpcio >=([^,]+),', pyproject)
-    protobuf_floor = re.search(r'"protobuf >=([^,]+),', pyproject)
+    grpc_bounds = re.search(r'"grpcio >=([^,]+),<([^"]+)', pyproject)
+    protobuf_bounds = re.search(r'"protobuf >=([^,]+),<([^"]+)', pyproject)
+    codegen_bounds = re.search(r'"grpcio-tools >=([^,]+),<([^"]+)', pyproject)
     generated_protobuf = re.search(r"# Protobuf Python Version: ([^\n]+)", protobuf_source)
 
-    assert grpc_floor is not None
-    assert protobuf_floor is not None
+    assert grpc_bounds is not None
+    assert protobuf_bounds is not None
+    assert codegen_bounds is not None
     assert generated_protobuf is not None
-    assert numeric_version(grpc_floor.group(1)) >= numeric_version(
-        runtime_pb2_grpc.GRPC_GENERATED_VERSION
-    )
-    assert numeric_version(protobuf_floor.group(1)) >= numeric_version(generated_protobuf.group(1))
+    generated_grpc = numeric_version(runtime_pb2_grpc.GRPC_GENERATED_VERSION)
+    generated_pb = numeric_version(generated_protobuf.group(1))
+    grpc_floor, grpc_ceiling = map(numeric_version, grpc_bounds.groups())
+    protobuf_floor, protobuf_ceiling = map(numeric_version, protobuf_bounds.groups())
+    codegen_floor, codegen_ceiling = map(numeric_version, codegen_bounds.groups())
+
+    assert grpc_floor >= generated_grpc
+    assert grpc_ceiling > generated_grpc
+    assert protobuf_floor >= generated_pb
+    assert protobuf_ceiling > generated_pb
+    assert codegen_floor >= generated_grpc
+    assert codegen_floor == grpc_floor
+    assert codegen_ceiling == grpc_ceiling
+
+
+@pytest.mark.parametrize(
+    ("status", "details"),
+    [
+        (grpc.StatusCode.NOT_FOUND, "kernel image not found"),
+        (grpc.StatusCode.FAILED_PRECONDITION, "rootfs image digest mismatch"),
+        (grpc.StatusCode.INTERNAL, "rootfs image staging failed"),
+    ],
+)
+def test_create_workspace_preserves_image_error_status_and_details(status, details) -> None:
+    class _ImageErrorRuntime(runtime_pb2_grpc.RuntimeServicer):
+        def CreateWorkspace(self, request, context):
+            context.abort(status, details)
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    runtime_pb2_grpc.add_RuntimeServicer_to_server(_ImageErrorRuntime(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    try:
+        with Client(f"127.0.0.1:{port}") as client, pytest.raises(grpc.RpcError) as exc:
+            client.create_workspace(
+                workspace_id="wks-image-error",
+                kernel_sha256="11" * 32,
+                rootfs_sha256="22" * 32,
+                vcpu_count=1,
+                mem_size_mib=256,
+                guest_vsock_cid=3,
+            )
+        assert exc.value.code() == status
+        assert exc.value.details() == details
+    finally:
+        server.stop(grace=0)
 
 
 def test_create_workspace_with_network_round_trips(fake_server) -> None:

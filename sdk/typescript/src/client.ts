@@ -97,10 +97,10 @@ export class Client {
 
   createWorkspace(options: {
     workspaceId: string;
-    /** Lowercase SHA-256 for the kernel in the supervisor-managed image store. */
-    kernelSha256: string;
-    /** Lowercase SHA-256 for the rootfs in the supervisor-managed image store. */
-    rootfsSha256: string;
+    /** Lowercase SHA-256 for the managed kernel; omit with rootfsSha256 for tier creates. */
+    kernelSha256?: string;
+    /** Lowercase SHA-256 for the managed rootfs; omit with kernelSha256 for tier creates. */
+    rootfsSha256?: string;
     vcpuCount: number;
     memSizeMib: number;
     guestVsockCid: number;
@@ -118,6 +118,13 @@ export class Client {
     }[];
     deadlineMs?: number;
   }): Promise<CreateWorkspaceResponse> {
+    const kernelSha256 = options.kernelSha256 ?? "";
+    const rootfsSha256 = options.rootfsSha256 ?? "";
+    if (Boolean(kernelSha256) !== Boolean(rootfsSha256)) {
+      return Promise.reject(
+        new TypeError("kernelSha256 and rootfsSha256 must be provided together"),
+      );
+    }
     const network: NetworkConfig | undefined = options.enableNetwork
       ? {
           enableEgress: options.enableEgress ?? false,
@@ -136,8 +143,8 @@ export class Client {
       : undefined;
     const request = {
       workspaceId: options.workspaceId,
-      kernelSha256: options.kernelSha256,
-      rootfsSha256: options.rootfsSha256,
+      kernelSha256,
+      rootfsSha256,
       rootfsReadOnly: options.rootfsReadOnly ?? true,
       vcpuCount: options.vcpuCount,
       memSizeMib: options.memSizeMib,

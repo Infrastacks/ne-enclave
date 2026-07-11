@@ -61,8 +61,8 @@ class Client:
         self,
         *,
         workspace_id: str,
-        kernel_sha256: str,
-        rootfs_sha256: str,
+        kernel_sha256: str | None = None,
+        rootfs_sha256: str | None = None,
         vcpu_count: int,
         mem_size_mib: int,
         guest_vsock_cid: int,
@@ -83,7 +83,9 @@ class Client:
         ``[a-zA-Z0-9-]{1,64}``. `vcpu_count` must be in 1..=255.
         ``kernel_sha256`` and ``rootfs_sha256`` identify artifacts in
         the supervisor-managed image store. Cold Firecracker creates
-        require both as 64-character lowercase SHA-256 digests.
+        require both as 64-character lowercase SHA-256 digests. Tier-
+        or backend-managed creates may omit both; a half-pair is rejected
+        locally while digest syntax remains a server-side contract.
 
         Network: pass ``enable_network=True`` to ask the supervisor
         to provision a per-workspace netns + veth + TAP. When
@@ -115,10 +117,15 @@ class Client:
         request still succeeds but the workspace runs without an
         eth0.
         """
+        kernel_digest = kernel_sha256 or ""
+        rootfs_digest = rootfs_sha256 or ""
+        if bool(kernel_digest) != bool(rootfs_digest):
+            raise ValueError("kernel_sha256 and rootfs_sha256 must be provided together")
+
         req = runtime_pb2.CreateWorkspaceRequest(
             workspace_id=workspace_id,
-            kernel_sha256=kernel_sha256,
-            rootfs_sha256=rootfs_sha256,
+            kernel_sha256=kernel_digest,
+            rootfs_sha256=rootfs_digest,
             rootfs_read_only=rootfs_read_only,
             vcpu_count=vcpu_count,
             mem_size_mib=mem_size_mib,

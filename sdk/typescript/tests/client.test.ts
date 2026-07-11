@@ -124,6 +124,67 @@ describe("Client", () => {
     expect(source).not.toContain(["rootfs", "Image", "Path"].join(""));
   });
 
+  test("createWorkspace tier omits managed image digests", async () => {
+    let seen: CreateWorkspaceRequest | undefined;
+    server = await startFakeServer({
+      createWorkspace: (req) => {
+        seen = req;
+        return {
+          workspaceId: req.workspaceId,
+          firecrackerPid: 99,
+          vsockHostSocket: "/x",
+          jailerChroot: "/y",
+          network: undefined,
+        };
+      },
+    });
+    const client = new Client({ target: server.target });
+    try {
+      await client.createWorkspace({
+        workspaceId: "wks-ts-tier",
+        vcpuCount: 1,
+        memSizeMib: 256,
+        guestVsockCid: 3,
+        tier: "warm-small",
+      });
+      expect(seen?.kernelSha256).toBe("");
+      expect(seen?.rootfsSha256).toBe("");
+      expect(seen?.tier).toBe("warm-small");
+    } finally {
+      client.close();
+    }
+  });
+
+  test.each([{ kernelSha256: "11".repeat(32) }, { rootfsSha256: "22".repeat(32) }])(
+    "createWorkspace rejects a half digest pair",
+    async (digestOptions) => {
+      server = await startFakeServer({
+        createWorkspace: (req) => ({
+          workspaceId: req.workspaceId,
+          firecrackerPid: 99,
+          vsockHostSocket: "/x",
+          jailerChroot: "/y",
+          network: undefined,
+        }),
+      });
+      const client = new Client({ target: server.target });
+      try {
+        await expect(
+          client.createWorkspace({
+            workspaceId: "wks-ts-half",
+            vcpuCount: 1,
+            memSizeMib: 256,
+            guestVsockCid: 3,
+            tier: "warm-small",
+            ...digestOptions,
+          }),
+        ).rejects.toThrow("provided together");
+      } finally {
+        client.close();
+      }
+    },
+  );
+
   test("createWorkspace with network populates allowCidrs and allowHostnames", async () => {
     let seen: CreateWorkspaceRequest | undefined;
     server = await startFakeServer({
@@ -218,6 +279,32 @@ describe("Client", () => {
           guestVsockCid: 3,
         }),
       ).rejects.toMatchObject({ code: grpcStatus.INVALID_ARGUMENT });
+    } finally {
+      client.close();
+    }
+  });
+
+  test.each([
+    [grpcStatus.NOT_FOUND, "kernel image not found"],
+    [grpcStatus.FAILED_PRECONDITION, "rootfs image digest mismatch"],
+    [grpcStatus.INTERNAL, "rootfs image staging failed"],
+  ])("createWorkspace preserves image error status %s and details", async (code, details) => {
+    server = await startFakeServer({
+      createWorkspace: () => statusError(code, details),
+    });
+    const client = new Client({ target: server.target });
+    try {
+      const error = await client
+        .createWorkspace({
+          workspaceId: "wks-image-error",
+          kernelSha256: "11".repeat(32),
+          rootfsSha256: "22".repeat(32),
+          vcpuCount: 1,
+          memSizeMib: 256,
+          guestVsockCid: 3,
+        })
+        .catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code, details });
     } finally {
       client.close();
     }
