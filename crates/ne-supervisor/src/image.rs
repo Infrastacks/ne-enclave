@@ -412,34 +412,72 @@ fn rejected(kind: ImageKind, digest: &str, reason: impl Into<String>) -> ImageEr
     }
 }
 
+/// Exclusive ownership token for one newly-created jailer workspace tree.
+///
+/// Construction atomically creates `<chroot_base>/firecracker/<workspace_id>`.
+/// A caller that receives an error never owns that path and must not clean it.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) async fn cleanup_failed_workspace(
-    jailer_chroot: &Path,
-    primary: ImageError,
-) -> ImageError {
-    let workspace_root = jailer_chroot.parent().unwrap_or(jailer_chroot);
-    match tokio::fs::remove_dir_all(workspace_root).await {
-        Ok(()) => primary,
-        Err(cleanup_error) => {
-            primary.with_cleanup_failure("removing failed workspace tree", cleanup_error)
-        }
-    }
+#[derive(Debug)]
+pub(crate) struct WorkspaceClaim {
+    workspace_root: PathBuf,
+    jailer_chroot: PathBuf,
 }
 
-#[cfg(test)]
-fn cleanup_failed_workspace_with<F>(
-    jailer_chroot: &Path,
-    primary: ImageError,
-    cleanup: F,
-) -> ImageError
-where
-    F: FnOnce(&Path) -> io::Result<()>,
-{
-    let workspace_root = jailer_chroot.parent().unwrap_or(jailer_chroot);
-    match cleanup(workspace_root) {
-        Ok(()) => primary,
-        Err(cleanup_error) => {
-            primary.with_cleanup_failure("removing failed workspace tree", cleanup_error)
+#[cfg(any(target_os = "linux", test))]
+impl WorkspaceClaim {
+    /// Atomically claims a workspace id after ensuring only the shared parent exists.
+    pub(crate) async fn claim(chroot_base: &Path, workspace_id: &str) -> io::Result<Self> {
+        let shared_root = chroot_base.join("firecracker");
+        tokio::fs::create_dir_all(&shared_root).await?;
+        let workspace_root = shared_root.join(workspace_id);
+        tokio::fs::create_dir(&workspace_root).await?;
+        let jailer_chroot = workspace_root.join("root");
+        if let Err(primary) = tokio::fs::create_dir(&jailer_chroot).await {
+            return match tokio::fs::remove_dir(&workspace_root).await {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "creating claimed workspace chroot failed: {primary}; removing owned claim: \
+                     {cleanup}"
+                ))),
+            };
+        }
+        Ok(Self {
+            workspace_root,
+            jailer_chroot,
+        })
+    }
+
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub(crate) fn jailer_chroot(&self) -> &Path {
+        &self.jailer_chroot
+    }
+
+    /// Removes this invocation's owned tree after an image failure.
+    pub(crate) async fn cleanup_image_failure(self, primary: ImageError) -> ImageError {
+        match tokio::fs::remove_dir_all(&self.workspace_root).await {
+            Ok(()) => primary,
+            Err(cleanup) => primary.with_cleanup_failure("removing failed workspace tree", cleanup),
+        }
+    }
+
+    /// Removes this invocation's owned tree for a non-image staging failure.
+    pub(crate) async fn cleanup(self) -> io::Result<()> {
+        tokio::fs::remove_dir_all(&self.workspace_root).await
+    }
+
+    #[cfg(test)]
+    fn cleanup_image_failure_with<F>(self, primary: ImageError, cleanup: F) -> ImageError
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
+        match cleanup(&self.workspace_root) {
+            Ok(()) => primary,
+            Err(cleanup_error) => {
+                primary.with_cleanup_failure("removing failed workspace tree", cleanup_error)
+            }
         }
     }
 }
@@ -1046,15 +1084,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_claim_collision_preserves_preexisting_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("firecracker/ws-existing");
+        tokio::fs::create_dir_all(existing.join("root"))
+            .await
+            .unwrap();
+        tokio::fs::write(existing.join("sentinel"), b"owned elsewhere")
+            .await
+            .unwrap();
+
+        let error = WorkspaceClaim::claim(temp.path(), "ws-existing")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            tokio::fs::read(existing.join("sentinel")).await.unwrap(),
+            b"owned elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_id_has_one_cleanup_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first, second) = tokio::join!(
+            WorkspaceClaim::claim(temp.path(), "ws-race"),
+            WorkspaceClaim::claim(temp.path(), "ws-race")
+        );
+        let (claim, loser_error) = match (first, second) {
+            (Ok(claim), Err(error)) | (Err(error), Ok(claim)) => (claim, error),
+            other => panic!("expected exactly one claimant, got {other:?}"),
+        };
+        assert_eq!(loser_error.kind(), io::ErrorKind::AlreadyExists);
+        tokio::fs::write(claim.workspace_root().join("sentinel"), b"winner")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(claim.workspace_root().join("sentinel"))
+                .await
+                .unwrap(),
+            b"winner"
+        );
+        claim.cleanup().await.unwrap();
+        assert!(!temp.path().join("firecracker/ws-race").exists());
+    }
+
+    #[tokio::test]
     async fn failed_workspace_cleanup_removes_only_target_and_preserves_sibling() {
         use sha2::Digest as _;
         use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::tempdir().unwrap();
         let firecracker = temp.path().join("firecracker");
-        let failing_chroot = firecracker.join("ws-failing").join("root");
+        let claim = WorkspaceClaim::claim(temp.path(), "ws-failing")
+            .await
+            .unwrap();
+        let failing_chroot = claim.jailer_chroot().to_path_buf();
         let sibling = firecracker.join("ws-sibling");
-        std::fs::create_dir_all(&failing_chroot).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
         std::fs::write(sibling.join("sentinel"), b"keep").unwrap();
         let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
@@ -1099,25 +1186,24 @@ mod tests {
         .await
         .unwrap_err();
 
-        let error = cleanup_failed_workspace(&failing_chroot, primary).await;
+        let error = claim.cleanup_image_failure(primary).await;
 
         assert!(matches!(error, ImageError::Stage { .. }));
         assert!(!firecracker.join("ws-failing").exists());
         assert_eq!(std::fs::read(sibling.join("sentinel")).unwrap(), b"keep");
     }
 
-    #[test]
-    fn failed_workspace_cleanup_surfaces_cleanup_failure() {
+    #[tokio::test]
+    async fn failed_workspace_cleanup_surfaces_cleanup_failure() {
         let temp = tempfile::tempdir().unwrap();
-        let chroot = temp.path().join("firecracker/ws/root");
-        std::fs::create_dir_all(&chroot).unwrap();
+        let claim = WorkspaceClaim::claim(temp.path(), "ws").await.unwrap();
         let primary = ImageError::Stage {
             kind: ImageKind::Rootfs,
             digest: "cd".repeat(32),
             source: io::Error::other("forced staging failure"),
         };
 
-        let error = cleanup_failed_workspace_with(&chroot, primary, |_| {
+        let error = claim.cleanup_image_failure_with(primary, |_| {
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "workspace cleanup denied",

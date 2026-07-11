@@ -32,7 +32,7 @@ use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use crate::image::{ImageError, VerifiedImagePair, cleanup_failed_workspace, stage_verified_pair};
+use crate::image::{ImageError, VerifiedImagePair, WorkspaceClaim, stage_verified_pair};
 
 /// Inputs to a single workspace launch. The supervisor builds this
 /// from a [`ne_protocol::supervisor::CreateWorkspaceRequest`]
@@ -199,6 +199,8 @@ struct JailedFirecracker {
     api_socket_host: PathBuf,
     vsock_host_socket: PathBuf,
     jailer_chroot: PathBuf,
+    /// Exact workspace directory atomically claimed by this launch.
+    workspace_root: PathBuf,
     /// Host path of the staged kernel inside the chroot (used by launch
     /// to derive the chroot-relative boot-source path).
     kernel_in_chroot: PathBuf,
@@ -222,152 +224,150 @@ async fn spawn_jailed_firecracker(
     if !is_valid_jailer_id(&cfg.workspace_id) {
         return Err(LaunchError::InvalidWorkspaceId(cfg.workspace_id.clone()));
     }
-    // jailer's convention: chroot lands at
-    //   {chroot_base}/firecracker/{id}/root/
-    // jailer creates root/ itself, but we need to stage kernel + rootfs
-    // inside it BEFORE jailer chowns the tree to the dropped uid/gid.
-    let jailer_chroot = cfg
-        .chroot_base
-        .join("firecracker")
-        .join(&cfg.workspace_id)
-        .join("root");
-    tokio::fs::create_dir_all(&jailer_chroot).await?;
+    // Claim the workspace id atomically. A collision returns before this
+    // invocation owns anything and therefore never cleans the existing tree.
+    let claim = WorkspaceClaim::claim(&cfg.chroot_base, &cfg.workspace_id).await?;
+    let jailer_chroot = claim.jailer_chroot().to_path_buf();
+    let workspace_root = claim.workspace_root().to_path_buf();
 
-    let kernel_in_chroot = jailer_chroot.join("vmlinux");
-    let rootfs_in_chroot = jailer_chroot.join("rootfs.img");
-    let stage_result = if let Some(images) = cfg.verified_images.as_mut() {
-        stage_verified_pair(
-            images,
-            &kernel_in_chroot,
-            &rootfs_in_chroot,
-            cfg.rootfs_read_only,
-            cfg.jailer_uid,
-            cfg.jailer_gid,
-        )
-        .await
-        .map_err(LaunchError::from)
-    } else {
-        // Transitional restore-only path. Task 3 resolves snapshot digests
-        // through ImageStore and removes this branch.
-        async {
-            stage_restore_file(
-                &cfg.kernel_image,
+    let outcome: Result<JailedFirecracker, LaunchError> = async {
+        let kernel_in_chroot = jailer_chroot.join("vmlinux");
+        let rootfs_in_chroot = jailer_chroot.join("rootfs.img");
+        let stage_result = if let Some(images) = cfg.verified_images.as_mut() {
+            stage_verified_pair(
+                images,
                 &kernel_in_chroot,
-                0o400,
-                cfg.jailer_uid,
-                cfg.jailer_gid,
-            )
-            .await?;
-            stage_restore_file(
-                &cfg.rootfs_image,
                 &rootfs_in_chroot,
-                if cfg.rootfs_read_only { 0o400 } else { 0o600 },
+                cfg.rootfs_read_only,
                 cfg.jailer_uid,
                 cfg.jailer_gid,
             )
-            .await?;
-            Ok::<(), io::Error>(())
-        }
-        .await
-        .map_err(LaunchError::from)
-    };
-    if let Err(error) = stage_result {
-        return match error {
-            LaunchError::Image(image_error) => Err(LaunchError::Image(
-                cleanup_failed_workspace(&jailer_chroot, image_error).await,
-            )),
-            other => {
-                let workspace_root = jailer_chroot.parent().unwrap_or(&jailer_chroot);
-                match tokio::fs::remove_dir_all(workspace_root).await {
-                    Ok(()) => Err(other),
-                    Err(cleanup_error) => Err(LaunchError::Io(io::Error::other(format!(
-                        "primary staging failure: {other}; removing failed workspace tree: \
-                         {cleanup_error}"
-                    )))),
-                }
+            .await
+            .map_err(LaunchError::from)
+        } else {
+            // Transitional restore-only path. Task 3 resolves snapshot digests
+            // through ImageStore and removes this branch.
+            async {
+                stage_restore_file(
+                    &cfg.kernel_image,
+                    &kernel_in_chroot,
+                    0o400,
+                    cfg.jailer_uid,
+                    cfg.jailer_gid,
+                )
+                .await?;
+                stage_restore_file(
+                    &cfg.rootfs_image,
+                    &rootfs_in_chroot,
+                    if cfg.rootfs_read_only { 0o400 } else { 0o600 },
+                    cfg.jailer_uid,
+                    cfg.jailer_gid,
+                )
+                .await?;
+                Ok::<(), io::Error>(())
             }
+            .await
+            .map_err(LaunchError::from)
         };
+        stage_result?;
+
+        // Host-side path to the vsock UDS. Firecracker (running inside
+        // the jailer chroot) creates this file at the `uds_path` we pass
+        // in the /vsock API call — relative to its OWN root, which from
+        // the host's POV is the jailer chroot. So the host path is
+        // `{jailer_chroot}/vsock.sock`, NOT `{chroot_base}/firecracker/
+        // {id}/vsock.sock` (that wrong path was one level too shallow
+        // and would never have a socket on it).
+        //
+        // Firecracker vsock UDS convention (for our caller's reference):
+        //   - Host → guest connection: connect to this base UDS and
+        //     send "CONNECT <guest_port>\n". Firecracker replies
+        //     "OK <fc_port>\n" then bridges the byte stream.
+        //   - Guest → host connection: Firecracker forwards to
+        //     `{vsock_host_socket}_<host_port>` (host must listen there).
+        let vsock_host_socket = jailer_chroot.join("vsock.sock");
+
+        // The API socket lives at /run/firecracker.socket inside the
+        // chroot per jailer convention; host path is chroot + that.
+        let api_socket_in_chroot = "/run/firecracker.socket";
+        let api_socket_host = jailer_chroot.join("run").join("firecracker.socket");
+
+        // Spawn jailer. Args after `--` go to Firecracker itself.
+        let mut jailer_cmd = Command::new(&cfg.jailer_binary);
+        jailer_cmd
+            .arg("--id")
+            .arg(&cfg.workspace_id)
+            .arg("--exec-file")
+            .arg(&cfg.firecracker_binary)
+            .arg("--uid")
+            .arg(cfg.jailer_uid.to_string())
+            .arg("--gid")
+            .arg(cfg.jailer_gid.to_string())
+            .arg("--chroot-base-dir")
+            .arg(&cfg.chroot_base);
+        if let Some(net) = &cfg.network {
+            // jailer's --netns drops Firecracker into the workspace's
+            // network namespace before chrooting + exec'ing, so the TAP
+            // we provisioned in the netns is visible from inside.
+            jailer_cmd.arg("--netns").arg(&net.netns_path);
+        }
+        // After `--`, args go to Firecracker. Jailer already passes
+        // `--id` to Firecracker itself, so we only add `--api-sock`.
+        jailer_cmd
+            .arg("--")
+            .arg("--api-sock")
+            .arg(api_socket_in_chroot);
+        let mut child = jailer_cmd.kill_on_drop(true).spawn()?;
+
+        let firecracker_pid = child.id().ok_or_else(|| {
+            LaunchError::Io(io::Error::other(
+                "jailer child has no pid (already exited?)",
+            ))
+        })?;
+        info!(
+            workspace_id = %cfg.workspace_id,
+            pid = firecracker_pid,
+            chroot = %jailer_chroot.display(),
+            "jailer spawned"
+        );
+
+        // Wait for the API socket. While waiting, watch for early jailer
+        // death so we don't burn the full timeout on a launch failure.
+        if let Err(e) = wait_for_socket(&api_socket_host, &mut child, cfg.api_socket_timeout).await
+        {
+            // Kill the child first. The claim owner performs filesystem cleanup
+            // after this inner launch attempt returns.
+            let _ = child.kill().await;
+            return Err(e);
+        }
+        debug!(socket = %api_socket_host.display(), "Firecracker API socket ready");
+
+        Ok(JailedFirecracker {
+            child,
+            firecracker_pid,
+            api_socket_host,
+            vsock_host_socket,
+            jailer_chroot,
+            workspace_root,
+            kernel_in_chroot,
+            rootfs_in_chroot,
+        })
     }
+    .await;
 
-    // Host-side path to the vsock UDS. Firecracker (running inside
-    // the jailer chroot) creates this file at the `uds_path` we pass
-    // in the /vsock API call — relative to its OWN root, which from
-    // the host's POV is the jailer chroot. So the host path is
-    // `{jailer_chroot}/vsock.sock`, NOT `{chroot_base}/firecracker/
-    // {id}/vsock.sock` (that wrong path was one level too shallow
-    // and would never have a socket on it).
-    //
-    // Firecracker vsock UDS convention (for our caller's reference):
-    //   - Host → guest connection: connect to this base UDS and
-    //     send "CONNECT <guest_port>\n". Firecracker replies
-    //     "OK <fc_port>\n" then bridges the byte stream.
-    //   - Guest → host connection: Firecracker forwards to
-    //     `{vsock_host_socket}_<host_port>` (host must listen there).
-    let vsock_host_socket = jailer_chroot.join("vsock.sock");
-
-    // The API socket lives at /run/firecracker.socket inside the
-    // chroot per jailer convention; host path is chroot + that.
-    let api_socket_in_chroot = "/run/firecracker.socket";
-    let api_socket_host = jailer_chroot.join("run").join("firecracker.socket");
-
-    // Spawn jailer. Args after `--` go to Firecracker itself.
-    let mut jailer_cmd = Command::new(&cfg.jailer_binary);
-    jailer_cmd
-        .arg("--id")
-        .arg(&cfg.workspace_id)
-        .arg("--exec-file")
-        .arg(&cfg.firecracker_binary)
-        .arg("--uid")
-        .arg(cfg.jailer_uid.to_string())
-        .arg("--gid")
-        .arg(cfg.jailer_gid.to_string())
-        .arg("--chroot-base-dir")
-        .arg(&cfg.chroot_base);
-    if let Some(net) = &cfg.network {
-        // jailer's --netns drops Firecracker into the workspace's
-        // network namespace before chrooting + exec'ing, so the TAP
-        // we provisioned in the netns is visible from inside.
-        jailer_cmd.arg("--netns").arg(&net.netns_path);
+    match outcome {
+        Ok(jailed) => Ok(jailed),
+        Err(LaunchError::Image(image_error)) => Err(LaunchError::Image(
+            claim.cleanup_image_failure(image_error).await,
+        )),
+        Err(other) => match claim.cleanup().await {
+            Ok(()) => Err(other),
+            Err(cleanup_error) => Err(LaunchError::Io(io::Error::other(format!(
+                "launch failed after claiming workspace: {other}; removing owned workspace tree: \
+                 {cleanup_error}"
+            )))),
+        },
     }
-    // After `--`, args go to Firecracker. Jailer already passes
-    // `--id` to Firecracker itself, so we only add `--api-sock`.
-    jailer_cmd
-        .arg("--")
-        .arg("--api-sock")
-        .arg(api_socket_in_chroot);
-    let mut child = jailer_cmd.kill_on_drop(true).spawn()?;
-
-    let firecracker_pid = child.id().ok_or_else(|| {
-        LaunchError::Io(io::Error::other(
-            "jailer child has no pid (already exited?)",
-        ))
-    })?;
-    info!(
-        workspace_id = %cfg.workspace_id,
-        pid = firecracker_pid,
-        chroot = %jailer_chroot.display(),
-        "jailer spawned"
-    );
-
-    // Wait for the API socket. While waiting, watch for early jailer
-    // death so we don't burn the full timeout on a launch failure.
-    if let Err(e) = wait_for_socket(&api_socket_host, &mut child, cfg.api_socket_timeout).await {
-        // Best-effort kill + cleanup so we don't leak the chroot tree.
-        let _ = child.kill().await;
-        let _ = tokio::fs::remove_dir_all(&jailer_chroot.parent().unwrap_or(&jailer_chroot)).await;
-        return Err(e);
-    }
-    debug!(socket = %api_socket_host.display(), "Firecracker API socket ready");
-
-    Ok(JailedFirecracker {
-        child,
-        firecracker_pid,
-        api_socket_host,
-        vsock_host_socket,
-        jailer_chroot,
-        kernel_in_chroot,
-        rootfs_in_chroot,
-    })
 }
 
 /// Launch one workspace. On error all partial host state is cleaned
@@ -385,80 +385,95 @@ pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
         }
     }
 
-    let jailed = spawn_jailed_firecracker(&mut cfg).await?;
+    let mut jailed = spawn_jailed_firecracker(&mut cfg).await?;
 
     // Configure the microVM. The order here matters: machine-config
     // sets vCPU/memory budgets, boot-source loads the kernel, drives
     // attach storage, vsock adds the guest-host channel, actions
     // boots.
-    api_put(
-        &jailed.api_socket_host,
-        "/machine-config",
-        &MachineConfig {
-            vcpu_count: cfg.vcpu_count,
-            mem_size_mib: cfg.mem_size_mib,
-        },
-    )
-    .await?;
-    api_put(
-        &jailed.api_socket_host,
-        "/boot-source",
-        &BootSource {
-            kernel_image_path: format!("/{}", chroot_relative(&jailed.kernel_in_chroot)?),
-            boot_args: cfg.kernel_boot_args.clone(),
-        },
-    )
-    .await?;
-    api_put(
-        &jailed.api_socket_host,
-        "/drives/rootfs",
-        &Drive {
-            drive_id: "rootfs".into(),
-            path_on_host: format!("/{}", chroot_relative(&jailed.rootfs_in_chroot)?),
-            is_root_device: true,
-            is_read_only: cfg.rootfs_read_only,
-        },
-    )
-    .await?;
-    if cfg.guest_vsock_cid != 0 {
+    let configured: Result<(), LaunchError> = async {
         api_put(
             &jailed.api_socket_host,
-            "/vsock",
-            &Vsock {
-                guest_cid: cfg.guest_vsock_cid,
-                // `uds_path` is relative to Firecracker's chroot. From
-                // the host's POV the same file is `vsock_host_socket`
-                // (= `{jailer_chroot}/vsock.sock`).
-                uds_path: "/vsock.sock".to_string(),
+            "/machine-config",
+            &MachineConfig {
+                vcpu_count: cfg.vcpu_count,
+                mem_size_mib: cfg.mem_size_mib,
             },
         )
         .await?;
-    }
-    if let Some(net) = &cfg.network {
-        // Wire the guest's eth0 to the TAP we provisioned in the
-        // workspace netns. iface_id is the kernel-side name the
-        // guest sees (eth0 by convention); host_dev_name is the
-        // host-visible TAP, which Firecracker (now inside the
-        // netns) sees by its raw name.
         api_put(
             &jailed.api_socket_host,
-            "/network-interfaces/eth0",
-            &NetworkInterface {
-                iface_id: "eth0".to_string(),
-                host_dev_name: net.tap_name.clone(),
+            "/boot-source",
+            &BootSource {
+                kernel_image_path: format!("/{}", chroot_relative(&jailed.kernel_in_chroot)?),
+                boot_args: cfg.kernel_boot_args.clone(),
             },
         )
         .await?;
+        api_put(
+            &jailed.api_socket_host,
+            "/drives/rootfs",
+            &Drive {
+                drive_id: "rootfs".into(),
+                path_on_host: format!("/{}", chroot_relative(&jailed.rootfs_in_chroot)?),
+                is_root_device: true,
+                is_read_only: cfg.rootfs_read_only,
+            },
+        )
+        .await?;
+        if cfg.guest_vsock_cid != 0 {
+            api_put(
+                &jailed.api_socket_host,
+                "/vsock",
+                &Vsock {
+                    guest_cid: cfg.guest_vsock_cid,
+                    // `uds_path` is relative to Firecracker's chroot. From
+                    // the host's POV the same file is `vsock_host_socket`
+                    // (= `{jailer_chroot}/vsock.sock`).
+                    uds_path: "/vsock.sock".to_string(),
+                },
+            )
+            .await?;
+        }
+        if let Some(net) = &cfg.network {
+            // Wire the guest's eth0 to the TAP we provisioned in the
+            // workspace netns. iface_id is the kernel-side name the
+            // guest sees (eth0 by convention); host_dev_name is the
+            // host-visible TAP, which Firecracker (now inside the
+            // netns) sees by its raw name.
+            api_put(
+                &jailed.api_socket_host,
+                "/network-interfaces/eth0",
+                &NetworkInterface {
+                    iface_id: "eth0".to_string(),
+                    host_dev_name: net.tap_name.clone(),
+                },
+            )
+            .await?;
+        }
+        api_put(
+            &jailed.api_socket_host,
+            "/actions",
+            &Action {
+                action_type: "InstanceStart".into(),
+            },
+        )
+        .await?;
+        info!(workspace_id = %cfg.workspace_id, "InstanceStart sent");
+        Ok(())
     }
-    api_put(
-        &jailed.api_socket_host,
-        "/actions",
-        &Action {
-            action_type: "InstanceStart".into(),
-        },
-    )
-    .await?;
-    info!(workspace_id = %cfg.workspace_id, "InstanceStart sent");
+    .await;
+    if let Err(primary) = configured {
+        let _ = jailed.child.start_kill();
+        let _ = jailed.child.wait().await;
+        return match tokio::fs::remove_dir_all(&jailed.workspace_root).await {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(LaunchError::Io(io::Error::other(format!(
+                "Firecracker configuration failed: {primary}; removing owned workspace tree: \
+                 {cleanup}"
+            )))),
+        };
+    }
 
     Ok(Instance {
         workspace_id: cfg.workspace_id,
@@ -1406,12 +1421,12 @@ pub async fn restore(mut cfg: RestoreLaunchConfig) -> Result<Instance, LaunchErr
             let mut jailed = jailed;
             let _ = jailed.child.start_kill();
             let _ = jailed.child.wait().await;
-            let workspace_root = jailed
-                .jailer_chroot
-                .parent()
-                .unwrap_or(&jailed.jailer_chroot);
-            let _ = tokio::fs::remove_dir_all(workspace_root).await;
-            Err(e)
+            match tokio::fs::remove_dir_all(&jailed.workspace_root).await {
+                Ok(()) => Err(e),
+                Err(cleanup) => Err(LaunchError::Io(io::Error::other(format!(
+                    "snapshot restore failed: {e}; removing owned workspace tree: {cleanup}"
+                )))),
+            }
         }
     }
 }
