@@ -9,6 +9,85 @@ use ne::install::layout::Layout;
 use ne::install::run::{InstallOptions, install};
 
 #[test]
+fn fakeroot_install_creates_missing_prefix_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fakeroot");
+    assert!(!root.exists());
+    let layout = Layout::new(&root);
+
+    install(InstallOptions {
+        layout: layout.clone(),
+        fakeroot: true,
+        no_start: true,
+        no_image: true,
+        dry_run: false,
+        ne_uid: 991,
+    })
+    .expect("fakeroot install with missing prefix");
+
+    assert!(root.is_dir(), "prefix root missing: {}", root.display());
+    assert!(
+        layout.supervisor_unit().is_file(),
+        "supervisor unit missing: {}",
+        layout.supervisor_unit().display()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fakeroot_install_rejects_symlink_prefix_without_touching_target() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fakeroot");
+    let sentinel = tmp.path().join("sentinel");
+    std::fs::create_dir(&sentinel).unwrap();
+    std::fs::write(sentinel.join("payload"), b"must-not-change").unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o711)).unwrap();
+    let before = std::fs::metadata(&sentinel).unwrap();
+    symlink(&sentinel, &root).unwrap();
+
+    let result = install(InstallOptions {
+        layout: Layout::new(&root),
+        fakeroot: true,
+        no_start: true,
+        no_image: true,
+        dry_run: false,
+        ne_uid: 991,
+    });
+
+    assert!(result.is_err(), "accepted symlink prefix root");
+    assert_eq!(
+        std::fs::read(sentinel.join("payload")).unwrap(),
+        b"must-not-change"
+    );
+    let after = std::fs::metadata(&sentinel).unwrap();
+    assert_eq!(after.mode(), before.mode(), "changed target mode");
+    assert_eq!(after.uid(), before.uid(), "changed target owner");
+    assert_eq!(after.gid(), before.gid(), "changed target group");
+}
+
+#[cfg(unix)]
+#[test]
+fn fakeroot_install_rejects_regular_file_prefix_without_changing_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fakeroot");
+    std::fs::write(&root, b"must-not-change").unwrap();
+
+    let result = install(InstallOptions {
+        layout: Layout::new(&root),
+        fakeroot: true,
+        no_start: true,
+        no_image: true,
+        dry_run: false,
+        ne_uid: 991,
+    });
+
+    assert!(result.is_err(), "accepted regular file prefix root");
+    assert_eq!(std::fs::read(&root).unwrap(), b"must-not-change");
+}
+
+#[test]
 fn fakeroot_install_creates_layout_and_files() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
