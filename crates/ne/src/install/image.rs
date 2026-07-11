@@ -58,6 +58,20 @@ pub fn import_artifact(
     src: &Path,
     expected_hex: &str,
 ) -> Result<PathBuf> {
+    import_artifact_with_hook(images_dir, kind, filename, src, expected_hex, || {})
+}
+
+fn import_artifact_with_hook<F>(
+    images_dir: &Path,
+    kind: &str,
+    filename: &str,
+    src: &Path,
+    expected_hex: &str,
+    before_copy: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(),
+{
     // Validate before reading the source or creating any store directory.
     validate_sha256(expected_hex)?;
     let expected_filename = match kind {
@@ -94,6 +108,7 @@ pub fn import_artifact(
     source
         .rewind()
         .with_context(|| format!("rewind {}", src.display()))?;
+    before_copy();
 
     let kind_dir = ensure_store_child_directory(images_dir, kind)?;
     let dir = ensure_store_child_directory(&kind_dir, expected_hex)?;
@@ -105,8 +120,24 @@ pub fn import_artifact(
         .open(&dest)
         .with_context(|| format!("create new managed artifact {}", dest.display()))?;
     let publish = (|| -> Result<()> {
-        std::io::copy(&mut source, &mut output)
-            .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+        let mut copied_hasher = Sha256::new();
+        loop {
+            let count = source
+                .read(&mut buffer)
+                .with_context(|| format!("read verified source {}", src.display()))?;
+            if count == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..count])
+                .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+            copied_hasher.update(&buffer[..count]);
+        }
+        let copied_digest = hex::encode(copied_hasher.finalize());
+        anyhow::ensure!(
+            copied_digest == expected_hex,
+            "copied managed artifact digest mismatch: expected {expected_hex}, got {copied_digest}"
+        );
         output
             .flush()
             .with_context(|| format!("flush {}", dest.display()))?;
@@ -365,5 +396,24 @@ mod tests {
 
         assert!(import_artifact(&images, "kernels", "vmlinux", &src, &digest).is_err());
         assert_eq!(fs::read(dest).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn import_rejects_same_inode_mutation_between_verification_and_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("vmlinux");
+        fs::write(&src, b"verified-kernel").unwrap();
+        let digest = sha256_file(&src).unwrap();
+        let images = dir.path().join("images");
+        fs::create_dir(&images).unwrap();
+        let dest = images.join("kernels").join(&digest).join("vmlinux");
+
+        let result =
+            import_artifact_with_hook(&images, "kernels", "vmlinux", &src, &digest, || {
+                fs::write(&src, b"mutated-kernel").unwrap();
+            });
+
+        assert!(result.is_err());
+        assert!(!dest.exists(), "mismatched copied bytes were published");
     }
 }
