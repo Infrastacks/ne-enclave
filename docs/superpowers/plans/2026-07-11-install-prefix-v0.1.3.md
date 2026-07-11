@@ -13,6 +13,7 @@
 - Existing prefix symlinks and non-directories must remain rejected.
 - Missing fakeroot prefixes must be created without changing production `/` behavior.
 - No CI-only directory-creation workaround may replace the CLI fix.
+- The KVM timeout test must accept either the guest or host timeout at the shared deadline and must retain the 800 ms wall-clock bound.
 - The release tag and all workflow-enforced version sources must be exactly `0.1.3`.
 - Follow feature branch → `dev` → `main` → tag → `dev` gitflow.
 
@@ -107,7 +108,47 @@ git add Cargo.toml Cargo.lock sdk/typescript/package.json sdk/python/pyproject.t
 git commit -m "chore(release): v0.1.3"
 ```
 
-### Task 3: Review, verify, integrate, and release
+### Task 3: Correct the KVM timeout race assertion
+
+**Files:**
+- Modify: `crates/ne-e2e/tests/firecracker_host_timeout.rs`
+
+**Interfaces:**
+- Consumes: `GuestRpcError`, `GuestResponse`, and `GuestErrorKind` timeout variants.
+- Produces: a deterministic KVM assertion for the two valid outcomes at a shared deadline.
+
+- [ ] **Step 1: Record RED evidence from main CI**
+
+Use KVM job `86578742487` from run `29165805514`. Expected evidence:
+`expected Timeout(100), got Ok(Error { kind: Timeout, ... })` while the elapsed
+bound is met.
+
+- [ ] **Step 2: Correct the assertion**
+
+Import `GuestResponse` and `GuestErrorKind`. Accept either
+`Err(GuestRpcError::Timeout(100))` or a guest `Error` response whose kind is
+`Timeout`; panic for every other outcome. Do not change production timeout
+logic or the 800 ms assertion.
+
+- [ ] **Step 3: Run available verification**
+
+```bash
+cargo test -p ne-e2e --test firecracker_host_timeout --no-run
+cargo clippy -p ne-e2e --test firecracker_host_timeout -- -D warnings
+cargo fmt --all -- --check
+```
+
+Expected: every command exits zero. The live KVM behavior is re-verified by
+the post-merge main CI job.
+
+- [ ] **Step 4: Commit the test correction**
+
+```bash
+git add crates/ne-e2e/tests/firecracker_host_timeout.rs
+git commit -m "test(e2e): accept guest timeout race outcome"
+```
+
+### Task 4: Review, verify, integrate, and release
 
 **Files:**
 - Verify: all files changed since `dev`
