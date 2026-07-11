@@ -61,8 +61,8 @@ class Client:
         self,
         *,
         workspace_id: str,
-        kernel_image_path: str,
-        rootfs_image_path: str,
+        kernel_sha256: str,
+        rootfs_sha256: str,
         vcpu_count: int,
         mem_size_mib: int,
         guest_vsock_cid: int,
@@ -81,6 +81,9 @@ class Client:
 
         `workspace_id` must satisfy jailer's grammar
         ``[a-zA-Z0-9-]{1,64}``. `vcpu_count` must be in 1..=255.
+        ``kernel_sha256`` and ``rootfs_sha256`` identify artifacts in
+        the supervisor-managed image store. Cold Firecracker creates
+        require both as 64-character lowercase SHA-256 digests.
 
         Network: pass ``enable_network=True`` to ask the supervisor
         to provision a per-workspace netns + veth + TAP. When
@@ -114,8 +117,8 @@ class Client:
         """
         req = runtime_pb2.CreateWorkspaceRequest(
             workspace_id=workspace_id,
-            kernel_image_path=kernel_image_path,
-            rootfs_image_path=rootfs_image_path,
+            kernel_sha256=kernel_sha256,
+            rootfs_sha256=rootfs_sha256,
             rootfs_read_only=rootfs_read_only,
             vcpu_count=vcpu_count,
             mem_size_mib=mem_size_mib,

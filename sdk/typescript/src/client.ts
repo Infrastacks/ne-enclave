@@ -97,8 +97,10 @@ export class Client {
 
   createWorkspace(options: {
     workspaceId: string;
-    kernelImagePath: string;
-    rootfsImagePath: string;
+    /** Lowercase SHA-256 for the kernel in the supervisor-managed image store. */
+    kernelSha256: string;
+    /** Lowercase SHA-256 for the rootfs in the supervisor-managed image store. */
+    rootfsSha256: string;
     vcpuCount: number;
     memSizeMib: number;
     guestVsockCid: number;
@@ -134,8 +136,8 @@ export class Client {
       : undefined;
     const request = {
       workspaceId: options.workspaceId,
-      kernelImagePath: options.kernelImagePath,
-      rootfsImagePath: options.rootfsImagePath,
+      kernelSha256: options.kernelSha256,
+      rootfsSha256: options.rootfsSha256,
       rootfsReadOnly: options.rootfsReadOnly ?? true,
       vcpuCount: options.vcpuCount,
       memSizeMib: options.memSizeMib,

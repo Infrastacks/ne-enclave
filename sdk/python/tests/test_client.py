@@ -8,8 +8,11 @@ dev machine and in CI.
 
 from __future__ import annotations
 
+import inspect
+import re
 from collections.abc import Callable, Iterator
 from concurrent import futures
+from pathlib import Path
 
 import grpc
 import pytest
@@ -239,8 +242,8 @@ def test_create_workspace_passes_fields_through(fake_server) -> None:
     with Client(target) as client:
         resp = client.create_workspace(
             workspace_id="wks-py-1",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=2,
             mem_size_mib=512,
             guest_vsock_cid=3,
@@ -249,8 +252,8 @@ def test_create_workspace_passes_fields_through(fake_server) -> None:
 
     sent = seen["req"]
     assert sent.workspace_id == "wks-py-1"
-    assert sent.kernel_image_path == "/k"
-    assert sent.rootfs_image_path == "/r"
+    assert sent.kernel_sha256 == "11" * 32
+    assert sent.rootfs_sha256 == "22" * 32
     assert sent.vcpu_count == 2
     assert sent.mem_size_mib == 512
     assert sent.guest_vsock_cid == 3
@@ -258,6 +261,35 @@ def test_create_workspace_passes_fields_through(fake_server) -> None:
     assert sent.rootfs_read_only is True  # SDK default
     assert resp.workspace_id == "wks-py-1"
     assert resp.firecracker_pid == 99
+
+
+def test_create_workspace_exposes_only_digest_image_parameters() -> None:
+    parameters = inspect.signature(Client.create_workspace).parameters
+    assert "kernel_sha256" in parameters
+    assert "rootfs_sha256" in parameters
+    assert "kernel_" + "image_path" not in parameters
+    assert "rootfs_" + "image_path" not in parameters
+
+
+def test_declared_runtime_floors_support_generated_stubs() -> None:
+    def numeric_version(value: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in value.split("."))
+
+    sdk_root = Path(__file__).parents[1]
+    pyproject = (sdk_root / "pyproject.toml").read_text()
+    protobuf_source = (sdk_root / "src/ne/runtime/v1/runtime_pb2.py").read_text()
+
+    grpc_floor = re.search(r'"grpcio >=([^,]+),', pyproject)
+    protobuf_floor = re.search(r'"protobuf >=([^,]+),', pyproject)
+    generated_protobuf = re.search(r"# Protobuf Python Version: ([^\n]+)", protobuf_source)
+
+    assert grpc_floor is not None
+    assert protobuf_floor is not None
+    assert generated_protobuf is not None
+    assert numeric_version(grpc_floor.group(1)) >= numeric_version(
+        runtime_pb2_grpc.GRPC_GENERATED_VERSION
+    )
+    assert numeric_version(protobuf_floor.group(1)) >= numeric_version(generated_protobuf.group(1))
 
 
 def test_create_workspace_with_network_round_trips(fake_server) -> None:
@@ -287,8 +319,8 @@ def test_create_workspace_with_network_round_trips(fake_server) -> None:
     with Client(target) as client:
         resp = client.create_workspace(
             workspace_id="wks-py-net",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=1,
             mem_size_mib=256,
             guest_vsock_cid=3,
@@ -320,8 +352,8 @@ def test_create_workspace_passes_allow_hostnames(fake_server) -> None:
     with Client(target) as client:
         client.create_workspace(
             workspace_id="wks-py-dns",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=1,
             mem_size_mib=256,
             guest_vsock_cid=3,
@@ -351,8 +383,8 @@ def test_create_workspace_passes_allow_cidrs(fake_server) -> None:
     with Client(target) as client:
         client.create_workspace(
             workspace_id="wks-py-allow",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=1,
             mem_size_mib=256,
             guest_vsock_cid=3,
@@ -383,8 +415,8 @@ def test_create_workspace_opts_into_privacy_router(fake_server) -> None:
     with Client(target) as client:
         client.create_workspace(
             workspace_id="wks-py-privacy",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=1,
             mem_size_mib=256,
             guest_vsock_cid=3,
@@ -411,8 +443,8 @@ def test_create_workspace_without_privacy_router_omits_field(fake_server) -> Non
     with Client(target) as client:
         client.create_workspace(
             workspace_id="wks-py-no-privacy",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=1,
             mem_size_mib=256,
             guest_vsock_cid=3,
@@ -437,8 +469,8 @@ def test_create_workspace_without_network_omits_field(fake_server) -> None:
     with Client(target) as client:
         client.create_workspace(
             workspace_id="wks-py-no-net",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=1,
             mem_size_mib=256,
             guest_vsock_cid=3,
@@ -655,8 +687,8 @@ def test_create_workspace_exposed_ports_round_trips(fake_server) -> None:
     with Client(target) as client:
         client.create_workspace(
             workspace_id="wks-ep",
-            kernel_image_path="/k",
-            rootfs_image_path="/r",
+            kernel_sha256="11" * 32,
+            rootfs_sha256="22" * 32,
             vcpu_count=1,
             mem_size_mib=256,
             guest_vsock_cid=3,

@@ -32,16 +32,15 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "grpcio >=1.62,<2.0",
-    # The pinned ceiling tracks grpcio-tools' codegen runtime
-    # requirement; grpcio-tools 1.80+ emits protobuf 6.x-compatible
-    # Python. Bump together when codegen.sh is rerun.
-    "protobuf >=4.25,<8.0",
+    # These floors match the committed generated stubs. Bump the runtime and
+    # codegen requirements together whenever codegen.sh is rerun.
+    "grpcio >=1.82.1,<2.0",
+    "protobuf >=7.35.0,<8.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "grpcio-tools >=1.62,<2.0",
+    "grpcio-tools >=1.82.1,<2.0",
     "pytest >=8.0",
     "pytest-asyncio >=0.23",
     "ruff >=0.5",
