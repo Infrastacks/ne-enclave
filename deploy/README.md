@@ -228,10 +228,15 @@ TPM-Quote nonce, validated against the genuine AMD Milan ARK).
 sudo nee install --no-image
 
 # 2. Import your own kernel + rootfs (SHA-256 values are verified on import)
-nee image import \
-  --kernel   /path/to/vmlinux       --kernel-sha256  <hex> \
-  --rootfs   /path/to/rootfs.img    --rootfs-sha256  <hex>
+KERNEL_SHA256=$(sha256sum /path/to/vmlinux | cut -d' ' -f1)
+ROOTFS_SHA256=$(sha256sum /path/to/rootfs.img | cut -d' ' -f1)
+sudo nee image import \
+  --kernel /path/to/vmlinux --kernel-sha256 "$KERNEL_SHA256" \
+  --rootfs /path/to/rootfs.img --rootfs-sha256 "$ROOTFS_SHA256"
 ```
+
+Import runs with elevated privileges because it creates content-addressed directories in
+the installed managed store, which is owned by `ne:ne` and mode `0750`.
 
 When creating a cold Firecracker workspace, send the same verified values as
 `kernel_sha256` and `rootfs_sha256`. The supervisor resolves only these fixed

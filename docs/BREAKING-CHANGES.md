@@ -9,7 +9,7 @@ Workspace creation now identifies managed images by content digest. The request 
 TypeScript. LangChain and Mastra environment configuration now uses
 `NE_KERNEL_SHA256` and `NE_ROOTFS_SHA256`; legacy path variables are ignored.
 
-Import images with `nee image import` and pass the same lowercase 64-character SHA-256
+Import images with `sudo nee image import` and pass the same lowercase 64-character SHA-256
 values when creating a cold Firecracker workspace. The supervisor resolves and verifies
 those artifacts beneath `NE_IMAGE_STORE` (default `/var/lib/ne-enclave/images`) and stages
 independent copies for each workspace.

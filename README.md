@@ -69,17 +69,17 @@ curl -fsSL https://github.com/Infrastacks/ne-enclave/releases/latest/download/in
 nee doctor                          # preflight: KVM, Firecracker, jailer
 systemctl status ne-supervisor ne-api
 
-# 3. Import an image and retain its verified digests
+# 3. Import into the privileged managed store and retain its verified digests
 KERNEL_SHA256=$(sha256sum /path/to/vmlinux | cut -d' ' -f1)
 ROOTFS_SHA256=$(sha256sum /path/to/rootfs.img | cut -d' ' -f1)
-nee image import \
+sudo nee image import \
   --kernel /path/to/vmlinux --kernel-sha256 "$KERNEL_SHA256" \
   --rootfs /path/to/rootfs.img --rootfs-sha256 "$ROOTFS_SHA256"
 
 # 4. Create a workspace + run a command (REST)
 curl -s http://127.0.0.1:8080/v1/workspaces \
   -H 'Content-Type: application/json' \
-  -d "{\"workspace_id\":\"hello\",\"kernel_sha256\":\"$KERNEL_SHA256\",\"rootfs_sha256\":\"$ROOTFS_SHA256\",\"vcpu_count\":1,\"mem_size_mib\":512,\"guest_vsock_cid\":3}"
+  -d "{\"workspace_id\":\"hello\",\"kernel_sha256\":\"$KERNEL_SHA256\",\"rootfs_sha256\":\"$ROOTFS_SHA256\",\"rootfs_read_only\":true,\"vcpu_count\":1,\"mem_size_mib\":512,\"guest_vsock_cid\":3}"
 
 curl -s http://127.0.0.1:8080/v1/workspaces/hello/exec \
   -H 'Content-Type: application/json' \
@@ -92,8 +92,8 @@ from ne import Client
 c = Client("127.0.0.1:50051")
 ws = c.create_workspace(
     workspace_id="hello",
-    kernel_sha256="<kernel digest from nee image import>",
-    rootfs_sha256="<rootfs digest from nee image import>",
+    kernel_sha256="<kernel digest supplied during import>",
+    rootfs_sha256="<rootfs digest supplied during import>",
     vcpu_count=1,
     mem_size_mib=512,
     guest_vsock_cid=3,
@@ -107,8 +107,8 @@ import { Client } from "@neuronedge/enclave";
 const c = new Client({ target: "127.0.0.1:50051" });
 const ws = await c.createWorkspace({
   workspaceId: "hello",
-  kernelSha256: "<kernel digest from nee image import>",
-  rootfsSha256: "<rootfs digest from nee image import>",
+  kernelSha256: "<kernel digest supplied during import>",
+  rootfsSha256: "<rootfs digest supplied during import>",
   vcpuCount: 1,
   memSizeMib: 512,
   guestVsockCid: 3,

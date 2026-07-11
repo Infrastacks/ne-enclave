@@ -28,7 +28,7 @@ with EnclaveWorkspace(target="127.0.0.1:50051") as ws:
 
 ## Configuration
 
-Import the guest images with `nee image import`, then configure `EnclaveWorkspace` with the same lowercase SHA-256 values. Any environment value can be overridden by a matching kwarg.
+Import the guest images with `sudo nee image import`, then configure `EnclaveWorkspace` with the same lowercase SHA-256 values. Any environment value can be overridden by a matching kwarg.
 
 | Env var | Meaning |
 |---|---|

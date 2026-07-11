@@ -34,7 +34,7 @@ await withWorkspace({ target: "127.0.0.1:50051" }, async (ws) => {
 
 ## Configuration
 
-Import the guest images with `nee image import`, then configure `withWorkspace` / `EnclaveWorkspace` with the same lowercase SHA-256 values. Any environment value can be overridden by a matching option.
+Import the guest images with `sudo nee image import`, then configure `withWorkspace` / `EnclaveWorkspace` with the same lowercase SHA-256 values. Any environment value can be overridden by a matching option.
 
 | Env var | Meaning |
 |---|---|
