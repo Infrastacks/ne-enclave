@@ -20,6 +20,8 @@ use ne_protocol::supervisor::{
 };
 
 use crate::audit::AuditLog;
+#[cfg(target_os = "linux")]
+use crate::image::{ImageDigest, ImageError, ImageKind, ImageStore};
 
 /// Host-side wall clock for the guest file-RPC round trip. Five seconds
 /// above the guest's 25-second `FILE_OP_TIMEOUT` so the guest's typed
@@ -30,6 +32,21 @@ const FILE_RPC_TIMEOUT_MS: u32 = 30_000;
 /// Guest vsock port the ne-guest-agent listens on by convention.
 #[cfg(target_os = "linux")]
 const DEFAULT_GUEST_VSOCK_PORT: u32 = 52;
+
+#[cfg(target_os = "linux")]
+fn image_error_response(error: ImageError) -> SupervisorResponse {
+    let kind = match &error {
+        ImageError::InvalidDigest { .. } => SupervisorErrorKind::InvalidImageDigest,
+        ImageError::NotFound { .. } => SupervisorErrorKind::ImageNotFound,
+        ImageError::Rejected { .. } => SupervisorErrorKind::ImageRejected,
+        ImageError::DigestMismatch { .. } => SupervisorErrorKind::ImageDigestMismatch,
+        ImageError::Stage { .. } => SupervisorErrorKind::ImageStageFailed,
+    };
+    SupervisorResponse::Error {
+        kind,
+        message: error.to_string(),
+    }
+}
 
 /// Short readiness probe at pool checkout — the member was proven ready at
 /// provision time; this only catches members that died while idle.
@@ -140,6 +157,8 @@ pub struct WorkspaceManagerConfig {
     pub jailer_binary: PathBuf,
     /// Base directory under which jailer creates per-workspace chroots.
     pub chroot_base: PathBuf,
+    /// Supervisor-owned content-addressed kernel and rootfs image store.
+    pub image_store: PathBuf,
     /// UID jailer drops the Firecracker process to.
     pub jailer_uid: u32,
     /// GID jailer drops the Firecracker process to.
@@ -182,6 +201,7 @@ impl WorkspaceManagerConfig {
             firecracker_binary: PathBuf::from("/opt/ne-enclave/bin/firecracker"),
             jailer_binary: PathBuf::from("/opt/ne-enclave/bin/jailer"),
             chroot_base: PathBuf::from("/srv/jailer"),
+            image_store: PathBuf::from("/var/lib/ne-enclave/images"),
             jailer_uid: 1000,
             jailer_gid: 1000,
             openshell_sandbox_binary: PathBuf::from("/opt/ne-enclave/bin/openshell-sandbox"),
@@ -543,6 +563,23 @@ impl WorkspaceManager {
     /// Launch a new Firecracker microVM and register it under the
     /// caller-supplied `workspace_id`.
     pub async fn create(&self, req: CreateWorkspaceRequest) -> SupervisorResponse {
+        let both_empty = req.kernel_sha256.is_empty() && req.rootfs_sha256.is_empty();
+        let both_present = !req.kernel_sha256.is_empty() && !req.rootfs_sha256.is_empty();
+        if !both_empty && !both_present {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidImageDigest,
+                message: "kernel and rootfs image digests must be supplied together".into(),
+            };
+        }
+        if both_present
+            && (ImageDigest::parse(ImageKind::Kernel, &req.kernel_sha256).is_err()
+                || ImageDigest::parse(ImageKind::Rootfs, &req.rootfs_sha256).is_err())
+        {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidImageDigest,
+                message: "image digests must be 64 lowercase hexadecimal characters".into(),
+            };
+        }
         if req.tier.is_some() {
             return self.create_from_pool(req).await;
         }
@@ -562,6 +599,7 @@ impl WorkspaceManager {
         if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
             return self.create_confidential(req).await;
         }
+
         #[cfg(not(all(target_os = "linux", feature = "confidential-cvm")))]
         if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
             return SupervisorResponse::Error {
@@ -573,6 +611,23 @@ impl WorkspaceManager {
                 ),
             };
         }
+
+        if both_empty {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidImageDigest,
+                message: "standard cold creates require kernel and rootfs image digests".into(),
+            };
+        }
+
+        // Resolve and verify both images before allocating a network slot or
+        // creating any workspace/chroot state.
+        let verified_images = match ImageStore::new(self.cfg.image_store.clone())
+            .resolve_pair(&req.kernel_sha256, &req.rootfs_sha256)
+            .await
+        {
+            Ok(images) => images,
+            Err(error) => return image_error_response(error),
+        };
 
         // Provision network plumbing first so we can hand the TAP +
         // netns to Firecracker. On any failure here we exit without
@@ -647,8 +702,19 @@ impl WorkspaceManager {
 
         let cfg = crate::firecracker::LaunchConfig {
             workspace_id: req.workspace_id.clone(),
-            kernel_image: PathBuf::from(&req.kernel_image_path),
-            rootfs_image: PathBuf::from(&req.rootfs_image_path),
+            kernel_image: self
+                .cfg
+                .image_store
+                .join("kernels")
+                .join(&req.kernel_sha256)
+                .join("vmlinux"),
+            rootfs_image: self
+                .cfg
+                .image_store
+                .join("rootfs")
+                .join(&req.rootfs_sha256)
+                .join("rootfs.img"),
+            verified_images: Some(verified_images),
             rootfs_read_only: req.rootfs_read_only,
             vcpu_count: req.vcpu_count,
             mem_size_mib: req.mem_size_mib,
@@ -748,9 +814,12 @@ impl WorkspaceManager {
                     serde_json::json!({ "op": "create_workspace", "error": e.to_string() }),
                 )
                 .await;
-                SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::LaunchFailed,
-                    message: e.to_string(),
+                match e {
+                    crate::firecracker::LaunchError::Image(error) => image_error_response(error),
+                    other => SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::LaunchFailed,
+                        message: other.to_string(),
+                    },
                 }
             }
         }
@@ -2012,6 +2081,7 @@ impl WorkspaceManager {
             workspace_id: new_workspace_id.to_string(),
             kernel_image: PathBuf::from(&manifest.kernel_path),
             rootfs_image: PathBuf::from(&manifest.rootfs_path),
+            verified_images: None,
             rootfs_read_only: true,
             vcpu_count: manifest.guest_identity.vcpu_count,
             mem_size_mib: manifest.guest_identity.mem_size_mib,
@@ -3079,8 +3149,8 @@ mod tests {
         let mgr = test_manager().await;
         let req = CreateWorkspaceRequest {
             workspace_id: "w".into(),
-            kernel_image_path: "k".into(),
-            rootfs_image_path: "r".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -3099,6 +3169,118 @@ mod tests {
                 }
             ),
             "expected TierNotFound, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_create_rejects_half_present_or_invalid_digest_pair() {
+        let mgr = test_manager().await;
+        for (kernel_sha256, rootfs_sha256) in [
+            ("11".repeat(32), String::new()),
+            ("AA".repeat(32), "22".repeat(32)),
+        ] {
+            let response = mgr
+                .create(CreateWorkspaceRequest {
+                    workspace_id: "bad-tier-digest".into(),
+                    kernel_sha256,
+                    rootfs_sha256,
+                    rootfs_read_only: true,
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    guest_vsock_cid: 3,
+                    kernel_boot_args: None,
+                    network: None,
+                    tier: Some("default".into()),
+                })
+                .await;
+            assert!(matches!(
+                response,
+                SupervisorResponse::Error {
+                    kind: S::InvalidImageDigest,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_cold_create_rejects_empty_digest_pair() {
+        let mgr = test_manager().await;
+        let response = mgr
+            .create(CreateWorkspaceRequest {
+                workspace_id: "missing-digests".into(),
+                kernel_sha256: String::new(),
+                rootfs_sha256: String::new(),
+                rootfs_read_only: true,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                guest_vsock_cid: 3,
+                kernel_boot_args: None,
+                network: None,
+                tier: None,
+            })
+            .await;
+        assert!(matches!(
+            response,
+            SupervisorResponse::Error {
+                kind: S::InvalidImageDigest,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_managed_image_is_rejected_before_network_setup() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let state_dir = tmp.path().join("state");
+        let image_store = tmp.path().join("images");
+        tokio::fs::create_dir_all(state_dir.join("keys"))
+            .await
+            .expect("keys dir");
+        tokio::fs::create_dir_all(&image_store)
+            .await
+            .expect("image store");
+        let audit = AuditLog::open(&state_dir).await.expect("audit open");
+        let mut cfg = WorkspaceManagerConfig::dev_defaults();
+        cfg.state_dir = state_dir;
+        cfg.image_store = image_store;
+        cfg.network = Some(crate::network::NetworkController::new(
+            PathBuf::from("/definitely/not/invoked/ip"),
+            PathBuf::from("/definitely/not/invoked/iptables"),
+            "eth0".into(),
+            None,
+            "1.1.1.1:53".into(),
+            None,
+            None,
+            None,
+        ));
+        let mgr = WorkspaceManager::new(cfg, audit).expect("workspace manager");
+        let response = mgr
+            .create(CreateWorkspaceRequest {
+                workspace_id: "missing-image".into(),
+                kernel_sha256: "11".repeat(32),
+                rootfs_sha256: "22".repeat(32),
+                rootfs_read_only: true,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                guest_vsock_cid: 3,
+                kernel_boot_args: None,
+                network: Some(ne_protocol::supervisor::NetworkConfig {
+                    enable_egress: true,
+                    ..Default::default()
+                }),
+                tier: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                response,
+                SupervisorResponse::Error {
+                    kind: S::ImageNotFound,
+                    ..
+                }
+            ),
+            "missing image must win before any network command: {response:?}"
         );
     }
 

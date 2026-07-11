@@ -22,7 +22,6 @@
 //! networking; Phase 2 adds attestation.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -33,10 +32,11 @@ use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
+use crate::image::{ImageError, VerifiedImagePair, stage_verified_pair};
+
 /// Inputs to a single workspace launch. The supervisor builds this
 /// from a [`ne_protocol::supervisor::CreateWorkspaceRequest`]
 /// plus its own configuration (binary paths, jailer uid/gid, etc.).
-#[derive(Debug, Clone)]
 pub struct LaunchConfig {
     /// Opaque identifier for the workspace; jailer uses this as the
     /// chroot subdirectory name.
@@ -45,6 +45,9 @@ pub struct LaunchConfig {
     pub kernel_image: PathBuf,
     /// Host path to the guest rootfs image.
     pub rootfs_image: PathBuf,
+    /// Retained, verified source handles for a cold create. Snapshot restore
+    /// temporarily uses the managed paths above until manifest v5 lands.
+    pub verified_images: Option<VerifiedImagePair>,
     /// Whether to mount the rootfs read-only inside the guest.
     pub rootfs_read_only: bool,
     /// Number of vCPUs to give the guest.
@@ -120,7 +123,7 @@ pub struct Instance {
     // --- Snapshot manifest metadata ---
     // These fields are captured at launch/restore time and written into
     // the snapshot manifest so `restore()` can reconstruct a full `LaunchConfig`
-    // without a per-request `kernel_image_path` argument.
+    // without a per-request kernel image location.
     /// vsock CID assigned to the guest (from `LaunchConfig::guest_vsock_cid`).
     pub guest_vsock_cid: u32,
     /// vCPU count (from `LaunchConfig::vcpu_count`).
@@ -141,6 +144,9 @@ pub enum LaunchError {
     /// IO error during chroot setup, jailer spawn, or API call.
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    /// Verified image staging failed.
+    #[error(transparent)]
+    Image(#[from] ImageError),
     /// `kernel_image` did not exist or was not a regular file.
     #[error("kernel image not found: {0}")]
     KernelNotFound(PathBuf),
@@ -204,7 +210,9 @@ struct JailedFirecracker {
 /// Spawns a jailed Firecracker, stages kernel+rootfs into the chroot, and
 /// waits for the API socket. Shared by `launch` (cold boot) and `restore`
 /// (snapshot load, Task 7). Returns the live child + resolved host paths.
-async fn spawn_jailed_firecracker(cfg: &LaunchConfig) -> Result<JailedFirecracker, LaunchError> {
+async fn spawn_jailed_firecracker(
+    cfg: &mut LaunchConfig,
+) -> Result<JailedFirecracker, LaunchError> {
     // S2-F1 (Critical) backstop: validate the id BEFORE it is joined into any
     // host path or passed to the jailer. `launch()` also checks this, but
     // `restore()`/`fork()` reach this function directly with a caller-supplied
@@ -227,14 +235,50 @@ async fn spawn_jailed_firecracker(cfg: &LaunchConfig) -> Result<JailedFirecracke
 
     let kernel_in_chroot = jailer_chroot.join("vmlinux");
     let rootfs_in_chroot = jailer_chroot.join("rootfs.img");
-    stage_file(&cfg.kernel_image, &kernel_in_chroot).await?;
-    stage_file(&cfg.rootfs_image, &rootfs_in_chroot).await?;
-
-    // chown staged artifacts to the dropped uid/gid; jailer will
-    // chown them again recursively but doing it ourselves means
-    // Firecracker can read them even if jailer's chown races.
-    chown(&kernel_in_chroot, cfg.jailer_uid, cfg.jailer_gid)?;
-    chown(&rootfs_in_chroot, cfg.jailer_uid, cfg.jailer_gid)?;
+    let stage_result = if let Some(images) = cfg.verified_images.as_mut() {
+        stage_verified_pair(
+            images,
+            &kernel_in_chroot,
+            &rootfs_in_chroot,
+            cfg.rootfs_read_only,
+            cfg.jailer_uid,
+            cfg.jailer_gid,
+        )
+        .await
+        .map_err(LaunchError::from)
+    } else {
+        // Transitional restore-only path. Task 3 resolves snapshot digests
+        // through ImageStore and removes this branch.
+        async {
+            stage_restore_file(
+                &cfg.kernel_image,
+                &kernel_in_chroot,
+                0o400,
+                cfg.jailer_uid,
+                cfg.jailer_gid,
+            )
+            .await?;
+            stage_restore_file(
+                &cfg.rootfs_image,
+                &rootfs_in_chroot,
+                if cfg.rootfs_read_only { 0o400 } else { 0o600 },
+                cfg.jailer_uid,
+                cfg.jailer_gid,
+            )
+            .await?;
+            Ok::<(), io::Error>(())
+        }
+        .await
+        .map_err(LaunchError::from)
+    };
+    if let Err(error) = stage_result {
+        let workspace_root = jailer_chroot
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&jailer_chroot);
+        let _ = tokio::fs::remove_dir_all(workspace_root).await;
+        return Err(error);
+    }
 
     // Host-side path to the vsock UDS. Firecracker (running inside
     // the jailer chroot) creates this file at the `uds_path` we pass
@@ -319,18 +363,20 @@ async fn spawn_jailed_firecracker(cfg: &LaunchConfig) -> Result<JailedFirecracke
 
 /// Launch one workspace. On error all partial host state is cleaned
 /// up (chroot directory, jailer process if it spawned).
-pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
+pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
     if !is_valid_jailer_id(&cfg.workspace_id) {
         return Err(LaunchError::InvalidWorkspaceId(cfg.workspace_id));
     }
-    if !cfg.kernel_image.is_file() {
-        return Err(LaunchError::KernelNotFound(cfg.kernel_image));
-    }
-    if !cfg.rootfs_image.is_file() {
-        return Err(LaunchError::RootfsNotFound(cfg.rootfs_image));
+    if cfg.verified_images.is_none() {
+        if !cfg.kernel_image.is_file() {
+            return Err(LaunchError::KernelNotFound(cfg.kernel_image));
+        }
+        if !cfg.rootfs_image.is_file() {
+            return Err(LaunchError::RootfsNotFound(cfg.rootfs_image));
+        }
     }
 
-    let jailed = spawn_jailed_firecracker(&cfg).await?;
+    let jailed = spawn_jailed_firecracker(&mut cfg).await?;
 
     // Configure the microVM. The order here matters: machine-config
     // sets vCPU/memory budgets, boot-source loads the kernel, drives
@@ -667,15 +713,35 @@ fn is_valid_jailer_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Stage `src` at `dst`. Prefers a hardlink (same filesystem, free);
-/// falls back to a copy if hardlinking fails (cross-fs or no perms).
-async fn stage_file(src: &Path, dst: &Path) -> io::Result<()> {
-    if dst.exists() {
-        tokio::fs::remove_file(dst).await?;
+/// Transitional snapshot-restore staging. Cold creates never use this path;
+/// Task 3 replaces it with verified manifest digest resolution.
+async fn stage_restore_file(
+    src: &Path,
+    dst: &Path,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut source = tokio::fs::File::open(src).await?;
+    let mut destination = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(dst)
+        .await?;
+    if let Err(error) = async {
+        tokio::io::copy(&mut source, &mut destination).await?;
+        destination.flush().await?;
+        chown(dst, uid, gid)?;
+        tokio::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).await
     }
-    if tokio::fs::hard_link(src, dst).await.is_err() {
-        tokio::fs::copy(src, dst).await?;
-        tokio::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644)).await?;
+    .await
+    {
+        let _ = tokio::fs::remove_file(dst).await;
+        return Err(error);
     }
     Ok(())
 }
@@ -1236,12 +1302,12 @@ pub struct RestoreLaunchConfig {
 //    stages rootfs there — confirm the path matches exactly.
 // 3. FC version skew: if /snapshot/load returns a version-incompat error, the
 //    caller surfaces it as RestoreFailed (manifest records firecracker_version).
-pub async fn restore(cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> {
+pub async fn restore(mut cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> {
     if cfg.launch.network.is_some() {
         return Err(LaunchError::NetworkedRestoreUnsupported);
     }
     // Boot the jailed FC (stages rootfs+kernel, waits for api socket).
-    let jailed = spawn_jailed_firecracker(&cfg.launch).await?;
+    let jailed = spawn_jailed_firecracker(&mut cfg.launch).await?;
 
     // Stage the snapshot mem/vmstate into the chroot and issue the load.
     // Capture the first error rather than `?`-ing out: restore copies a

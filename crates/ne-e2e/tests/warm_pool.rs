@@ -183,8 +183,8 @@ async fn wait_pool_at_least(mgr: &WorkspaceManager, n: u32, deadline: Duration) 
 fn tier_create_req(workspace_id: &str) -> CreateWorkspaceRequest {
     CreateWorkspaceRequest {
         workspace_id: workspace_id.to_string(),
-        kernel_image_path: String::new(),
-        rootfs_image_path: String::new(),
+        kernel_sha256: String::new(),
+        rootfs_sha256: String::new(),
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,

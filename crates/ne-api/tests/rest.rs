@@ -135,8 +135,8 @@ async fn create_workspace_returns_201() {
     });
     let payload = serde_json::json!({
         "workspace_id": "wks-1",
-        "kernel_image_path": "/k",
-        "rootfs_image_path": "/r",
+        "kernel_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "rootfs_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
         "rootfs_read_only": true,
         "vcpu_count": 1,
         "mem_size_mib": 256,
@@ -167,8 +167,8 @@ async fn create_workspace_zero_vcpu_is_400() {
     });
     let payload = serde_json::json!({
         "workspace_id": "w",
-        "kernel_image_path": "/k",
-        "rootfs_image_path": "/r",
+        "kernel_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "rootfs_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
         "rootfs_read_only": true,
         "vcpu_count": 0,
         "mem_size_mib": 256,

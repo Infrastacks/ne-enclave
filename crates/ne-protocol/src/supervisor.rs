@@ -92,11 +92,10 @@ pub struct CreateWorkspaceRequest {
     /// Opaque workspace identifier. The caller (API daemon) picks this;
     /// the supervisor does not generate IDs.
     pub workspace_id: String,
-    /// Absolute host path to the guest kernel image (uncompressed ELF
-    /// vmlinux for Firecracker).
-    pub kernel_image_path: String,
-    /// Absolute host path to the guest rootfs image (squashfs or ext4).
-    pub rootfs_image_path: String,
+    /// Canonical lowercase SHA-256 digest of the managed guest kernel image.
+    pub kernel_sha256: String,
+    /// Canonical lowercase SHA-256 digest of the managed guest rootfs image.
+    pub rootfs_sha256: String,
     /// Whether the rootfs should be mounted read-only inside the guest.
     /// Required `true` for squashfs; ext4 may be either.
     pub rootfs_read_only: bool,
@@ -626,6 +625,16 @@ pub enum SupervisorErrorKind {
     Unauthorized,
     /// Request could not be parsed or was malformed.
     InvalidRequest,
+    /// A required image digest was missing or not canonical lowercase SHA-256.
+    InvalidImageDigest,
+    /// The expected managed image artifact does not exist.
+    ImageNotFound,
+    /// The managed image artifact was unsafe (for example a symlink).
+    ImageRejected,
+    /// The managed artifact bytes did not match the requested digest.
+    ImageDigestMismatch,
+    /// A verified image could not be staged into the workspace chroot.
+    ImageStageFailed,
     /// Operation is not implemented on this platform or build.
     Unsupported,
     /// A workspace with this `workspace_id` already exists.
@@ -734,8 +743,8 @@ mod tests {
     fn create_workspace_request_roundtrips() {
         let req = SupervisorRequest::CreateWorkspace(CreateWorkspaceRequest {
             workspace_id: "wks_01jABCDEF".into(),
-            kernel_image_path: "/opt/ne-enclave/kernel/vmlinux-spike".into(),
-            rootfs_image_path: "/opt/ne-enclave/rootfs/ubuntu-24.04.squashfs".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 256,
@@ -753,8 +762,8 @@ mod tests {
     fn create_workspace_request_with_network_roundtrips() {
         let req = SupervisorRequest::CreateWorkspace(CreateWorkspaceRequest {
             workspace_id: "wks-net-1".into(),
-            kernel_image_path: "/k".into(),
-            rootfs_image_path: "/r".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 256,
@@ -782,8 +791,8 @@ mod tests {
         let legacy = r#"{
             "op":"create_workspace",
             "workspace_id":"wks-legacy",
-            "kernel_image_path":"/k",
-            "rootfs_image_path":"/r",
+            "kernel_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+            "rootfs_sha256":"2222222222222222222222222222222222222222222222222222222222222222",
             "rootfs_read_only":true,
             "vcpu_count":1,
             "mem_size_mib":256,
@@ -950,6 +959,17 @@ mod tests {
     #[test]
     fn new_supervisor_error_kinds_roundtrip() {
         for (variant, expected) in [
+            (
+                SupervisorErrorKind::InvalidImageDigest,
+                "invalid_image_digest",
+            ),
+            (SupervisorErrorKind::ImageNotFound, "image_not_found"),
+            (SupervisorErrorKind::ImageRejected, "image_rejected"),
+            (
+                SupervisorErrorKind::ImageDigestMismatch,
+                "image_digest_mismatch",
+            ),
+            (SupervisorErrorKind::ImageStageFailed, "image_stage_failed"),
             (SupervisorErrorKind::PathRejected, "path_rejected"),
             (SupervisorErrorKind::FileTooLarge, "file_too_large"),
             (SupervisorErrorKind::FileNotFound, "file_not_found"),
@@ -1108,7 +1128,7 @@ mod tests {
 
     #[test]
     fn create_request_tier_is_optional_and_snake_tagged() {
-        let json = r#"{"op":"create_workspace","workspace_id":"w","kernel_image_path":"k","rootfs_image_path":"r","rootfs_read_only":true,"vcpu_count":1,"mem_size_mib":128,"guest_vsock_cid":3}"#;
+        let json = r#"{"op":"create_workspace","workspace_id":"w","kernel_sha256":"1111111111111111111111111111111111111111111111111111111111111111","rootfs_sha256":"2222222222222222222222222222222222222222222222222222222222222222","rootfs_read_only":true,"vcpu_count":1,"mem_size_mib":128,"guest_vsock_cid":3}"#;
         let req: SupervisorRequest = serde_json::from_str(json).expect("parse");
         match req {
             SupervisorRequest::CreateWorkspace(c) => assert_eq!(c.tier, None),

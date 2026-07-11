@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
                 firecracker_binary: a.firecracker_binary,
                 jailer_binary: a.jailer_binary,
                 jailer_chroot_base: a.jailer_chroot_base,
+                image_store: a.image_store,
                 jailer_uid: a.jailer_uid,
                 jailer_gid: a.jailer_gid,
                 openshell_sandbox_binary: a.openshell_sandbox_binary,

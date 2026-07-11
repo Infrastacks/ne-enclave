@@ -83,7 +83,7 @@ pub struct SnapshotManifest {
     /// Absolute host path to the kernel image used by the snapshotted VM.
     ///
     /// Stored in the manifest so `restore()` can locate the kernel without
-    /// a separate per-request `kernel_image_path` argument.
+    /// a separate per-request kernel image location.
     pub kernel_path: String,
     /// Base64-encoded Ed25519 public key that signed this manifest.
     /// Carried inside the signed bytes so key-swap forgery is detectable.

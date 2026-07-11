@@ -47,8 +47,8 @@ async fn main() -> anyhow::Result<()> {
 
     let params = CreateParams {
         workspace_id: String::new(), // set per-trial by each benchmark
-        kernel_image_path: args.kernel_path.clone(),
-        rootfs_image_path: args.rootfs_path.clone(),
+        kernel_sha256: args.kernel_digest.clone(),
+        rootfs_sha256: args.rootfs_digest.clone(),
         vcpu_count: args.vcpu_count,
         mem_size_mib: args.mem_size_mib,
         guest_vsock_cid: args.base_vsock_cid,

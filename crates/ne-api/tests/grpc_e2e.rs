@@ -73,8 +73,8 @@ async fn create_workspace_round_trips_through_api_and_supervisor() {
     let response = client
         .create_workspace(pb::CreateWorkspaceRequest {
             workspace_id: "wks-rpc-1".into(),
-            kernel_image_path: "/opt/ne-enclave/kernel/vmlinux-spike".into(),
-            rootfs_image_path: "/opt/ne-enclave/rootfs/spike.ext4".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 2,
             mem_size_mib: 512,

@@ -34,6 +34,7 @@ use ne_protocol::supervisor::{
     CreateWorkspaceRequest, RunCommandRequest as SupervisorRunCommandRequest, SupervisorRequest,
     SupervisorResponse, TerminateRequest,
 };
+use sha2::Digest as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -52,6 +53,8 @@ async fn run_command_round_trips_through_vsock() {
     let socket = format!("/tmp/ne-rc-{}.sock", std::process::id());
     let workspace_id = format!("wks-rc-{}", std::process::id());
     let supervisor_bin = ne_binary();
+    let (image_store, kernel_sha256, rootfs_sha256) =
+        prepare_managed_images(&kernel, &rootfs, "direct");
 
     let mut supervisor = Command::new("sudo")
         .arg("-n")
@@ -66,6 +69,8 @@ async fn run_command_round_trips_through_vsock() {
         .arg(JAILER)
         .arg("--jailer-chroot-base")
         .arg(CHROOT_BASE)
+        .arg("--image-store")
+        .arg(&image_store)
         .arg("--jailer-uid")
         .arg("1000")
         .arg("--jailer-gid")
@@ -79,8 +84,8 @@ async fn run_command_round_trips_through_vsock() {
     // Boot the spike image.
     let create = SupervisorRequest::CreateWorkspace(CreateWorkspaceRequest {
         workspace_id: workspace_id.clone(),
-        kernel_image_path: kernel.display().to_string(),
-        rootfs_image_path: rootfs.display().to_string(),
+        kernel_sha256,
+        rootfs_sha256,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 256,
@@ -153,6 +158,8 @@ async fn run_command_via_supervisor_ipc_round_trip() {
     let socket = format!("/tmp/ne-rc2-{}.sock", std::process::id());
     let workspace_id = format!("wks-rc2-{}", std::process::id());
     let supervisor_bin = ne_binary();
+    let (image_store, kernel_sha256, rootfs_sha256) =
+        prepare_managed_images(&kernel, &rootfs, "ipc");
 
     let mut supervisor = Command::new("sudo")
         .arg("-n")
@@ -167,6 +174,8 @@ async fn run_command_via_supervisor_ipc_round_trip() {
         .arg(JAILER)
         .arg("--jailer-chroot-base")
         .arg(CHROOT_BASE)
+        .arg("--image-store")
+        .arg(&image_store)
         .arg("--jailer-uid")
         .arg("1000")
         .arg("--jailer-gid")
@@ -180,8 +189,8 @@ async fn run_command_via_supervisor_ipc_round_trip() {
     // CreateWorkspace.
     let create = SupervisorRequest::CreateWorkspace(CreateWorkspaceRequest {
         workspace_id: workspace_id.clone(),
-        kernel_image_path: kernel.display().to_string(),
-        rootfs_image_path: rootfs.display().to_string(),
+        kernel_sha256,
+        rootfs_sha256,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 256,
@@ -289,6 +298,21 @@ fn locate_spike_artifacts() -> (PathBuf, PathBuf) {
     );
     assert!(rootfs.is_file(), "missing {}", rootfs.display());
     (kernel, rootfs)
+}
+
+fn prepare_managed_images(kernel: &Path, rootfs: &Path, suffix: &str) -> (PathBuf, String, String) {
+    let store = PathBuf::from(format!("/tmp/ne-rc-images-{}-{suffix}", std::process::id()));
+    let kernel_bytes = std::fs::read(kernel).expect("read kernel");
+    let rootfs_bytes = std::fs::read(rootfs).expect("read rootfs");
+    let kernel_sha256 = hex::encode(sha2::Sha256::digest(&kernel_bytes));
+    let rootfs_sha256 = hex::encode(sha2::Sha256::digest(&rootfs_bytes));
+    let kernel_dst = store.join("kernels").join(&kernel_sha256).join("vmlinux");
+    let rootfs_dst = store.join("rootfs").join(&rootfs_sha256).join("rootfs.img");
+    std::fs::create_dir_all(kernel_dst.parent().unwrap()).expect("kernel store dir");
+    std::fs::create_dir_all(rootfs_dst.parent().unwrap()).expect("rootfs store dir");
+    std::fs::write(kernel_dst, kernel_bytes).expect("managed kernel");
+    std::fs::write(rootfs_dst, rootfs_bytes).expect("managed rootfs");
+    (store, kernel_sha256, rootfs_sha256)
 }
 
 async fn connect_and_run_command(
