@@ -22,7 +22,6 @@
 //! networking; Phase 2 adds attestation.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -77,18 +76,18 @@ fn scaled_api_timeout(mem_size_mib: u32) -> Duration {
     Duration::from_millis(*FC_API_TIMEOUT_MS + u64::from(mem_size_mib) * PER_MIB_MS)
 }
 
+use crate::image::{ImageError, VerifiedImagePair, WorkspaceClaim, stage_verified_pair};
+
 /// Inputs to a single workspace launch. The supervisor builds this
 /// from a [`ne_protocol::supervisor::CreateWorkspaceRequest`]
 /// plus its own configuration (binary paths, jailer uid/gid, etc.).
-#[derive(Debug, Clone)]
 pub struct LaunchConfig {
     /// Opaque identifier for the workspace; jailer uses this as the
     /// chroot subdirectory name.
     pub workspace_id: String,
-    /// Host path to the guest kernel image (uncompressed vmlinux).
-    pub kernel_image: PathBuf,
-    /// Host path to the guest rootfs image.
-    pub rootfs_image: PathBuf,
+    /// Retained, verified source handles. All launch and restore paths must
+    /// resolve these before any workspace tree is claimed.
+    pub verified_images: VerifiedImagePair,
     /// Whether to mount the rootfs read-only inside the guest.
     pub rootfs_read_only: bool,
     /// Number of vCPUs to give the guest.
@@ -173,8 +172,7 @@ pub struct Instance {
     pub network_slot: Option<crate::network::NetworkSlot>,
     // --- Snapshot manifest metadata ---
     // These fields are captured at launch/restore time and written into
-    // the snapshot manifest so `restore()` can reconstruct a full `LaunchConfig`
-    // without a per-request `kernel_image_path` argument.
+    // the snapshot manifest so `restore()` can reconstruct a full launch.
     /// vsock CID assigned to the guest (from `LaunchConfig::guest_vsock_cid`).
     pub guest_vsock_cid: u32,
     /// vCPU count (from `LaunchConfig::vcpu_count`).
@@ -183,10 +181,13 @@ pub struct Instance {
     pub mem_size_mib: u32,
     /// Kernel command-line arguments (from `LaunchConfig::kernel_boot_args`).
     pub kernel_boot_args: String,
-    /// Host path to the rootfs image (from `LaunchConfig::rootfs_image`).
-    pub rootfs_path: PathBuf,
-    /// Host path to the kernel image (from `LaunchConfig::kernel_image`).
-    pub kernel_path: PathBuf,
+    /// Canonical managed kernel content identity.
+    pub kernel_sha256: String,
+    /// Canonical managed rootfs content identity.
+    pub rootfs_sha256: String,
+    /// Whether the rootfs was launched read-only. Writable-rootfs instances
+    /// cannot be snapshotted because v5 does not capture disk mutations.
+    pub rootfs_read_only: bool,
 }
 
 /// Errors returned by [`launch`].
@@ -195,12 +196,13 @@ pub enum LaunchError {
     /// IO error during chroot setup, jailer spawn, or API call.
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    /// `kernel_image` did not exist or was not a regular file.
-    #[error("kernel image not found: {0}")]
-    KernelNotFound(PathBuf),
-    /// `rootfs_image` did not exist or was not a regular file.
-    #[error("rootfs image not found: {0}")]
-    RootfsNotFound(PathBuf),
+    /// Verified image staging failed.
+    #[error(transparent)]
+    Image(#[from] ImageError),
+    /// Child termination or reaping failed. The owned workspace tree is left
+    /// intact because deleting it while the child may still run is unsafe.
+    #[error("{0}")]
+    TerminationFailed(String),
     /// `workspace_id` contained a character not in `[a-zA-Z0-9-]` (the
     /// jailer ID grammar).
     #[error("workspace_id {0:?} is not a valid jailer id ([a-zA-Z0-9-]{{1,64}})")]
@@ -251,6 +253,8 @@ struct JailedFirecracker {
     api_socket_host: PathBuf,
     vsock_host_socket: PathBuf,
     jailer_chroot: PathBuf,
+    /// Exact workspace directory atomically claimed by this launch.
+    workspace_root: PathBuf,
     /// Host path of the staged kernel inside the chroot (used by launch
     /// to derive the chroot-relative boot-source path).
     kernel_in_chroot: PathBuf,
@@ -262,141 +266,152 @@ struct JailedFirecracker {
 /// Spawns a jailed Firecracker, stages kernel+rootfs into the chroot, and
 /// waits for the API socket. Shared by `launch` (cold boot) and `restore`
 /// (snapshot load, Task 7). Returns the live child + resolved host paths.
-async fn spawn_jailed_firecracker(cfg: &LaunchConfig) -> Result<JailedFirecracker, LaunchError> {
+async fn spawn_jailed_firecracker(
+    cfg: &mut LaunchConfig,
+) -> Result<JailedFirecracker, LaunchError> {
     // S2-F1 (Critical) backstop: validate the id BEFORE it is joined into any
     // host path or passed to the jailer. `launch()` also checks this, but
     // `restore()`/`fork()` reach this function directly with a caller-supplied
     // `new_workspace_id`; gating here covers every caller by construction so an
-    // absolute or `..`-bearing id can never reach `create_dir_all`/`stage_file`/
-    // `remove_dir_all` (which run as root) outside the per-workspace tree.
+    // absolute or `..`-bearing id can never reach workspace claiming/image
+    // staging/cleanup (which run as root) outside the per-workspace tree.
     if !is_valid_jailer_id(&cfg.workspace_id) {
         return Err(LaunchError::InvalidWorkspaceId(cfg.workspace_id.clone()));
     }
-    // jailer's convention: chroot lands at
-    //   {chroot_base}/firecracker/{id}/root/
-    // jailer creates root/ itself, but we need to stage kernel + rootfs
-    // inside it BEFORE jailer chowns the tree to the dropped uid/gid.
-    let jailer_chroot = cfg
-        .chroot_base
-        .join("firecracker")
-        .join(&cfg.workspace_id)
-        .join("root");
-    tokio::fs::create_dir_all(&jailer_chroot).await?;
+    // Claim the workspace id atomically. A collision returns before this
+    // invocation owns anything and therefore never cleans the existing tree.
+    let claim = WorkspaceClaim::claim(&cfg.chroot_base, &cfg.workspace_id).await?;
+    let jailer_chroot = claim.jailer_chroot().to_path_buf();
+    let workspace_root = claim.workspace_root().to_path_buf();
 
-    let kernel_in_chroot = jailer_chroot.join("vmlinux");
-    let rootfs_in_chroot = jailer_chroot.join("rootfs.img");
-    stage_file(&cfg.kernel_image, &kernel_in_chroot).await?;
-    stage_file(&cfg.rootfs_image, &rootfs_in_chroot).await?;
+    let outcome: Result<JailedFirecracker, LaunchError> = async {
+        let kernel_in_chroot = jailer_chroot.join("vmlinux");
+        let rootfs_in_chroot = jailer_chroot.join("rootfs.img");
+        stage_verified_pair(
+            &mut cfg.verified_images,
+            &kernel_in_chroot,
+            &rootfs_in_chroot,
+            cfg.rootfs_read_only,
+            cfg.jailer_uid,
+            cfg.jailer_gid,
+        )
+        .await?;
 
-    // chown staged artifacts to the dropped uid/gid; jailer will
-    // chown them again recursively but doing it ourselves means
-    // Firecracker can read them even if jailer's chown races.
-    chown(&kernel_in_chroot, cfg.jailer_uid, cfg.jailer_gid)?;
-    chown(&rootfs_in_chroot, cfg.jailer_uid, cfg.jailer_gid)?;
+        // Host-side path to the vsock UDS. Firecracker (running inside
+        // the jailer chroot) creates this file at the `uds_path` we pass
+        // in the /vsock API call — relative to its OWN root, which from
+        // the host's POV is the jailer chroot. So the host path is
+        // `{jailer_chroot}/vsock.sock`, NOT `{chroot_base}/firecracker/
+        // {id}/vsock.sock` (that wrong path was one level too shallow
+        // and would never have a socket on it).
+        //
+        // Firecracker vsock UDS convention (for our caller's reference):
+        //   - Host → guest connection: connect to this base UDS and
+        //     send "CONNECT <guest_port>\n". Firecracker replies
+        //     "OK <fc_port>\n" then bridges the byte stream.
+        //   - Guest → host connection: Firecracker forwards to
+        //     `{vsock_host_socket}_<host_port>` (host must listen there).
+        let vsock_host_socket = jailer_chroot.join("vsock.sock");
 
-    // Host-side path to the vsock UDS. Firecracker (running inside
-    // the jailer chroot) creates this file at the `uds_path` we pass
-    // in the /vsock API call — relative to its OWN root, which from
-    // the host's POV is the jailer chroot. So the host path is
-    // `{jailer_chroot}/vsock.sock`, NOT `{chroot_base}/firecracker/
-    // {id}/vsock.sock` (that wrong path was one level too shallow
-    // and would never have a socket on it).
-    //
-    // Firecracker vsock UDS convention (for our caller's reference):
-    //   - Host → guest connection: connect to this base UDS and
-    //     send "CONNECT <guest_port>\n". Firecracker replies
-    //     "OK <fc_port>\n" then bridges the byte stream.
-    //   - Guest → host connection: Firecracker forwards to
-    //     `{vsock_host_socket}_<host_port>` (host must listen there).
-    let vsock_host_socket = jailer_chroot.join("vsock.sock");
+        // The API socket lives at /run/firecracker.socket inside the
+        // chroot per jailer convention; host path is chroot + that.
+        let api_socket_in_chroot = "/run/firecracker.socket";
+        let api_socket_host = jailer_chroot.join("run").join("firecracker.socket");
 
-    // The API socket lives at /run/firecracker.socket inside the
-    // chroot per jailer convention; host path is chroot + that.
-    let api_socket_in_chroot = "/run/firecracker.socket";
-    let api_socket_host = jailer_chroot.join("run").join("firecracker.socket");
+        // Spawn jailer. Args after `--` go to Firecracker itself.
+        let mut jailer_cmd = Command::new(&cfg.jailer_binary);
+        jailer_cmd
+            .arg("--id")
+            .arg(&cfg.workspace_id)
+            .arg("--exec-file")
+            .arg(&cfg.firecracker_binary)
+            .arg("--uid")
+            .arg(cfg.jailer_uid.to_string())
+            .arg("--gid")
+            .arg(cfg.jailer_gid.to_string())
+            .arg("--chroot-base-dir")
+            .arg(&cfg.chroot_base);
+        if let Some(net) = &cfg.network {
+            // jailer's --netns drops Firecracker into the workspace's
+            // network namespace before chrooting + exec'ing, so the TAP
+            // we provisioned in the netns is visible from inside.
+            jailer_cmd.arg("--netns").arg(&net.netns_path);
+        }
+        // After `--`, args go to Firecracker. Jailer already passes
+        // `--id` to Firecracker itself, so we only add `--api-sock`.
+        jailer_cmd
+            .arg("--")
+            .arg("--api-sock")
+            .arg(api_socket_in_chroot);
+        let mut child = jailer_cmd.kill_on_drop(true).spawn()?;
 
-    // Spawn jailer. Args after `--` go to Firecracker itself.
-    let mut jailer_cmd = Command::new(&cfg.jailer_binary);
-    jailer_cmd
-        .arg("--id")
-        .arg(&cfg.workspace_id)
-        .arg("--exec-file")
-        .arg(&cfg.firecracker_binary)
-        .arg("--uid")
-        .arg(cfg.jailer_uid.to_string())
-        .arg("--gid")
-        .arg(cfg.jailer_gid.to_string())
-        .arg("--chroot-base-dir")
-        .arg(&cfg.chroot_base);
-    if let Some(net) = &cfg.network {
-        // jailer's --netns drops Firecracker into the workspace's
-        // network namespace before chrooting + exec'ing, so the TAP
-        // we provisioned in the netns is visible from inside.
-        jailer_cmd.arg("--netns").arg(&net.netns_path);
+        let firecracker_pid = child.id().ok_or_else(|| {
+            LaunchError::Io(io::Error::other(
+                "jailer child has no pid (already exited?)",
+            ))
+        })?;
+        info!(
+            workspace_id = %cfg.workspace_id,
+            pid = firecracker_pid,
+            chroot = %jailer_chroot.display(),
+            "jailer spawned"
+        );
+
+        // Wait for the API socket. While waiting, watch for early jailer
+        // death so we don't burn the full timeout on a launch failure.
+        if let Err(e) = wait_for_socket(&api_socket_host, &mut child, cfg.api_socket_timeout).await
+        {
+            confirm_child_exit(&mut child, "jailer startup", &e).await?;
+            return Err(e);
+        }
+        debug!(socket = %api_socket_host.display(), "Firecracker API socket ready");
+
+        Ok(JailedFirecracker {
+            child,
+            firecracker_pid,
+            api_socket_host,
+            vsock_host_socket,
+            jailer_chroot,
+            workspace_root,
+            kernel_in_chroot,
+            rootfs_in_chroot,
+        })
     }
-    // After `--`, args go to Firecracker. Jailer already passes
-    // `--id` to Firecracker itself, so we only add `--api-sock`.
-    jailer_cmd
-        .arg("--")
-        .arg("--api-sock")
-        .arg(api_socket_in_chroot);
-    let mut child = jailer_cmd.kill_on_drop(true).spawn()?;
+    .await;
 
-    let firecracker_pid = child.id().ok_or_else(|| {
-        LaunchError::Io(io::Error::other(
-            "jailer child has no pid (already exited?)",
-        ))
-    })?;
-    info!(
-        workspace_id = %cfg.workspace_id,
-        pid = firecracker_pid,
-        chroot = %jailer_chroot.display(),
-        "jailer spawned"
-    );
-
-    // Wait for the API socket. While waiting, watch for early jailer
-    // death so we don't burn the full timeout on a launch failure.
-    if let Err(e) = wait_for_socket(&api_socket_host, &mut child, cfg.api_socket_timeout).await {
-        // Best-effort kill + cleanup so we don't leak the chroot tree.
-        let _ = child.kill().await;
-        let _ = tokio::fs::remove_dir_all(&jailer_chroot.parent().unwrap_or(&jailer_chroot)).await;
-        return Err(e);
+    match outcome {
+        Ok(jailed) => Ok(jailed),
+        Err(LaunchError::Image(image_error)) => Err(LaunchError::Image(
+            claim.cleanup_image_failure(image_error).await,
+        )),
+        Err(error @ LaunchError::TerminationFailed(_)) => Err(error),
+        Err(other) => match claim.cleanup().await {
+            Ok(()) => Err(other),
+            Err(cleanup_error) => Err(LaunchError::Io(io::Error::other(format!(
+                "launch failed after claiming workspace: {other}; removing owned workspace tree: \
+                 {cleanup_error}"
+            )))),
+        },
     }
-    debug!(socket = %api_socket_host.display(), "Firecracker API socket ready");
-
-    Ok(JailedFirecracker {
-        child,
-        firecracker_pid,
-        api_socket_host,
-        vsock_host_socket,
-        jailer_chroot,
-        kernel_in_chroot,
-        rootfs_in_chroot,
-    })
 }
 
 /// Launch one workspace. On error all partial host state is cleaned
 /// up (chroot directory, jailer process if it spawned).
-pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
+pub async fn launch(mut cfg: LaunchConfig) -> Result<Instance, LaunchError> {
     if !is_valid_jailer_id(&cfg.workspace_id) {
         return Err(LaunchError::InvalidWorkspaceId(cfg.workspace_id));
     }
-    if !cfg.kernel_image.is_file() {
-        return Err(LaunchError::KernelNotFound(cfg.kernel_image));
-    }
-    if !cfg.rootfs_image.is_file() {
-        return Err(LaunchError::RootfsNotFound(cfg.rootfs_image));
-    }
-
-    let mut jailed = spawn_jailed_firecracker(&cfg).await?;
+    let (kernel_sha256, rootfs_sha256) = cfg.verified_images.digests();
+    let kernel_sha256 = kernel_sha256.to_owned();
+    let rootfs_sha256 = rootfs_sha256.to_owned();
+    let mut jailed = spawn_jailed_firecracker(&mut cfg).await?;
 
     // Configure the microVM. The order here matters: machine-config
     // sets vCPU/memory budgets, boot-source loads the kernel, drives
     // attach storage, vsock adds the guest-host channel, actions
-    // boots. Staged in an inner block so any failure after the jailer
-    // has spawned falls through to the cleanup below instead of
-    // leaking the child + chroot (mirrors restore()'s cleanup).
-    let staged: Result<(), LaunchError> = async {
+    // boots. Configure in an inner block so any failure after the jailer
+    // has spawned flows through the owned-tree cleanup below.
+    let configured: Result<(), LaunchError> = async {
         // Flat control-call deadline — none of these PUTs touch guest memory
         // (unlike snapshot/restore, which use `scaled_api_timeout`).
         let api_timeout = Duration::from_millis(*FC_API_TIMEOUT_MS);
@@ -473,27 +488,19 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
             api_timeout,
         )
         .await?;
+        info!(workspace_id = %cfg.workspace_id, "InstanceStart sent");
         Ok(())
     }
     .await;
-
-    if let Err(e) = staged {
-        // Kill the jailer child FIRST, then reap the chroot tree — never
-        // remove a chroot still in use by a live jailer (mirrors
-        // restore()'s cleanup). Without this, a transient config error
-        // (e.g. a bad mem_size_mib) permanently poisons the workspace-id:
-        // jailer refuses to reuse an existing chroot dir, so every
-        // subsequent launch with the same id fails with JailerExited.
-        let _ = jailed.child.start_kill();
-        let _ = jailed.child.wait().await;
-        let workspace_root = jailed
-            .jailer_chroot
-            .parent()
-            .unwrap_or(&jailed.jailer_chroot);
-        let _ = tokio::fs::remove_dir_all(workspace_root).await;
-        return Err(e);
+    if let Err(primary) = configured {
+        return Err(cleanup_failed_child(
+            &mut jailed.child,
+            &jailed.workspace_root,
+            "Firecracker configuration",
+            primary,
+        )
+        .await);
     }
-    info!(workspace_id = %cfg.workspace_id, "InstanceStart sent");
 
     Ok(Instance {
         workspace_id: cfg.workspace_id,
@@ -516,8 +523,9 @@ pub async fn launch(cfg: LaunchConfig) -> Result<Instance, LaunchError> {
         vcpu_count: cfg.vcpu_count,
         mem_size_mib: cfg.mem_size_mib,
         kernel_boot_args: cfg.kernel_boot_args,
-        rootfs_path: cfg.rootfs_image,
-        kernel_path: cfg.kernel_image,
+        kernel_sha256,
+        rootfs_sha256,
+        rootfs_read_only: cfg.rootfs_read_only,
     })
 }
 
@@ -726,8 +734,10 @@ pub async fn terminate(mut instance: Instance, grace: Duration) -> Result<(), Te
         }
         if Instant::now() >= deadline {
             warn!(workspace_id = %instance.workspace_id, "grace expired, escalating to SIGKILL");
-            let _ = kill(pid, Signal::SIGKILL);
-            let _ = instance.child.wait().await;
+            let primary = LaunchError::Io(io::Error::other("graceful termination timed out"));
+            confirm_child_exit(&mut instance.child, "workspace termination", &primary)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
             break;
         }
         sleep(Duration::from_millis(25)).await;
@@ -747,6 +757,77 @@ pub async fn terminate(mut instance: Instance, grace: Duration) -> Result<(), Te
     Ok(())
 }
 
+#[allow(async_fn_in_trait)]
+trait ChildControl {
+    fn try_wait_control(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
+    fn start_kill_control(&mut self) -> io::Result<()>;
+    async fn wait_control(&mut self) -> io::Result<std::process::ExitStatus>;
+}
+
+impl ChildControl for Child {
+    fn try_wait_control(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+
+    fn start_kill_control(&mut self) -> io::Result<()> {
+        self.start_kill()
+    }
+
+    async fn wait_control(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.wait().await
+    }
+}
+
+/// Confirm that a child has exited and has been reaped. Failure deliberately
+/// carries the primary operation context so callers can leave the owned tree
+/// intact without losing the original cause.
+async fn confirm_child_exit<C: ChildControl>(
+    child: &mut C,
+    context: &str,
+    primary: &LaunchError,
+) -> Result<(), LaunchError> {
+    match child.try_wait_control() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(LaunchError::TerminationFailed(format!(
+                "{context} failed: {primary}; checking child exit before cleanup failed: {error}; \
+                 owned workspace tree retained"
+            )));
+        }
+    }
+    child.start_kill_control().map_err(|error| {
+        LaunchError::TerminationFailed(format!(
+            "{context} failed: {primary}; terminating child before cleanup failed: {error}; owned \
+             workspace tree retained"
+        ))
+    })?;
+    child.wait_control().await.map_err(|error| {
+        LaunchError::TerminationFailed(format!(
+            "{context} failed: {primary}; reaping child before cleanup failed: {error}; owned \
+             workspace tree retained"
+        ))
+    })?;
+    Ok(())
+}
+
+async fn cleanup_failed_child<C: ChildControl>(
+    child: &mut C,
+    workspace_root: &Path,
+    context: &str,
+    primary: LaunchError,
+) -> LaunchError {
+    if let Err(termination) = confirm_child_exit(child, context, &primary).await {
+        return termination;
+    }
+    match tokio::fs::remove_dir_all(workspace_root).await {
+        Ok(()) => primary,
+        Err(cleanup) => LaunchError::Io(io::Error::other(format!(
+            "{context} failed: {primary}; removing owned workspace tree: {cleanup}"
+        ))),
+    }
+}
+
 // ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
@@ -756,49 +837,6 @@ pub async fn terminate(mut instance: Instance, grace: Duration) -> Result<(), Te
 /// jailer's exit code.
 fn is_valid_jailer_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-/// Stage `src` at `dst`. Prefers a hardlink (same filesystem, free);
-/// falls back to a copy if hardlinking fails (cross-fs or no perms).
-///
-/// Stages into a unique temp file in `dst`'s directory, then atomically
-/// `rename`s it over `dst`. This is required for safety under concurrent
-/// same-`dst` callers (e.g. two same-id `create`s sharing one chroot path):
-/// the previous implementation staged in place — `if dst.exists() {
-/// remove_file }` → `hard_link` → fallback `copy` — which has a TOCTOU
-/// window. Two racers can both observe `!dst.exists()`; the loser's
-/// `hard_link` then fails `EEXIST` (the winner already created it) and
-/// falls to `copy(src, dst)`. Since `dst` is by then a hardlink to `src`,
-/// `copy`'s truncate-on-open zeroes the shared inode — destroying `src`
-/// too (observed for real as a 0-byte `vmlinux`). Staging into a fresh,
-/// call-unique temp name means the copy fallback only ever opens an inode
-/// this call itself created, and `rename` replaces `dst` without ever
-/// opening it — so no call can write through an inode it didn't create,
-/// under any interleaving.
-async fn stage_file(src: &Path, dst: &Path) -> io::Result<()> {
-    let tmp_name = format!(
-        "{}.tmp-{}",
-        dst.file_name().and_then(|n| n.to_str()).unwrap_or("stage"),
-        ulid::Ulid::new()
-    );
-    let tmp = dst.with_file_name(tmp_name);
-
-    let result: io::Result<()> = async {
-        if tokio::fs::hard_link(src, &tmp).await.is_err() {
-            tokio::fs::copy(src, &tmp).await?;
-            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).await?;
-        }
-        tokio::fs::rename(&tmp, dst).await?;
-        Ok(())
-    }
-    .await;
-
-    if result.is_err() {
-        // Best-effort cleanup: the temp file is call-unique, so removing it
-        // here can never race with or affect another caller's staging.
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    result
 }
 
 /// chown via the nix crate (no unsafe in this crate).
@@ -1162,9 +1200,110 @@ struct SnapshotCreateBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use tokio::net::UnixListener;
+
+    struct FakeChild {
+        start_kill_error: bool,
+        wait_error: bool,
+    }
+
+    impl ChildControl for FakeChild {
+        fn try_wait_control(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn start_kill_control(&mut self) -> io::Result<()> {
+            if self.start_kill_error {
+                Err(io::Error::other("injected start_kill failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn wait_control(&mut self) -> io::Result<std::process::ExitStatus> {
+            if self.wait_error {
+                Err(io::Error::other("injected wait failure"))
+            } else {
+                Ok(std::process::ExitStatus::from_raw(0))
+            }
+        }
+    }
+
+    fn injected_primary() -> LaunchError {
+        LaunchError::Io(io::Error::other("injected primary failure"))
+    }
+
+    #[tokio::test]
+    async fn cold_cleanup_keeps_tree_when_start_kill_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owned");
+        tokio::fs::create_dir(&root).await.unwrap();
+        tokio::fs::write(root.join("sentinel"), b"live")
+            .await
+            .unwrap();
+        let mut child = FakeChild {
+            start_kill_error: true,
+            wait_error: false,
+        };
+
+        let error = cleanup_failed_child(
+            &mut child,
+            &root,
+            "Firecracker configuration",
+            injected_primary(),
+        )
+        .await;
+
+        assert!(matches!(error, LaunchError::TerminationFailed(_)));
+        assert!(error.to_string().contains("injected primary failure"));
+        assert!(
+            root.join("sentinel").exists(),
+            "live child's tree was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_cleanup_keeps_tree_when_reap_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owned");
+        tokio::fs::create_dir(&root).await.unwrap();
+        tokio::fs::write(root.join("sentinel"), b"live")
+            .await
+            .unwrap();
+        let mut child = FakeChild {
+            start_kill_error: false,
+            wait_error: true,
+        };
+
+        let error =
+            cleanup_failed_child(&mut child, &root, "snapshot restore", injected_primary()).await;
+
+        assert!(matches!(error, LaunchError::TerminationFailed(_)));
+        assert!(error.to_string().contains("injected wait failure"));
+        assert!(
+            root.join("sentinel").exists(),
+            "unreaped child's tree was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_tree_only_after_confirmed_reap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owned");
+        tokio::fs::create_dir(&root).await.unwrap();
+        let mut child = FakeChild {
+            start_kill_error: false,
+            wait_error: false,
+        };
+
+        let error = cleanup_failed_child(&mut child, &root, "restore", injected_primary()).await;
+
+        assert!(matches!(error, LaunchError::Io(_)));
+        assert!(!root.exists());
+    }
 
     /// Spawn a fake vsock-style UDS server that accepts one connection,
     /// completes the `CONNECT` handshake by writing `"OK 0\n"`, then
@@ -1389,7 +1528,7 @@ mod tests {
     }
 
     /// Regression test for the golden-image corruption bug: two concurrent
-    /// `stage_file` calls racing on the SAME `dst` path (the exact shape of
+    /// managed-image stages racing on the SAME `dst` path (the exact shape of
     /// the wedge-A `create_race` gauntlet, where two same-id creates derive
     /// the identical chroot path). Pre-fix, `stage_file` staged in place —
     /// `if dst.exists() { remove_file }` → `hard_link` → fallback `copy` —
@@ -1401,74 +1540,100 @@ mod tests {
     /// 0-byte `vmlinux` / "Unable to read elf header" during the Task 5
     /// KVM gauntlet.
     ///
-    /// The fix stages into a unique per-call temp file and atomically
-    /// renames over `dst`, so no call ever opens a pre-existing inode for
-    /// writing. This test races many same-dst `stage_file` calls repeatedly
-    /// and asserts `src`'s content is never disturbed — regardless of
-    /// whether any individual racer surfaces a (benign-looking, but itself
-    /// symptomatic of the same missing-atomicity defect) transient error,
-    /// the load-bearing safety property is that `src` is never touched. It
-    /// fails reliably against the pre-fix implementation (reproduces
-    /// corruption or a staging error within a handful of iterations) and
-    /// passes deterministically post-fix.
+    /// Managed staging retains independently verified source handles and
+    /// creates the destination exclusively. Exactly one racer owns the
+    /// destination; the loser fails closed without opening either existing
+    /// inode for writing.
     #[tokio::test]
-    async fn stage_file_concurrent_same_dst_never_corrupts_source() {
+    async fn managed_stage_concurrent_same_dst_never_corrupts_source() {
+        use crate::image::{ImageKind, ImageStore};
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt as _;
+
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let src = tmp.path().join("golden.img");
         let golden = b"GOLDEN-KERNEL-IMAGE-DO-NOT-TRUNCATE-ME".to_vec();
+        let digest = hex::encode(sha2::Sha256::digest(&golden));
+        let src = tmp.path().join("kernels").join(&digest).join("vmlinux");
+        tokio::fs::create_dir_all(src.parent().expect("managed kernel parent"))
+            .await
+            .expect("create managed kernel parent");
         tokio::fs::write(&src, &golden).await.expect("write src");
+        let metadata = std::fs::metadata(&src).expect("source metadata");
+        let store = ImageStore::new(tmp.path().to_path_buf());
         let dst = tmp.path().join("staged.img");
 
-        let mut any_racer_failed = false;
         for iter in 0..200 {
             let _ = tokio::fs::remove_file(&dst).await;
+            let mut first = store
+                .resolve(ImageKind::Kernel, &digest)
+                .await
+                .expect("resolve first retained handle");
+            let mut second = store
+                .resolve(ImageKind::Kernel, &digest)
+                .await
+                .expect("resolve second retained handle");
 
             // Exactly two racers on the identical dst path — the literal
             // shape of the reported race (two concurrent same-id creates
             // sharing one chroot dst path).
-            let (r1, r2) = tokio::join!(stage_file(&src, &dst), stage_file(&src, &dst));
-            if r1.is_err() || r2.is_err() {
-                // Pre-fix, the unsynchronized exists/remove/hard_link/copy
-                // sequence can also surface a bare ENOENT/EEXIST from the
-                // losing racer instead of (or in addition to) truncating
-                // src on any given run — both are symptoms of the same
-                // missing-atomicity defect, so record and keep going
-                // rather than stopping at the first one.
-                any_racer_failed = true;
-            }
+            let (r1, r2) = tokio::join!(
+                first.stage(&dst, 0o400, metadata.uid(), metadata.gid()),
+                second.stage(&dst, 0o400, metadata.uid(), metadata.gid())
+            );
+            assert_ne!(
+                r1.is_ok(),
+                r2.is_ok(),
+                "iter {iter}: exclusive destination creation must select exactly one owner"
+            );
 
             let src_now = tokio::fs::read(&src).await.expect("read src");
             assert_eq!(
                 src_now, golden,
                 "iter {iter}: golden source image was corrupted by a concurrent \
-                 stage_file race (copy-onto-own-hardlink truncation)"
+                 managed-stage race"
+            );
+            assert_eq!(
+                tokio::fs::read(&dst).await.expect("read staged image"),
+                golden,
+                "iter {iter}: winning stage must publish the verified image"
             );
         }
-        assert!(
-            !any_racer_failed,
-            "stage_file returned an error under concurrent same-dst staging — \
-             the staging sequence is not safe under this race"
-        );
     }
 
-    /// Defense-in-depth: even a single `stage_file` call that happens to
+    /// Defense-in-depth: even a single managed-image stage that happens to
     /// find `dst` already hardlinked to `src` (e.g. left behind by a prior
     /// staging attempt) must never truncate through that shared inode.
-    /// The fixed implementation never opens `dst` for writing at all — it
-    /// only ever renames a freshly-created temp file over it.
+    /// Managed staging never opens a pre-existing destination for writing.
     #[tokio::test]
-    async fn stage_file_preexisting_hardlink_dst_leaves_source_intact() {
+    async fn managed_stage_preexisting_hardlink_dst_leaves_source_intact() {
+        use crate::image::{ImageError, ImageKind, ImageStore};
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt as _;
+
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let src = tmp.path().join("golden.img");
         let golden = b"ANOTHER-GOLDEN-IMAGE-PAYLOAD".to_vec();
+        let digest = hex::encode(sha2::Sha256::digest(&golden));
+        let src = tmp.path().join("kernels").join(&digest).join("vmlinux");
+        tokio::fs::create_dir_all(src.parent().expect("managed kernel parent"))
+            .await
+            .expect("create managed kernel parent");
         tokio::fs::write(&src, &golden).await.expect("write src");
+        let metadata = std::fs::metadata(&src).expect("source metadata");
+        let mut verified = ImageStore::new(tmp.path().to_path_buf())
+            .resolve(ImageKind::Kernel, &digest)
+            .await
+            .expect("resolve retained image handle");
 
         let dst = tmp.path().join("staged.img");
         tokio::fs::hard_link(&src, &dst)
             .await
             .expect("pre-link dst to src (simulate a prior racer's win)");
 
-        stage_file(&src, &dst).await.expect("stage_file");
+        let error = verified
+            .stage(&dst, 0o400, metadata.uid(), metadata.gid())
+            .await
+            .expect_err("exclusive staging must reject a pre-existing destination");
+        assert!(matches!(error, ImageError::Stage { .. }));
 
         let src_now = tokio::fs::read(&src).await.expect("read src");
         assert_eq!(
@@ -1529,7 +1694,7 @@ struct SnapshotLoadBody {
 /// Inputs to restore a workspace from a snapshot artifact.
 pub struct RestoreLaunchConfig {
     /// Reuses the cold-boot [`LaunchConfig`] fields (binaries, `chroot_base`,
-    /// jailer uid/gid, rootfs path, kernel path, timeouts). `network` MUST
+    /// jailer uid/gid, verified managed images, and timeouts). `network` MUST
     /// be `None` for this wedge — networked restore is not supported (FC
     /// records the host TAP name in vmstate; restoring into a different
     /// `workspace_id` would reference a non-existent TAP).
@@ -1562,12 +1727,15 @@ pub struct RestoreLaunchConfig {
 //    stages rootfs there — confirm the path matches exactly.
 // 3. FC version skew: if /snapshot/load returns a version-incompat error, the
 //    caller surfaces it as RestoreFailed (manifest records firecracker_version).
-pub async fn restore(cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> {
+pub async fn restore(mut cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> {
     if cfg.launch.network.is_some() {
         return Err(LaunchError::NetworkedRestoreUnsupported);
     }
+    let (kernel_sha256, rootfs_sha256) = cfg.launch.verified_images.digests();
+    let kernel_sha256 = kernel_sha256.to_owned();
+    let rootfs_sha256 = rootfs_sha256.to_owned();
     // Boot the jailed FC (stages rootfs+kernel, waits for api socket).
-    let jailed = spawn_jailed_firecracker(&cfg.launch).await?;
+    let jailed = spawn_jailed_firecracker(&mut cfg.launch).await?;
 
     // Stage the snapshot mem/vmstate into the chroot and issue the load.
     // Capture the first error rather than `?`-ing out: restore copies a
@@ -1643,8 +1811,9 @@ pub async fn restore(cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> 
                 vcpu_count: cfg.launch.vcpu_count,
                 mem_size_mib: cfg.launch.mem_size_mib,
                 kernel_boot_args: cfg.launch.kernel_boot_args,
-                rootfs_path: cfg.launch.rootfs_image,
-                kernel_path: cfg.launch.kernel_image,
+                kernel_sha256,
+                rootfs_sha256,
+                rootfs_read_only: cfg.launch.rootfs_read_only,
             })
         }
         Err(e) => {
@@ -1652,14 +1821,13 @@ pub async fn restore(cfg: RestoreLaunchConfig) -> Result<Instance, LaunchError> 
             // chroot still in use by a live jailer), then reap the chroot tree
             // including the GB-scale mem copy we staged.
             let mut jailed = jailed;
-            let _ = jailed.child.start_kill();
-            let _ = jailed.child.wait().await;
-            let workspace_root = jailed
-                .jailer_chroot
-                .parent()
-                .unwrap_or(&jailed.jailer_chroot);
-            let _ = tokio::fs::remove_dir_all(workspace_root).await;
-            Err(e)
+            Err(cleanup_failed_child(
+                &mut jailed.child,
+                &jailed.workspace_root,
+                "snapshot restore",
+                e,
+            )
+            .await)
         }
     }
 }

@@ -151,22 +151,51 @@ fn core_error_to_status(e: &CoreError) -> StatusCode {
     };
     match kind {
         K::Unauthorized => StatusCode::FORBIDDEN,
-        K::InvalidRequest | K::PathRejected | K::FileTooLarge => StatusCode::BAD_REQUEST,
+        K::InvalidRequest | K::InvalidImageDigest | K::PathRejected | K::FileTooLarge => {
+            StatusCode::BAD_REQUEST
+        }
         K::Unsupported => StatusCode::NOT_IMPLEMENTED,
         // WorkspaceAlreadyExists + the failed_precondition group all map to
         // 409 CONFLICT (team convention: gRPC failed_precondition ↔ HTTP 409).
         K::WorkspaceAlreadyExists
+        | K::ImageRejected
+        | K::ImageDigestMismatch
         | K::InvalidSnapshot
         | K::WorkspaceNotPaused
         | K::WorkspaceAlreadyPaused
         | K::WorkspaceNotNetworked
         | K::AttestationReplay => StatusCode::CONFLICT,
-        K::WorkspaceNotFound | K::FileNotFound | K::TierNotFound | K::IngressPortNotFound => {
-            StatusCode::NOT_FOUND
-        }
+        K::WorkspaceNotFound
+        | K::FileNotFound
+        | K::ImageNotFound
+        | K::TierNotFound
+        | K::IngressPortNotFound => StatusCode::NOT_FOUND,
         K::Timeout => StatusCode::GATEWAY_TIMEOUT,
         K::GuestUnreachable => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod image_error_mapping_tests {
+    use super::*;
+    use ne_protocol::supervisor::SupervisorErrorKind as K;
+
+    #[test]
+    fn image_errors_map_to_http_statuses() {
+        for (kind, status) in [
+            (K::InvalidImageDigest, StatusCode::BAD_REQUEST),
+            (K::ImageNotFound, StatusCode::NOT_FOUND),
+            (K::ImageRejected, StatusCode::CONFLICT),
+            (K::ImageDigestMismatch, StatusCode::CONFLICT),
+            (K::ImageStageFailed, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let error = CoreError::Supervisor {
+                kind,
+                message: "image error".into(),
+            };
+            assert_eq!(core_error_to_status(&error), status);
+        }
     }
 }
 
@@ -194,8 +223,8 @@ async fn health(State(core): State<Arc<RuntimeCore>>) -> Result<Json<HealthRespo
 #[derive(Deserialize)]
 struct CreateWorkspaceBody {
     workspace_id: String,
-    kernel_image_path: String,
-    rootfs_image_path: String,
+    kernel_sha256: String,
+    rootfs_sha256: String,
     rootfs_read_only: bool,
     vcpu_count: u32,
     mem_size_mib: u32,
@@ -267,8 +296,8 @@ async fn create_workspace(
     let c = core
         .create_workspace(CreateWorkspaceInput {
             workspace_id: body.workspace_id,
-            kernel_image_path: body.kernel_image_path,
-            rootfs_image_path: body.rootfs_image_path,
+            kernel_sha256: body.kernel_sha256,
+            rootfs_sha256: body.rootfs_sha256,
             rootfs_read_only: body.rootfs_read_only,
             vcpu_count: body.vcpu_count,
             mem_size_mib: body.mem_size_mib,

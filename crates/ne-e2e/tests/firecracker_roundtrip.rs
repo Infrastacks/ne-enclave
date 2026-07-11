@@ -56,11 +56,12 @@ async fn firecracker_roundtrip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().to_path_buf();
     let workspace_id = format!("e2e-rt-{}", std::process::id());
+    let (_, _, verified_images) =
+        ne_e2e::resolve_managed_images(&tmp.path().join("images"), &kernel, &rootfs).await;
 
     let cfg = LaunchConfig {
         workspace_id: workspace_id.clone(),
-        kernel_image: kernel,
-        rootfs_image: rootfs,
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,

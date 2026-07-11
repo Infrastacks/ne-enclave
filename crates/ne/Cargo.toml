@@ -37,6 +37,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
+nix = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 sha2 = { workspace = true }
@@ -52,6 +53,3 @@ ne-protocol = { path = "../ne-protocol" }
 ed25519-dalek = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true }

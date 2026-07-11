@@ -13,7 +13,8 @@ method — is described inline below.
 
 2. **NeuronEdge Enclave installed and both systemd units running.** Follow
    [`../deploy/README.md`](../deploy/README.md) to install the `nee` binary, run
-   `nee install`, import a guest image, and verify the two units are active:
+   `sudo /opt/ne-enclave/bin/nee install`, import a guest image, and verify the two units
+   are active:
 
    ```bash
    systemctl --no-pager status ne-supervisor.service ne-api.service
@@ -30,40 +31,52 @@ method — is described inline below.
 
    The binary lands at `target/release/ne-bench`.
 
-4. **Guest image digests.** After `nee image import` the content-addressed paths are:
+4. **Guest image digests.** Compute and retain the digests before importing into the
+   privileged managed store:
 
-   ```
-   /var/lib/ne-enclave/images/kernels/<ksum>/vmlinux
-   /var/lib/ne-enclave/images/rootfs/<rsum>/rootfs.img
+   ```bash
+   KERNEL=/path/to/vmlinux
+   ROOTFS=/path/to/rootfs.img
+   KERNEL_SHA256=$(sha256sum "$KERNEL" | cut -d' ' -f1)
+   ROOTFS_SHA256=$(sha256sum "$ROOTFS" | cut -d' ' -f1)
+   sudo /opt/ne-enclave/bin/nee image import \
+     --kernel "$KERNEL" --kernel-sha256 "$KERNEL_SHA256" \
+     --rootfs "$ROOTFS" --rootfs-sha256 "$ROOTFS_SHA256"
    ```
 
-   Substitute `<ksum>` and `<rsum>` in the commands below with the SHA-256 values
-   printed by `nee image import` or by `ls /var/lib/ne-enclave/images/kernels/`.
+   Keep `KERNEL_SHA256` and `ROOTFS_SHA256` set in the shell used for the benchmark
+   commands below. Image import verifies the supplied values but does not print them.
 
 ---
 
 ## Running the benchmarks
 
-Set the shared flags once, then invoke each subcommand. Replace the angle-bracket
-placeholders with values for your host.
+Set the shared flags once, then invoke each subcommand. Replace the representative Azure
+SKU, storage backend, and environment notes with accurate values for your host.
 
 ```bash
 BIN=target/release/ne-bench
+: "${KERNEL_SHA256:?run the image-import step above in this shell}"
+: "${ROOTFS_SHA256:?run the image-import step above in this shell}"
 
-COMMON="--endpoint http://127.0.0.1:50051 --output-dir results/$(date -u +%Y-%m-%d) \
-  --run-timestamp $(date -u +%FT%TZ) \
-  --kernel-path /var/lib/ne-enclave/images/kernels/<ksum>/vmlinux \
-  --rootfs-path /var/lib/ne-enclave/images/rootfs/<rsum>/rootfs.img \
-  --kernel-digest <ksum> --rootfs-digest <rsum> \
-  --instance-sku <vm-size> --storage-backend 'ext4 on NVMe' \
-  --environment-notes 'cloud VM, nested KVM; floor not ceiling' \
-  --vcpu-count 1 --mem-size-mib 256"
+COMMON=(
+  --endpoint "http://127.0.0.1:50051"
+  --output-dir "results/$(date -u +%Y-%m-%d)"
+  --run-timestamp "$(date -u +%FT%TZ)"
+  --kernel-sha256 "$KERNEL_SHA256"
+  --rootfs-sha256 "$ROOTFS_SHA256"
+  --instance-sku "Azure Standard_D8s_v5"
+  --storage-backend "ext4 on NVMe"
+  --environment-notes "cloud VM, nested KVM; floor not ceiling"
+  --vcpu-count 1
+  --mem-size-mib 256
+)
 
-$BIN $COMMON cold-start --iterations 1000
-$BIN $COMMON exec --iterations 10000
-$BIN $COMMON teardown --iterations 1000
-$BIN $COMMON boot-storm --concurrency 50
-$BIN $COMMON density --ram-stop-percent 85 --max-consecutive-failures 3
+"$BIN" "${COMMON[@]}" cold-start --iterations 1000
+"$BIN" "${COMMON[@]}" exec --iterations 10000
+"$BIN" "${COMMON[@]}" teardown --iterations 1000
+"$BIN" "${COMMON[@]}" boot-storm --concurrency 50
+"$BIN" "${COMMON[@]}" density --ram-stop-percent 85 --max-consecutive-failures 3
 ```
 
 Run each command to completion before starting the next. The runs are sequential by

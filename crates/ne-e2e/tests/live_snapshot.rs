@@ -74,6 +74,9 @@ async fn live_snapshot_source_survives_and_is_consistent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().join("chroot");
     let state_dir = tmp.path().join("state");
+    let image_store = tmp.path().join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &env.kernel, &env.rootfs);
     tokio::fs::create_dir_all(state_dir.join("keys"))
         .await
         .expect("keys dir");
@@ -87,6 +90,7 @@ async fn live_snapshot_source_survives_and_is_consistent() {
     cfg.jailer_binary = env.jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 1024, 32768).expect("workspace manager"));
 
@@ -94,8 +98,8 @@ async fn live_snapshot_source_survives_and_is_consistent() {
     let create_resp = mgr
         .create(CreateWorkspaceRequest {
             workspace_id: "ws-a".to_string(),
-            kernel_image_path: env.kernel.to_string_lossy().into_owned(),
-            rootfs_image_path: env.rootfs.to_string_lossy().into_owned(),
+            kernel_sha256,
+            rootfs_sha256,
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,

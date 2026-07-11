@@ -18,3 +18,38 @@
 pub fn host_can_launch_firecracker() -> bool {
     std::path::Path::new("/dev/kvm").exists()
 }
+
+/// Populate a temporary managed image store from e2e fixture artifacts.
+pub fn prepare_managed_images(
+    store: &std::path::Path,
+    kernel: &std::path::Path,
+    rootfs: &std::path::Path,
+) -> (String, String) {
+    use sha2::Digest as _;
+
+    let kernel_bytes = std::fs::read(kernel).expect("read e2e kernel");
+    let rootfs_bytes = std::fs::read(rootfs).expect("read e2e rootfs");
+    let kernel_sha256 = hex::encode(sha2::Sha256::digest(&kernel_bytes));
+    let rootfs_sha256 = hex::encode(sha2::Sha256::digest(&rootfs_bytes));
+    let kernel_path = store.join("kernels").join(&kernel_sha256).join("vmlinux");
+    let rootfs_path = store.join("rootfs").join(&rootfs_sha256).join("rootfs.img");
+    std::fs::create_dir_all(kernel_path.parent().unwrap()).expect("kernel image dir");
+    std::fs::create_dir_all(rootfs_path.parent().unwrap()).expect("rootfs image dir");
+    std::fs::write(kernel_path, kernel_bytes).expect("managed e2e kernel");
+    std::fs::write(rootfs_path, rootfs_bytes).expect("managed e2e rootfs");
+    (kernel_sha256, rootfs_sha256)
+}
+
+/// Populate and resolve a managed image pair for direct Firecracker e2e tests.
+pub async fn resolve_managed_images(
+    store: &std::path::Path,
+    kernel: &std::path::Path,
+    rootfs: &std::path::Path,
+) -> (String, String, ne_supervisor::image::VerifiedImagePair) {
+    let (kernel_sha256, rootfs_sha256) = prepare_managed_images(store, kernel, rootfs);
+    let images = ne_supervisor::image::ImageStore::new(store.to_path_buf())
+        .resolve_pair(&kernel_sha256, &rootfs_sha256)
+        .await
+        .expect("resolve managed e2e images");
+    (kernel_sha256, rootfs_sha256, images)
+}

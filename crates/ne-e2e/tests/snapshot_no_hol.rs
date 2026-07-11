@@ -92,6 +92,9 @@ async fn snapshot_does_not_head_of_line_block() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().join("chroot");
     let state_dir = tmp.path().join("state");
+    let image_store = tmp.path().join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &env.kernel, &env.rootfs);
     tokio::fs::create_dir_all(state_dir.join("keys"))
         .await
         .expect("keys dir");
@@ -104,6 +107,7 @@ async fn snapshot_does_not_head_of_line_block() {
     cfg.jailer_binary = env.jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     // Generous admission: source VM + a concurrent small create.
     let mem_mib = source_mem_mib();
@@ -113,8 +117,8 @@ async fn snapshot_does_not_head_of_line_block() {
     let create_resp = mgr
         .create(CreateWorkspaceRequest {
             workspace_id: "ws-src".to_string(),
-            kernel_image_path: env.kernel.to_string_lossy().into_owned(),
-            rootfs_image_path: env.rootfs.to_string_lossy().into_owned(),
+            kernel_sha256: kernel_sha256.clone(),
+            rootfs_sha256: rootfs_sha256.clone(),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: mem_mib,
@@ -187,8 +191,8 @@ async fn snapshot_does_not_head_of_line_block() {
     let create2 = mgr
         .create(CreateWorkspaceRequest {
             workspace_id: "ws-other".to_string(),
-            kernel_image_path: env.kernel.to_string_lossy().into_owned(),
-            rootfs_image_path: env.rootfs.to_string_lossy().into_owned(),
+            kernel_sha256,
+            rootfs_sha256,
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -264,6 +268,9 @@ async fn terminate_during_snapshot_does_not_resurrect() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().join("chroot");
     let state_dir = tmp.path().join("state");
+    let image_store = tmp.path().join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &env.kernel, &env.rootfs);
     tokio::fs::create_dir_all(state_dir.join("keys"))
         .await
         .expect("keys dir");
@@ -276,6 +283,7 @@ async fn terminate_during_snapshot_does_not_resurrect() {
     cfg.jailer_binary = env.jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     let mem_mib = source_mem_mib();
     let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 64, 65536).expect("workspace manager"));
@@ -285,8 +293,8 @@ async fn terminate_during_snapshot_does_not_resurrect() {
     let create_resp = mgr
         .create(CreateWorkspaceRequest {
             workspace_id: "ws-doomed".to_string(),
-            kernel_image_path: env.kernel.to_string_lossy().into_owned(),
-            rootfs_image_path: env.rootfs.to_string_lossy().into_owned(),
+            kernel_sha256: kernel_sha256.clone(),
+            rootfs_sha256: rootfs_sha256.clone(),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: mem_mib,
@@ -381,8 +389,8 @@ async fn terminate_during_snapshot_does_not_resurrect() {
     let recreate = mgr
         .create(CreateWorkspaceRequest {
             workspace_id: "ws-doomed".to_string(),
-            kernel_image_path: env.kernel.to_string_lossy().into_owned(),
-            rootfs_image_path: env.rootfs.to_string_lossy().into_owned(),
+            kernel_sha256,
+            rootfs_sha256,
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -427,23 +435,22 @@ async fn terminate_during_snapshot_does_not_resurrect() {
     eprintln!("terminate_during_snapshot_does_not_resurrect: PASSED");
 }
 
-/// The ABA case with teeth (deterministic window): terminate the source and
-/// recreate the SAME id inside the live snapshot's hot-swap window (between
-/// the artifact manifest write and the swap's registry splice — a
-/// seconds-wide, lock-free restore boot). The swap must recognize that the
-/// id now names a DIFFERENT boot and discard its restored instance instead
-/// of splicing stale state over the freshly-created workspace. Fails against
-/// an existence-only guard (which would destroy the replacement and
-/// resurrect the old snapshot under its id); passes with the boot-identity
-/// token check.
+/// A live snapshot holds the source id's lifecycle lease through artifact
+/// publication and hot-swap finalization. If the source is terminated during
+/// that window, a same-id create must fail fast until the snapshot finishes;
+/// once the lease is released, the id is reusable and the replacement must be
+/// reachable without inheriting the old boot's state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires /dev/kvm + firecracker"]
-async fn recreate_during_live_snapshot_is_not_clobbered() {
+async fn same_id_recreate_waits_for_live_snapshot_lease() {
     let Some(env) = load_host_env() else { return };
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let chroot_base = tmp.path().join("chroot");
     let state_dir = tmp.path().join("state");
+    let image_store = tmp.path().join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &env.kernel, &env.rootfs);
     tokio::fs::create_dir_all(state_dir.join("keys"))
         .await
         .expect("keys dir");
@@ -456,6 +463,7 @@ async fn recreate_during_live_snapshot_is_not_clobbered() {
     cfg.jailer_binary = env.jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 64, 65536).expect("workspace manager"));
 
@@ -464,8 +472,8 @@ async fn recreate_during_live_snapshot_is_not_clobbered() {
     let create_resp = mgr
         .create(CreateWorkspaceRequest {
             workspace_id: "ws-aba".to_string(),
-            kernel_image_path: env.kernel.to_string_lossy().into_owned(),
-            rootfs_image_path: env.rootfs.to_string_lossy().into_owned(),
+            kernel_sha256: kernel_sha256.clone(),
+            rootfs_sha256: rootfs_sha256.clone(),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -535,9 +543,9 @@ async fn recreate_during_live_snapshot_is_not_clobbered() {
         "live snapshot finished the instant its manifest appeared — hot-swap window too \
          small to race; investigate before trusting this test"
     );
-    eprintln!("manifest written; inside the hot-swap window — terminating + recreating ws-aba");
+    eprintln!("manifest written; inside the hot-swap window — terminating ws-aba");
 
-    // --- Terminate + recreate the SAME id inside the window ---
+    // --- Terminate, then prove the lifecycle lease blocks same-id reuse ---
     match mgr
         .terminate(TerminateRequest {
             workspace_id: "ws-aba".to_string(),
@@ -548,11 +556,52 @@ async fn recreate_during_live_snapshot_is_not_clobbered() {
         SupervisorResponse::WorkspaceTerminated { .. } => {}
         other => panic!("expected WorkspaceTerminated, got {other:?}"),
     }
+    let blocked_recreate = mgr
+        .create(CreateWorkspaceRequest {
+            workspace_id: "ws-aba".to_string(),
+            kernel_sha256: kernel_sha256.clone(),
+            rootfs_sha256: rootfs_sha256.clone(),
+            rootfs_read_only: true,
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            guest_vsock_cid: 3,
+            kernel_boot_args: None,
+            network: None,
+            tier: None,
+        })
+        .await;
+    match blocked_recreate {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::WorkspaceAlreadyExists,
+            ..
+        } => {}
+        other => panic!(
+            "same-id create must be rejected while the live snapshot holds its lifecycle lease; \
+             expected WorkspaceAlreadyExists, got {other:?}"
+        ),
+    }
+
+    // --- The live snapshot must notice that its source was terminated ---
+    let snap_resp = snap_handle.await.expect("snapshot task panicked");
+    match &snap_resp {
+        SupervisorResponse::Error {
+            kind: SupervisorErrorKind::WorkspaceNotFound,
+            message,
+        } => {
+            eprintln!("live snapshot declined the swap as expected: {message}");
+        }
+        other => panic!(
+            "expected the live snapshot to decline its hot-swap (WorkspaceNotFound) after the \
+             source was terminated mid-swap; got {other:?}"
+        ),
+    }
+
+    // --- Snapshot completion releases the lease; same-id reuse now succeeds ---
     let recreate = mgr
         .create(CreateWorkspaceRequest {
             workspace_id: "ws-aba".to_string(),
-            kernel_image_path: env.kernel.to_string_lossy().into_owned(),
-            rootfs_image_path: env.rootfs.to_string_lossy().into_owned(),
+            kernel_sha256,
+            rootfs_sha256,
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -564,29 +613,14 @@ async fn recreate_during_live_snapshot_is_not_clobbered() {
         .await;
     let wc2 = match recreate {
         SupervisorResponse::WorkspaceCreated(w) => w,
-        other => panic!("expected WorkspaceCreated for the recreate, got {other:?}"),
+        other => panic!("expected WorkspaceCreated after snapshot completion, got {other:?}"),
     };
-    eprintln!("ws-aba recreated (new pid={})", wc2.firecracker_pid);
+    eprintln!(
+        "ws-aba recreated after snapshot completion (new pid={})",
+        wc2.firecracker_pid
+    );
 
-    // --- The live snapshot must decline the swap (id now names a new boot) ---
-    let snap_resp = snap_handle.await.expect("snapshot task panicked");
-    match &snap_resp {
-        SupervisorResponse::Error {
-            kind: SupervisorErrorKind::WorkspaceNotFound,
-            message,
-        } => {
-            eprintln!("live snapshot declined the swap as expected: {message}");
-        }
-        other => panic!(
-            "expected the live snapshot to decline its hot-swap (WorkspaceNotFound) after the \
-             source was terminated+recreated mid-swap; got {other:?} — an existence-only guard \
-             would have clobbered the replacement here"
-        ),
-    }
-
-    // --- The replacement must be untouched: reachable, WITHOUT the old
-    //     boot's marker (an existence-only swap would have resurrected the
-    //     old snapshot — marker present — under this id) ---
+    // --- The replacement is reachable, WITHOUT the old boot's marker ---
     ne_supervisor::firecracker::wait_for_guest_ready(
         std::path::Path::new(&wc2.vsock_host_socket),
         PORT,
@@ -635,5 +669,5 @@ async fn recreate_during_live_snapshot_is_not_clobbered() {
             grace_period_ms: 2_000,
         })
         .await;
-    eprintln!("recreate_during_live_snapshot_is_not_clobbered: PASSED");
+    eprintln!("same_id_recreate_waits_for_live_snapshot_lease: PASSED");
 }

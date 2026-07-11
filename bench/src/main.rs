@@ -37,8 +37,8 @@ async fn main() -> anyhow::Result<()> {
         run_timestamp: args.run_timestamp.clone(),
         instance_sku: args.instance_sku.clone(),
         storage_backend: args.storage_backend.clone(),
-        guest_kernel_digest: args.kernel_digest.clone(),
-        guest_rootfs_digest: args.rootfs_digest.clone(),
+        guest_kernel_digest: args.kernel_sha256.clone(),
+        guest_rootfs_digest: args.rootfs_sha256.clone(),
         environment_notes: args.environment_notes.clone(),
         vcpu_count: args.vcpu_count,
         mem_size_mib: args.mem_size_mib,
@@ -47,8 +47,8 @@ async fn main() -> anyhow::Result<()> {
 
     let params = CreateParams {
         workspace_id: String::new(), // set per-trial by each benchmark
-        kernel_image_path: args.kernel_path.clone(),
-        rootfs_image_path: args.rootfs_path.clone(),
+        kernel_sha256: args.kernel_sha256.clone(),
+        rootfs_sha256: args.rootfs_sha256.clone(),
         vcpu_count: args.vcpu_count,
         mem_size_mib: args.mem_size_mib,
         guest_vsock_cid: args.base_vsock_cid,

@@ -42,10 +42,10 @@ export interface CreateWorkspaceRequest {
    * ([a-zA-Z0-9-]{1,64}).
    */
   workspaceId: string;
-  /** Absolute host path to the guest kernel image (uncompressed vmlinux). */
-  kernelImagePath: string;
-  /** Absolute host path to the guest rootfs image (ext4 or squashfs). */
-  rootfsImagePath: string;
+  /** Canonical lowercase SHA-256 digest of the managed guest kernel image. */
+  kernelSha256: string;
+  /** Canonical lowercase SHA-256 digest of the managed guest rootfs image. */
+  rootfsSha256: string;
   /** Whether the rootfs should be mounted read-only inside the guest. */
   rootfsReadOnly: boolean;
   /** Guest vCPU count. Protobuf has no u8 — runtime validates 1..=255. */
@@ -480,6 +480,10 @@ export interface AttestationProof {
   signature: Uint8Array;
   /** 32 bytes (software) */
   signerPubkey: Uint8Array;
+  /** SEV-SNP firmware Attestation Report (provider_type "sev_snp"). */
+  sevSnpReport: Uint8Array;
+  /** VCEK cert chain, DER leaf-first (sev_snp) */
+  sevSnpVcekChain: Uint8Array;
 }
 
 function createBasePingRequest(): PingRequest {
@@ -652,8 +656,8 @@ export const PingResponse: MessageFns<PingResponse> = {
 function createBaseCreateWorkspaceRequest(): CreateWorkspaceRequest {
   return {
     workspaceId: "",
-    kernelImagePath: "",
-    rootfsImagePath: "",
+    kernelSha256: "",
+    rootfsSha256: "",
     rootfsReadOnly: false,
     vcpuCount: 0,
     memSizeMib: 0,
@@ -669,11 +673,11 @@ export const CreateWorkspaceRequest: MessageFns<CreateWorkspaceRequest> = {
     if (message.workspaceId !== "") {
       writer.uint32(10).string(message.workspaceId);
     }
-    if (message.kernelImagePath !== "") {
-      writer.uint32(18).string(message.kernelImagePath);
+    if (message.kernelSha256 !== "") {
+      writer.uint32(18).string(message.kernelSha256);
     }
-    if (message.rootfsImagePath !== "") {
-      writer.uint32(26).string(message.rootfsImagePath);
+    if (message.rootfsSha256 !== "") {
+      writer.uint32(26).string(message.rootfsSha256);
     }
     if (message.rootfsReadOnly !== false) {
       writer.uint32(32).bool(message.rootfsReadOnly);
@@ -719,7 +723,7 @@ export const CreateWorkspaceRequest: MessageFns<CreateWorkspaceRequest> = {
             break;
           }
 
-          message.kernelImagePath = reader.string();
+          message.kernelSha256 = reader.string();
           continue;
         }
         case 3: {
@@ -727,7 +731,7 @@ export const CreateWorkspaceRequest: MessageFns<CreateWorkspaceRequest> = {
             break;
           }
 
-          message.rootfsImagePath = reader.string();
+          message.rootfsSha256 = reader.string();
           continue;
         }
         case 4: {
@@ -802,15 +806,15 @@ export const CreateWorkspaceRequest: MessageFns<CreateWorkspaceRequest> = {
         : isSet(object.workspace_id)
         ? globalThis.String(object.workspace_id)
         : "",
-      kernelImagePath: isSet(object.kernelImagePath)
-        ? globalThis.String(object.kernelImagePath)
-        : isSet(object.kernel_image_path)
-        ? globalThis.String(object.kernel_image_path)
+      kernelSha256: isSet(object.kernelSha256)
+        ? globalThis.String(object.kernelSha256)
+        : isSet(object.kernel_sha256)
+        ? globalThis.String(object.kernel_sha256)
         : "",
-      rootfsImagePath: isSet(object.rootfsImagePath)
-        ? globalThis.String(object.rootfsImagePath)
-        : isSet(object.rootfs_image_path)
-        ? globalThis.String(object.rootfs_image_path)
+      rootfsSha256: isSet(object.rootfsSha256)
+        ? globalThis.String(object.rootfsSha256)
+        : isSet(object.rootfs_sha256)
+        ? globalThis.String(object.rootfs_sha256)
         : "",
       rootfsReadOnly: isSet(object.rootfsReadOnly)
         ? globalThis.Boolean(object.rootfsReadOnly)
@@ -847,11 +851,11 @@ export const CreateWorkspaceRequest: MessageFns<CreateWorkspaceRequest> = {
     if (message.workspaceId !== "") {
       obj.workspaceId = message.workspaceId;
     }
-    if (message.kernelImagePath !== "") {
-      obj.kernelImagePath = message.kernelImagePath;
+    if (message.kernelSha256 !== "") {
+      obj.kernelSha256 = message.kernelSha256;
     }
-    if (message.rootfsImagePath !== "") {
-      obj.rootfsImagePath = message.rootfsImagePath;
+    if (message.rootfsSha256 !== "") {
+      obj.rootfsSha256 = message.rootfsSha256;
     }
     if (message.rootfsReadOnly !== false) {
       obj.rootfsReadOnly = message.rootfsReadOnly;
@@ -883,8 +887,8 @@ export const CreateWorkspaceRequest: MessageFns<CreateWorkspaceRequest> = {
   fromPartial<I extends Exact<DeepPartial<CreateWorkspaceRequest>, I>>(object: I): CreateWorkspaceRequest {
     const message = createBaseCreateWorkspaceRequest();
     message.workspaceId = object.workspaceId ?? "";
-    message.kernelImagePath = object.kernelImagePath ?? "";
-    message.rootfsImagePath = object.rootfsImagePath ?? "";
+    message.kernelSha256 = object.kernelSha256 ?? "";
+    message.rootfsSha256 = object.rootfsSha256 ?? "";
     message.rootfsReadOnly = object.rootfsReadOnly ?? false;
     message.vcpuCount = object.vcpuCount ?? 0;
     message.memSizeMib = object.memSizeMib ?? 0;
@@ -4659,7 +4663,12 @@ export const AttestationEvidence: MessageFns<AttestationEvidence> = {
 };
 
 function createBaseAttestationProof(): AttestationProof {
-  return { signature: new Uint8Array(0), signerPubkey: new Uint8Array(0) };
+  return {
+    signature: new Uint8Array(0),
+    signerPubkey: new Uint8Array(0),
+    sevSnpReport: new Uint8Array(0),
+    sevSnpVcekChain: new Uint8Array(0),
+  };
 }
 
 export const AttestationProof: MessageFns<AttestationProof> = {
@@ -4669,6 +4678,12 @@ export const AttestationProof: MessageFns<AttestationProof> = {
     }
     if (message.signerPubkey.length !== 0) {
       writer.uint32(18).bytes(message.signerPubkey);
+    }
+    if (message.sevSnpReport.length !== 0) {
+      writer.uint32(26).bytes(message.sevSnpReport);
+    }
+    if (message.sevSnpVcekChain.length !== 0) {
+      writer.uint32(34).bytes(message.sevSnpVcekChain);
     }
     return writer;
   },
@@ -4696,6 +4711,22 @@ export const AttestationProof: MessageFns<AttestationProof> = {
           message.signerPubkey = reader.bytes();
           continue;
         }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.sevSnpReport = reader.bytes();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.sevSnpVcekChain = reader.bytes();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4713,6 +4744,16 @@ export const AttestationProof: MessageFns<AttestationProof> = {
         : isSet(object.signer_pubkey)
         ? bytesFromBase64(object.signer_pubkey)
         : new Uint8Array(0),
+      sevSnpReport: isSet(object.sevSnpReport)
+        ? bytesFromBase64(object.sevSnpReport)
+        : isSet(object.sev_snp_report)
+        ? bytesFromBase64(object.sev_snp_report)
+        : new Uint8Array(0),
+      sevSnpVcekChain: isSet(object.sevSnpVcekChain)
+        ? bytesFromBase64(object.sevSnpVcekChain)
+        : isSet(object.sev_snp_vcek_chain)
+        ? bytesFromBase64(object.sev_snp_vcek_chain)
+        : new Uint8Array(0),
     };
   },
 
@@ -4724,6 +4765,12 @@ export const AttestationProof: MessageFns<AttestationProof> = {
     if (message.signerPubkey.length !== 0) {
       obj.signerPubkey = base64FromBytes(message.signerPubkey);
     }
+    if (message.sevSnpReport.length !== 0) {
+      obj.sevSnpReport = base64FromBytes(message.sevSnpReport);
+    }
+    if (message.sevSnpVcekChain.length !== 0) {
+      obj.sevSnpVcekChain = base64FromBytes(message.sevSnpVcekChain);
+    }
     return obj;
   },
 
@@ -4734,6 +4781,8 @@ export const AttestationProof: MessageFns<AttestationProof> = {
     const message = createBaseAttestationProof();
     message.signature = object.signature ?? new Uint8Array(0);
     message.signerPubkey = object.signerPubkey ?? new Uint8Array(0);
+    message.sevSnpReport = object.sevSnpReport ?? new Uint8Array(0);
+    message.sevSnpVcekChain = object.sevSnpVcekChain ?? new Uint8Array(0);
     return message;
   },
 };

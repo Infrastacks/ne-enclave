@@ -20,6 +20,8 @@ use ne_protocol::supervisor::{
 };
 
 use crate::audit::AuditLog;
+#[cfg(target_os = "linux")]
+use crate::image::{ImageDigest, ImageError, ImageKind, ImageStore};
 
 /// Host-side wall clock for the guest file-RPC round trip. Five seconds
 /// above the guest's 25-second `FILE_OP_TIMEOUT` so the guest's typed
@@ -30,6 +32,36 @@ const FILE_RPC_TIMEOUT_MS: u32 = 30_000;
 /// Guest vsock port the ne-guest-agent listens on by convention.
 #[cfg(target_os = "linux")]
 const DEFAULT_GUEST_VSOCK_PORT: u32 = 52;
+
+#[cfg(target_os = "linux")]
+fn image_error_response(error: ImageError) -> SupervisorResponse {
+    let kind = match &error {
+        ImageError::InvalidDigest { .. } => SupervisorErrorKind::InvalidImageDigest,
+        ImageError::NotFound { .. } => SupervisorErrorKind::ImageNotFound,
+        ImageError::Rejected { .. } => SupervisorErrorKind::ImageRejected,
+        ImageError::DigestMismatch { .. } => SupervisorErrorKind::ImageDigestMismatch,
+        ImageError::Stage { .. } => SupervisorErrorKind::ImageStageFailed,
+    };
+    SupervisorResponse::Error {
+        kind,
+        message: error.to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_launch_error_response(error: crate::firecracker::LaunchError) -> SupervisorResponse {
+    match error {
+        crate::firecracker::LaunchError::NetworkedRestoreUnsupported => SupervisorResponse::Error {
+            kind: SupervisorErrorKind::InvalidSnapshot,
+            message: "networked snapshot restore is not supported".to_string(),
+        },
+        crate::firecracker::LaunchError::Image(error) => image_error_response(error),
+        error => SupervisorResponse::Error {
+            kind: SupervisorErrorKind::RestoreFailed,
+            message: error.to_string(),
+        },
+    }
+}
 
 /// Short readiness probe at pool checkout — the member was proven ready at
 /// provision time; this only catches members that died while idle.
@@ -168,6 +200,8 @@ pub struct WorkspaceManagerConfig {
     pub jailer_binary: PathBuf,
     /// Base directory under which jailer creates per-workspace chroots.
     pub chroot_base: PathBuf,
+    /// Supervisor-owned content-addressed kernel and rootfs image store.
+    pub image_store: PathBuf,
     /// UID jailer drops the Firecracker process to.
     pub jailer_uid: u32,
     /// GID jailer drops the Firecracker process to.
@@ -210,6 +244,7 @@ impl WorkspaceManagerConfig {
             firecracker_binary: PathBuf::from("/opt/ne-enclave/bin/firecracker"),
             jailer_binary: PathBuf::from("/opt/ne-enclave/bin/jailer"),
             chroot_base: PathBuf::from("/srv/jailer"),
+            image_store: PathBuf::from("/var/lib/ne-enclave/images"),
             jailer_uid: 1000,
             jailer_gid: 1000,
             openshell_sandbox_binary: PathBuf::from("/opt/ne-enclave/bin/openshell-sandbox"),
@@ -262,33 +297,45 @@ pub struct WorkspaceManager {
     /// (replay detection). Bounded; not a durable anti-replay store.
     #[cfg(target_os = "linux")]
     attestation_nonces: Mutex<HashMap<String, NonceRing>>,
-    /// Ids with a cold boot currently in flight (claimed before the multi-
-    /// second launch, released after registration or on failure). Serializes
-    /// same-id cold creates (audit C1): the jailer chroot is derived from the
-    /// caller id, so two concurrent boots of one id destroy each other's
-    /// shared chroot tree — and the loser's error-path cleanup deletes the
-    /// winner's live tree. A `std::sync` mutex (not tokio): claims are O(1)
-    /// with no await while held, and release happens in `Drop`, which cannot
-    /// await.
+    /// Ids with a path-owning lifecycle operation in flight. A create,
+    /// restore, or fork holds its claim through registration; snapshot holds
+    /// it through the entire unlocked pause/dump/publication/finalization
+    /// window. This prevents same-id jailer socket/chroot reuse after a
+    /// concurrent terminate removes the registry entry.
     #[cfg(target_os = "linux")]
-    booting: std::sync::Mutex<std::collections::HashSet<String>>,
+    lifecycle_claims: LifecycleClaims,
 }
 
-/// RAII claim on a workspace id while its cold boot is in flight (see
-/// [`WorkspaceManager::claim_boot`]). Releases the id on drop — after the
-/// winner has registered into `instances`, or immediately on a failed boot.
-#[cfg(target_os = "linux")]
-struct BootClaim<'a> {
-    set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+/// Shared atomic set behind per-workspace lifecycle leases.
+#[derive(Debug, Default)]
+struct LifecycleClaims {
+    ids: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl LifecycleClaims {
+    fn claim(&self, id: &str) -> Option<LifecycleLease<'_>> {
+        let inserted = self
+            .ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string());
+        inserted.then(|| LifecycleLease {
+            claims: self,
+            id: id.to_string(),
+        })
+    }
+}
+
+/// RAII lease on a workspace id for a path-owning lifecycle operation.
+struct LifecycleLease<'a> {
+    claims: &'a LifecycleClaims,
     id: String,
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for BootClaim<'_> {
+impl Drop for LifecycleLease<'_> {
     fn drop(&mut self) {
-        // Poison recovery: the set holds plain ids, so continuing past a
-        // panicked holder is safe (worst case: we clear our own claim).
-        self.set
+        self.claims
+            .ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
@@ -333,24 +380,125 @@ fn is_valid_workspace_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Compute the v1 configuration measurement for a running instance.
-/// Hashes the launch configuration (no per-request file IO, so the
-/// warm-pool create path is unaffected). Swapping kernel/rootfs paths
-/// for content digests is a follow-up.
-#[cfg(target_os = "linux")]
-fn measure_config(inst: &crate::firecracker::Instance) -> ne_attestation::Measurement {
+/// Compute the v1 configuration measurement from stable launch metadata.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn configuration_measurement(
+    vcpu_count: u8,
+    mem_size_mib: u32,
+    kernel_boot_args: &str,
+    networked: bool,
+    kernel_sha256: &str,
+    rootfs_sha256: &str,
+) -> ne_attestation::Measurement {
     use sha2::{Digest, Sha256};
     let canonical = serde_json::json!({
-        "vcpu_count": inst.vcpu_count,
-        "mem_size_mib": inst.mem_size_mib,
-        "kernel_boot_args": inst.kernel_boot_args,
-        "networked": inst.network_slot.is_some(),
-        "kernel_path": inst.kernel_path.to_string_lossy(),
-        "rootfs_path": inst.rootfs_path.to_string_lossy(),
+        "vcpu_count": vcpu_count,
+        "mem_size_mib": mem_size_mib,
+        "kernel_boot_args": kernel_boot_args,
+        "networked": networked,
+        "kernel_sha256": kernel_sha256,
+        "rootfs_sha256": rootfs_sha256,
     });
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     let digest = Sha256::digest(&bytes);
     ne_attestation::Measurement(digest.into())
+}
+
+/// Reject snapshot configurations that v5 cannot restore faithfully. This is
+/// pure so callers can run it before pausing a VM or allocating artifacts.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn snapshot_preflight(rootfs_read_only: bool, networked: bool) -> Result<(), &'static str> {
+    if !rootfs_read_only {
+        return Err(
+            "snapshot of writable-rootfs workspaces is not supported; create the workspace with rootfs_read_only=true",
+        );
+    }
+    if networked {
+        return Err("snapshot of networked workspaces is not supported in this build");
+    }
+    Ok(())
+}
+
+/// Compute the v1 configuration measurement for a running instance.
+/// Hashes stable launch metadata without per-request file I/O.
+#[cfg(target_os = "linux")]
+fn measure_config(inst: &crate::firecracker::Instance) -> ne_attestation::Measurement {
+    configuration_measurement(
+        inst.vcpu_count,
+        inst.mem_size_mib,
+        &inst.kernel_boot_args,
+        inst.network_slot.is_some(),
+        &inst.kernel_sha256,
+        &inst.rootfs_sha256,
+    )
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::{LifecycleClaims, configuration_measurement, snapshot_preflight};
+
+    #[test]
+    fn lifecycle_claims_serialize_and_release_same_id() {
+        let claims = LifecycleClaims::default();
+        let lease = claims.claim("ws-lifecycle").expect("first claim");
+
+        assert!(
+            claims.claim("ws-lifecycle").is_none(),
+            "same id must remain unavailable while an unlocked lifecycle operation continues"
+        );
+        assert!(claims.claim("ws-other").is_some(), "ids are independent");
+
+        drop(lease);
+        assert!(
+            claims.claim("ws-lifecycle").is_some(),
+            "same id must be released on every return path via Drop"
+        );
+    }
+
+    #[test]
+    fn configuration_measurement_binds_both_image_digests() {
+        let baseline = configuration_measurement(
+            2,
+            512,
+            "console=ttyS0",
+            false,
+            &"11".repeat(32),
+            &"22".repeat(32),
+        );
+        let other_kernel = configuration_measurement(
+            2,
+            512,
+            "console=ttyS0",
+            false,
+            &"33".repeat(32),
+            &"22".repeat(32),
+        );
+        let other_rootfs = configuration_measurement(
+            2,
+            512,
+            "console=ttyS0",
+            false,
+            &"11".repeat(32),
+            &"44".repeat(32),
+        );
+        assert_ne!(baseline, other_kernel);
+        assert_ne!(baseline, other_rootfs);
+    }
+
+    #[test]
+    fn writable_snapshot_preflight_rejects_before_state_or_artifact_changes() {
+        for live in [false, true] {
+            let lifecycle = ne_protocol::supervisor::WorkspaceState::Running;
+            let artifact_published = false;
+            let error = snapshot_preflight(false, false).unwrap_err();
+            assert_eq!(
+                error,
+                "snapshot of writable-rootfs workspaces is not supported; create the workspace with rootfs_read_only=true"
+            );
+            assert_eq!(lifecycle, ne_protocol::supervisor::WorkspaceState::Running);
+            assert!(!artifact_published, "live={live}");
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -614,7 +762,7 @@ impl WorkspaceManager {
                 }
             },
             attestation_nonces: Mutex::new(HashMap::new()),
-            booting: std::sync::Mutex::new(std::collections::HashSet::new()),
+            lifecycle_claims: LifecycleClaims::default(),
         })
     }
 
@@ -664,6 +812,29 @@ impl WorkspaceManager {
                 ),
             };
         }
+        let both_empty = req.kernel_sha256.is_empty() && req.rootfs_sha256.is_empty();
+        let both_present = !req.kernel_sha256.is_empty() && !req.rootfs_sha256.is_empty();
+        if !both_empty && !both_present {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidImageDigest,
+                message: "kernel and rootfs image digests must be supplied together".into(),
+            };
+        }
+        if both_present
+            && (ImageDigest::parse(ImageKind::Kernel, &req.kernel_sha256).is_err()
+                || ImageDigest::parse(ImageKind::Rootfs, &req.rootfs_sha256).is_err())
+        {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidImageDigest,
+                message: "image digests must be 64 lowercase hexadecimal characters".into(),
+            };
+        }
+        // Claim every caller-selected id before either pool adoption or a
+        // cold boot can begin. The lease remains held through registration.
+        let _lifecycle_lease = match self.claim_boot(&req.workspace_id).await {
+            Ok(claim) => claim,
+            Err(resp) => return resp,
+        };
         // Warm-pool dispatch runs BEFORE the net-new count ceiling below,
         // deliberately: a pool HIT is count-neutral — the VM moves from the
         // pool tally into `instances`, leaving `live_vm_count` unchanged — so
@@ -690,17 +861,6 @@ impl WorkspaceManager {
                 message: format!("at workspace capacity ({})", self.max_workspaces),
             };
         }
-        // Claim the id for the entire cold boot (C1): a concurrent same-id
-        // create fails fast here instead of racing a second boot into the
-        // shared id-derived chroot (destructive collision + the loser's
-        // cleanup deleting the winner's tree). Subsumes the old courtesy
-        // registry check; held across `create_confidential` too; released on
-        // every return path.
-        let _boot_claim = match self.claim_boot(&req.workspace_id).await {
-            Ok(claim) => claim,
-            Err(resp) => return resp,
-        };
-
         // Two-tier dispatch (R1): the confidential profile (SevSnp) routes to
         // the OpenShell-in-CVM substrate (single-CVM-direct, B); the software
         // profile routes to the Firecracker microVM path below. The OpenShell
@@ -709,6 +869,7 @@ impl WorkspaceManager {
         if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
             return self.create_confidential(req).await;
         }
+
         #[cfg(not(all(target_os = "linux", feature = "confidential-cvm")))]
         if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
             return SupervisorResponse::Error {
@@ -720,6 +881,23 @@ impl WorkspaceManager {
                 ),
             };
         }
+
+        if both_empty {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidImageDigest,
+                message: "standard cold creates require kernel and rootfs image digests".into(),
+            };
+        }
+
+        // Resolve and verify both images before allocating a network slot or
+        // creating any workspace/chroot state.
+        let verified_images = match ImageStore::new(self.cfg.image_store.clone())
+            .resolve_pair(&req.kernel_sha256, &req.rootfs_sha256)
+            .await
+        {
+            Ok(images) => images,
+            Err(error) => return image_error_response(error),
+        };
 
         // Provision network plumbing first so we can hand the TAP +
         // netns to Firecracker. On any failure here we exit without
@@ -794,8 +972,7 @@ impl WorkspaceManager {
 
         let cfg = crate::firecracker::LaunchConfig {
             workspace_id: req.workspace_id.clone(),
-            kernel_image: PathBuf::from(&req.kernel_image_path),
-            rootfs_image: PathBuf::from(&req.rootfs_image_path),
+            verified_images,
             rootfs_read_only: req.rootfs_read_only,
             vcpu_count: req.vcpu_count,
             mem_size_mib: req.mem_size_mib,
@@ -901,9 +1078,12 @@ impl WorkspaceManager {
                     serde_json::json!({ "op": "create_workspace", "error": e.to_string() }),
                 )
                 .await;
-                SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::LaunchFailed,
-                    message: e.to_string(),
+                match e {
+                    crate::firecracker::LaunchError::Image(error) => image_error_response(error),
+                    other => SupervisorResponse::Error {
+                        kind: SupervisorErrorKind::LaunchFailed,
+                        message: other.to_string(),
+                    },
                 }
             }
         }
@@ -1853,6 +2033,19 @@ impl WorkspaceManager {
     /// was terminated mid-dump it is NOT reinserted. The subsequent copy-out,
     /// hashing, and signing need only the artifact paths and stay unlocked.
     pub async fn snapshot(&self, req: SnapshotRequest) -> SupervisorResponse {
+        // Claim before looking in the registry. If terminate removes the
+        // source after this point, no create/restore/fork can reuse its
+        // id-derived socket or chroot until every snapshot return path drops
+        // this lease, including artifact publication and live finalization.
+        let Some(_lifecycle_lease) = self.claim_lifecycle(&req.workspace_id) else {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::SnapshotFailed,
+                message: format!(
+                    "another lifecycle operation is in progress for workspace {}",
+                    req.workspace_id
+                ),
+            };
+        };
         // Step 1: brief lock — look up + validate + capture FC socket/chroot
         // paths + metadata, set the transient `Snapshotting` state, then DROP
         // the guard. The multi-GiB memory dump (Steps 2-4) runs entirely
@@ -1870,8 +2063,8 @@ impl WorkspaceManager {
             vcpu_count,
             mem_size_mib,
             kernel_boot_args,
-            rootfs_path,
-            kernel_path,
+            kernel_sha256,
+            rootfs_sha256,
             was_running,
         ) = {
             let mut guard = self.instances.lock().await;
@@ -1916,6 +2109,21 @@ impl WorkspaceManager {
                 };
             }
 
+            // Reject before live-state checks, pause, snapshot_create, or
+            // destination allocation. A writable rootfs may have diverged from
+            // its managed source digest and v5 intentionally has no disk-capture
+            // schema, so publishing such a snapshot would be unsound. This also
+            // rejects networked sources because Firecracker bakes the host TAP
+            // name into vmstate and restore cannot safely reconstruct it.
+            if let Err(reason) =
+                snapshot_preflight(instance.rootfs_read_only, instance.network_slot.is_some())
+            {
+                return SupervisorResponse::Error {
+                    kind: SupervisorErrorKind::SnapshotFailed,
+                    message: format!("workspace {}: {reason}", req.workspace_id),
+                };
+            }
+
             // Live snapshot requires a running source (it keeps the source live).
             if req.live && instance.lifecycle_state != WorkspaceState::Running {
                 return SupervisorResponse::Error {
@@ -1923,21 +2131,6 @@ impl WorkspaceManager {
                     message: format!(
                         "live snapshot requires a running workspace; {} is {:?}",
                         req.workspace_id, instance.lifecycle_state
-                    ),
-                };
-            }
-
-            // Reject snapshotting a networked source: restore is non-networked
-            // only (FC bakes the host TAP name into vmstate, so a restored VM
-            // would reference a TAP that doesn't exist). Fail at capture time
-            // rather than producing an artifact that can never be restored.
-            if instance.network_slot.is_some() {
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::SnapshotFailed,
-                    message: format!(
-                        "workspace {} has networking; snapshot of networked workspaces is \
-                         not supported in this build",
-                        req.workspace_id
                     ),
                 };
             }
@@ -1952,10 +2145,9 @@ impl WorkspaceManager {
             instance.lifecycle_state = WorkspaceState::Snapshotting;
 
             // Capture everything we need before dropping the guard — including
-            // the per-boot identity token: the socket/chroot paths below are
-            // id-derived and would collide with a terminate→recreate of the
-            // same id, so every later re-acquire must verify the token, not
-            // just the id (ABA guard).
+            // the per-boot identity token. The lifecycle lease prevents a
+            // same-id boot from reusing these id-derived paths; the token
+            // remains defense in depth for every later registry re-acquire.
             (
                 instance.workspace_id.clone(),
                 instance.boot_id.clone(),
@@ -1967,8 +2159,8 @@ impl WorkspaceManager {
                 instance.vcpu_count,
                 instance.mem_size_mib,
                 instance.kernel_boot_args.clone(),
-                instance.rootfs_path.clone(),
-                instance.kernel_path.clone(),
+                instance.kernel_sha256.clone(),
+                instance.rootfs_sha256.clone(),
                 was_running,
             )
         };
@@ -1978,12 +2170,11 @@ impl WorkspaceManager {
         // pause/resume are deferred/Unsupported, and a re-entrant snapshot is
         // rejected above by the Snapshotting guard). A concurrent terminate
         // kills the FC process + reaps its chroot, which makes our unlocked FC
-        // calls fail (handled as a dump failure). Worse, a terminate→recreate
-        // of the SAME id boots a NEW VM behind the SAME id-derived paths —
-        // which is why finalize (and the in-place resume) go through
-        // `finalize_snapshot_state`, which verifies the captured `boot_id`
-        // before touching anything: it never resurrects a terminated
-        // workspace and never mutates (or resumes) a replacement boot.
+        // calls fail (handled as a dump failure). The lifecycle lease held
+        // above prevents create/restore/fork from reusing the SAME id-derived
+        // paths until this function returns. Finalize still verifies the
+        // captured `boot_id` as defense in depth before touching registry
+        // state or resuming in place.
 
         // Step 2: if the source was running, pause it (unlocked).
         if was_running && let Err(e) = crate::firecracker::pause_at(&api_socket).await {
@@ -2154,10 +2345,10 @@ impl WorkspaceManager {
             &snapshot_id,
             &source_ws_id,
             &fc_version,
-            &rootfs_path,
+            &kernel_sha256,
+            &rootfs_sha256,
             guest_identity,
             &kernel_boot_args,
-            &kernel_path,
         )
         .await
         {
@@ -2256,12 +2447,13 @@ impl WorkspaceManager {
     /// the wedge-7.1 resurrection guard, hardened against ABA).
     ///
     /// Existence alone is NOT enough: the FC socket/chroot paths are fully
-    /// id-derived, so a terminate→recreate of the same id during the unlocked
-    /// dump registers a NEW, Running VM behind the SAME paths. Mutating (or
-    /// resuming) that replacement based on the id string would mislabel a
-    /// live guest as Paused — poisoning later snapshots (a non-live snapshot
-    /// would skip the pause and dump a running guest; a live snapshot would
-    /// be spuriously rejected). So: `get_mut` → compare `boot_id` → only then
+    /// id-derived. The lifecycle lease now blocks a terminate→recreate ABA
+    /// through the public boot paths; this token check remains defense in
+    /// depth so mutating (or resuming) a replacement based on the id string
+    /// can never mislabel a live guest as Paused — poisoning later snapshots
+    /// (a non-live snapshot would skip the pause and dump a running guest; a
+    /// live snapshot would be spuriously rejected). So: `get_mut` → compare
+    /// `boot_id` → only then
     /// touch. On `None` OR token mismatch, leave the map untouched and return
     /// `false`; never reinsert, never relabel, never resume.
     ///
@@ -2370,12 +2562,19 @@ impl WorkspaceManager {
         // (the only legitimate producer of a snapshot here) rather than the key
         // embedded in the untrusted manifest — closes the self-signed forgery
         // class on the restore/fork trust path.
-        let manifest = crate::snapshot::verify_artifact_pinned(&dir, &self.audit.verifying_key())
-            .await
-            .map_err(|e| SupervisorResponse::Error {
+        let (manifest, verified_images) = crate::snapshot::verify_and_resolve_images(
+            &dir,
+            &self.audit.verifying_key(),
+            &ImageStore::new(self.cfg.image_store.clone()),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::snapshot::SnapshotRestoreError::Artifact(error) => SupervisorResponse::Error {
                 kind: SupervisorErrorKind::InvalidSnapshot,
-                message: e.to_string(),
-            })?;
+                message: error.to_string(),
+            },
+            crate::snapshot::SnapshotRestoreError::Image(error) => image_error_response(error),
+        })?;
 
         // Admission control (audit O3): validate the memory size the
         // snapshot will boot at before spawning anything. `restore`/`fork`
@@ -2395,8 +2594,7 @@ impl WorkspaceManager {
 
         let launch_cfg = crate::firecracker::LaunchConfig {
             workspace_id: new_workspace_id.to_string(),
-            kernel_image: PathBuf::from(&manifest.kernel_path),
-            rootfs_image: PathBuf::from(&manifest.rootfs_path),
+            verified_images,
             rootfs_read_only: true,
             vcpu_count: manifest.guest_identity.vcpu_count,
             mem_size_mib: manifest.guest_identity.mem_size_mib,
@@ -2415,19 +2613,10 @@ impl WorkspaceManager {
             mem_source: dir.join("mem"),
             vmstate_source: dir.join("vmstate"),
         };
-        match crate::firecracker::restore(restore_cfg).await {
-            Ok(inst) => Ok((inst, manifest)),
-            Err(crate::firecracker::LaunchError::NetworkedRestoreUnsupported) => {
-                Err(SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::InvalidSnapshot,
-                    message: "networked snapshot restore is not supported".to_string(),
-                })
-            }
-            Err(e) => Err(SupervisorResponse::Error {
-                kind: SupervisorErrorKind::RestoreFailed,
-                message: e.to_string(),
-            }),
-        }
+        crate::firecracker::restore(restore_cfg)
+            .await
+            .map(|inst| (inst, manifest))
+            .map_err(restore_launch_error_response)
     }
 
     /// Claim `workspace_id` for a cold boot, failing fast with
@@ -2444,27 +2633,24 @@ impl WorkspaceManager {
     /// Ordering: the winner registers into `instances` BEFORE its claim is
     /// released (the claim lives past `register_or_teardown`), so there is no
     /// window in which neither guard covers the id.
-    async fn claim_boot(&self, workspace_id: &str) -> Result<BootClaim<'_>, SupervisorResponse> {
+    fn claim_lifecycle(&self, workspace_id: &str) -> Option<LifecycleLease<'_>> {
+        self.lifecycle_claims.claim(workspace_id)
+    }
+
+    async fn claim_boot(
+        &self,
+        workspace_id: &str,
+    ) -> Result<LifecycleLease<'_>, SupervisorResponse> {
         let already = |id: &str| SupervisorResponse::Error {
             kind: SupervisorErrorKind::WorkspaceAlreadyExists,
             message: format!("workspace {id} already exists"),
         };
-        // Poison recovery mirrors `BootClaim::drop` (plain-id set; safe).
-        if !self
-            .booting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(workspace_id.to_string())
-        {
-            return Err(already(workspace_id));
-        }
         // Claim first, registry check second (dropping the claim on failure);
         // `register_or_teardown` re-checks the registry under its own lock as
         // the final backstop.
-        let claim = BootClaim {
-            set: &self.booting,
-            id: workspace_id.to_string(),
-        };
+        let claim = self
+            .claim_lifecycle(workspace_id)
+            .ok_or_else(|| already(workspace_id))?;
         if self.instances.lock().await.contains_key(workspace_id) {
             return Err(already(workspace_id));
         }
@@ -2568,12 +2754,11 @@ impl WorkspaceManager {
         let new_pid = instance.firecracker_pid;
 
         // Swap under the registry mutex (atomic w.r.t. the mutex only). The
-        // source may have been removed — or removed AND recreated under the
-        // same id — during our lock-free boot window (a concurrent
-        // terminate/create). Existence is not enough: verify the entry still
-        // carries the boot identity this snapshot captured before removing
-        // it. Swapping out a replacement boot would silently destroy a
-        // freshly-created workspace and resurrect stale state under its id.
+        // source may have been removed during our lock-free boot window. The
+        // lifecycle lease prevents a public same-id recreate, while the boot
+        // token remains defense in depth: existence alone is not enough.
+        // Swapping out a replacement boot would silently destroy a freshly-
+        // created workspace and resurrect stale state under its id.
         // On gone-or-replaced: tear the fresh instance down and fail; the
         // signed artifact still persists, so fail-closed holds.
         let old_instance = {
@@ -2889,18 +3074,11 @@ impl WorkspaceManager {
             };
         }
 
-        // Step 1: fast-fail courtesy check (re-checked under final lock).
-        if self
-            .instances
-            .lock()
-            .await
-            .contains_key(&req.new_workspace_id)
-        {
-            return SupervisorResponse::Error {
-                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
-                message: format!("workspace {} already exists", req.new_workspace_id),
-            };
-        }
+        // Step 1: hold the caller-selected id through boot and registration.
+        let _lifecycle_lease = match self.claim_boot(&req.new_workspace_id).await {
+            Ok(claim) => claim,
+            Err(resp) => return resp,
+        };
 
         // Step 2: verify + boot (shared with fork).
         let (instance, _manifest) = match self
@@ -2987,18 +3165,11 @@ impl WorkspaceManager {
             };
         }
 
-        // Step 1: courtesy collision check.
-        if self
-            .instances
-            .lock()
-            .await
-            .contains_key(&req.new_workspace_id)
-        {
-            return SupervisorResponse::Error {
-                kind: SupervisorErrorKind::WorkspaceAlreadyExists,
-                message: format!("workspace {} already exists", req.new_workspace_id),
-            };
-        }
+        // Step 1: hold the caller-selected id through boot and registration.
+        let _lifecycle_lease = match self.claim_boot(&req.new_workspace_id).await {
+            Ok(claim) => claim,
+            Err(resp) => return resp,
+        };
 
         // Steps 2-4: boot + ready + identity reset (shared with pool provisioning).
         let hostname = req
@@ -3345,13 +3516,14 @@ fn guest_kind_to_supervisor_kind(kind: GuestErrorKind) -> SupervisorErrorKind {
 #[cfg(target_os = "linux")]
 mod tests {
     use super::{
-        NonceRing, WorkspaceManager, WorkspaceManagerConfig, compose_boot_args,
-        guest_kind_to_supervisor_kind, is_valid_workspace_id,
+        ImageError, ImageKind, NonceRing, PathBuf, WorkspaceExec, WorkspaceManager,
+        WorkspaceManagerConfig, compose_boot_args, guest_kind_to_supervisor_kind,
+        is_valid_workspace_id, restore_launch_error_response,
     };
     use ne_protocol::guest::GuestErrorKind as G;
     use ne_protocol::supervisor::{
-        CreateWorkspaceRequest, ForkRequest, RestoreRequest, SupervisorErrorKind as S,
-        SupervisorResponse, WorkspaceRef,
+        CreateWorkspaceRequest, ForkRequest, RestoreRequest, SnapshotRequest,
+        SupervisorErrorKind as S, SupervisorResponse, WorkspaceRef, WorkspaceState,
     };
 
     use crate::audit::AuditLog;
@@ -3402,28 +3574,26 @@ mod tests {
             jailer_chroot: "/nonexistent/chroot".into(),
             jailer_uid: 0,
             jailer_gid: 0,
-            lifecycle_state: ne_protocol::supervisor::WorkspaceState::Running,
+            lifecycle_state: WorkspaceState::Running,
             network_slot: None,
             guest_vsock_cid: 3,
             vcpu_count: 1,
             mem_size_mib: 128,
             kernel_boot_args: String::new(),
-            rootfs_path: "/nonexistent/rootfs".into(),
-            kernel_path: "/nonexistent/kernel".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
+            rootfs_read_only: true,
         };
         mgr.instances.lock().await.insert(
             ws_id.to_string(),
-            super::WorkspaceExec::Firecracker(Box::new(instance)),
+            WorkspaceExec::Firecracker(Box::new(instance)),
         );
     }
 
-    async fn fake_lifecycle_state(
-        mgr: &WorkspaceManager,
-        ws_id: &str,
-    ) -> ne_protocol::supervisor::WorkspaceState {
+    async fn fake_lifecycle_state(mgr: &WorkspaceManager, ws_id: &str) -> WorkspaceState {
         let guard = mgr.instances.lock().await;
         match guard.get(ws_id) {
-            Some(super::WorkspaceExec::Firecracker(inst)) => inst.lifecycle_state,
+            Some(WorkspaceExec::Firecracker(inst)) => inst.lifecycle_state,
             _ => panic!("workspace {ws_id} missing from registry"),
         }
     }
@@ -3537,6 +3707,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn lifecycle_lease_blocks_same_id_boot_after_registry_removal() {
+        let mgr = test_manager().await;
+        insert_fake_instance(&mgr, "ws-lifecycle", "boot-OLD").await;
+
+        // Snapshot takes this lease before dropping the registry lock for its
+        // long pause/dump/publish window.
+        let lease = mgr
+            .claim_lifecycle("ws-lifecycle")
+            .expect("snapshot lifecycle lease");
+
+        // Simulate terminate removing the source while snapshot continues.
+        mgr.instances.lock().await.remove("ws-lifecycle");
+
+        match mgr.claim_boot("ws-lifecycle").await {
+            Err(SupervisorResponse::Error { kind, .. }) => {
+                assert_eq!(kind, S::WorkspaceAlreadyExists);
+            }
+            Err(other) => panic!("unexpected error response: {other:?}"),
+            Ok(_) => panic!("same-id boot must remain blocked for the lease lifetime"),
+        }
+
+        drop(lease);
+        assert!(
+            mgr.claim_boot("ws-lifecycle").await.is_ok(),
+            "same id must become claimable only after snapshot releases its lease"
+        );
+    }
+
     #[test]
     fn guest_kind_maps_to_supervisor_kind_one_to_one() {
         for (input, expected) in [
@@ -3555,6 +3754,26 @@ mod tests {
                 "for {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn restore_destination_staging_failure_is_image_stage_failed() {
+        let error = crate::firecracker::LaunchError::Image(ImageError::Stage {
+            kind: ImageKind::Rootfs,
+            digest: "ab".repeat(32),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected destination create failure",
+            ),
+        });
+        let response = restore_launch_error_response(error);
+        assert!(matches!(
+            response,
+            SupervisorResponse::Error {
+                kind: S::ImageStageFailed,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -3694,6 +3913,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writable_snapshot_rejection_preserves_running_state_and_publishes_nothing() {
+        let mgr = test_manager().await;
+        for live in [false, true] {
+            let id = format!("writable-{live}");
+            let child = tokio::process::Command::new("/usr/bin/true")
+                .spawn()
+                .expect("spawn harmless child");
+            mgr.instances.lock().await.insert(
+                id.clone(),
+                WorkspaceExec::Firecracker(Box::new(crate::firecracker::Instance {
+                    workspace_id: id.clone(),
+                    boot_id: ulid::Ulid::new().to_string(),
+                    child,
+                    firecracker_pid: 1,
+                    api_socket_host: PathBuf::from("/unused/api.sock"),
+                    vsock_host_socket: PathBuf::from("/unused/vsock.sock"),
+                    jailer_chroot: PathBuf::from("/unused/chroot"),
+                    jailer_uid: 1000,
+                    jailer_gid: 1000,
+                    lifecycle_state: WorkspaceState::Running,
+                    network_slot: None,
+                    guest_vsock_cid: 3,
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    kernel_boot_args: "console=ttyS0".into(),
+                    kernel_sha256: "11".repeat(32),
+                    rootfs_sha256: "22".repeat(32),
+                    rootfs_read_only: false,
+                })),
+            );
+
+            let response = mgr
+                .snapshot(SnapshotRequest {
+                    workspace_id: id.clone(),
+                    live,
+                })
+                .await;
+            assert!(matches!(
+                response,
+                SupervisorResponse::Error {
+                    kind: S::SnapshotFailed,
+                    ref message,
+                } if message.contains("writable-rootfs")
+            ));
+            let guard = mgr.instances.lock().await;
+            let Some(WorkspaceExec::Firecracker(instance)) = guard.get(&id) else {
+                panic!("writable instance must remain registered");
+            };
+            assert_eq!(instance.lifecycle_state, WorkspaceState::Running);
+            drop(guard);
+            assert!(
+                !mgr.cfg.state_dir.join("snapshots").exists(),
+                "live={live}: rejection must occur before artifact publication"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn restore_missing_snapshot_is_invalid() {
         let mgr = test_manager().await;
         let resp = mgr
@@ -3751,8 +4028,8 @@ mod tests {
         let mgr = test_manager().await;
         let req = CreateWorkspaceRequest {
             workspace_id: "w".into(),
-            kernel_image_path: "k".into(),
-            rootfs_image_path: "r".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -3779,8 +4056,8 @@ mod tests {
         let mgr = test_manager_with_limits(1024, 256).await;
         let req = CreateWorkspaceRequest {
             workspace_id: "ws-mem".into(),
-            kernel_image_path: "k".into(),
-            rootfs_image_path: "r".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 512,
@@ -3809,8 +4086,8 @@ mod tests {
         let mgr = test_manager_with_limits(0, 32768).await;
         let req = CreateWorkspaceRequest {
             workspace_id: "ws-cap".into(),
-            kernel_image_path: "k".into(),
-            rootfs_image_path: "r".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -3865,8 +4142,8 @@ mod tests {
         let resp = mgr
             .create(CreateWorkspaceRequest {
                 workspace_id: "ws-pool-cap".into(),
-                kernel_image_path: "k".into(),
-                rootfs_image_path: "r".into(),
+                kernel_sha256: "11".repeat(32),
+                rootfs_sha256: "22".repeat(32),
                 rootfs_read_only: true,
                 vcpu_count: 1,
                 mem_size_mib: 128,
@@ -3933,6 +4210,118 @@ mod tests {
                 }
             ),
             "expected CapacityExceeded, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_create_rejects_half_present_or_invalid_digest_pair() {
+        let mgr = test_manager().await;
+        for (kernel_sha256, rootfs_sha256) in [
+            ("11".repeat(32), String::new()),
+            ("AA".repeat(32), "22".repeat(32)),
+        ] {
+            let response = mgr
+                .create(CreateWorkspaceRequest {
+                    workspace_id: "bad-tier-digest".into(),
+                    kernel_sha256,
+                    rootfs_sha256,
+                    rootfs_read_only: true,
+                    vcpu_count: 1,
+                    mem_size_mib: 128,
+                    guest_vsock_cid: 3,
+                    kernel_boot_args: None,
+                    network: None,
+                    tier: Some("default".into()),
+                })
+                .await;
+            assert!(matches!(
+                response,
+                SupervisorResponse::Error {
+                    kind: S::InvalidImageDigest,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_cold_create_rejects_empty_digest_pair() {
+        let mgr = test_manager().await;
+        let response = mgr
+            .create(CreateWorkspaceRequest {
+                workspace_id: "missing-digests".into(),
+                kernel_sha256: String::new(),
+                rootfs_sha256: String::new(),
+                rootfs_read_only: true,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                guest_vsock_cid: 3,
+                kernel_boot_args: None,
+                network: None,
+                tier: None,
+            })
+            .await;
+        assert!(matches!(
+            response,
+            SupervisorResponse::Error {
+                kind: S::InvalidImageDigest,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_managed_image_is_rejected_before_network_setup() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let state_dir = tmp.path().join("state");
+        let image_store = tmp.path().join("images");
+        tokio::fs::create_dir_all(state_dir.join("keys"))
+            .await
+            .expect("keys dir");
+        tokio::fs::create_dir_all(&image_store)
+            .await
+            .expect("image store");
+        let audit = AuditLog::open(&state_dir).await.expect("audit open");
+        let mut cfg = WorkspaceManagerConfig::dev_defaults();
+        cfg.state_dir = state_dir;
+        cfg.image_store = image_store;
+        cfg.network = Some(crate::network::NetworkController::new(
+            PathBuf::from("/definitely/not/invoked/ip"),
+            PathBuf::from("/definitely/not/invoked/iptables"),
+            "eth0".into(),
+            None,
+            "1.1.1.1:53".into(),
+            None,
+            None,
+            None,
+        ));
+        let mgr = WorkspaceManager::new(cfg, audit, 1024, 32768).expect("workspace manager");
+        let response = mgr
+            .create(CreateWorkspaceRequest {
+                workspace_id: "missing-image".into(),
+                kernel_sha256: "11".repeat(32),
+                rootfs_sha256: "22".repeat(32),
+                rootfs_read_only: true,
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                guest_vsock_cid: 3,
+                kernel_boot_args: None,
+                network: Some(ne_protocol::supervisor::NetworkConfig {
+                    enable_egress: true,
+                    ..Default::default()
+                }),
+                tier: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                response,
+                SupervisorResponse::Error {
+                    kind: S::ImageNotFound,
+                    ..
+                }
+            ),
+            "missing image must win before any network command: {response:?}"
         );
     }
 

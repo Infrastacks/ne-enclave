@@ -16,7 +16,8 @@ Validated on Ubuntu 24.04 / x86_64 with KVM.
 
 NeuronEdge Enclave does not bundle Firecracker or jailer. Install them from the
 [Firecracker releases page](https://github.com/firecracker-microvm/firecracker/releases)
-and place both binaries at `/opt/ne-enclave/bin/` before running `nee install`.
+and place both binaries at `/opt/ne-enclave/bin/` before running
+`sudo /opt/ne-enclave/bin/nee install`.
 
 ---
 
@@ -60,7 +61,8 @@ The thin `install.sh` (in this directory) does three things:
 
 1. Downloads the static-musl `nee` binary from the GitHub release.
 2. Verifies the SHA-256 checksum against the published `SHA256SUMS` file.
-3. Drops the binary to `/opt/ne-enclave/bin/nee` and execs `sudo nee install`.
+3. Drops the binary to `/opt/ne-enclave/bin/nee` and execs
+   `sudo /opt/ne-enclave/bin/nee install`.
 
 Cosign signature verification is a documented future step (see the commented
 block in `deploy/install.sh`).
@@ -68,9 +70,12 @@ block in `deploy/install.sh`).
 To pin a specific release:
 
 ```sh
-NE_VERSION=v0.3.0 curl -fsSL \
-  https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh | sh
+curl -fsSL \
+  https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh |
+  NE_VERSION=v0.3.0 sh
 ```
+
+The assignment is attached to `sh`, so the downloaded installer receives `NE_VERSION`.
 
 ---
 
@@ -81,7 +86,7 @@ host (re-renders config; does not restart running services unless asked).
 
 Steps in order:
 
-1. **Preflight** — runs `nee doctor` (checks `/dev/kvm`, `firecracker`,
+1. **Preflight** — runs `/opt/ne-enclave/bin/nee doctor` (checks `/dev/kvm`, `firecracker`,
    `jailer` at expected paths, kernel module state).
 2. **System user/group** — creates the `nee` system user + group if absent.
 3. **Directory layout** — creates all directories listed in the
@@ -144,6 +149,12 @@ One fused static binary at `/opt/ne-enclave/bin/nee`. Subcommands:
 /etc/systemd/system/ne-supervisor.service
 /etc/systemd/system/ne-api.service
 /etc/tmpfiles.d/ne-enclave.conf
+```
+
+The supervisor's environment file sets the managed image root explicitly:
+
+```sh
+NE_IMAGE_STORE=/var/lib/ne-enclave/images
 ```
 
 ---
@@ -237,17 +248,37 @@ TPM-Quote nonce, validated against the genuine AMD Milan ARK).
 
 ```sh
 # 1. Install without fetching the default image
-sudo nee install --no-image
+sudo /opt/ne-enclave/bin/nee install --no-image
 
 # 2. Import your own kernel + rootfs (SHA-256 values are verified on import)
-nee image import \
-  --kernel   /path/to/vmlinux       --kernel-sha256  <hex> \
-  --rootfs   /path/to/rootfs.img    --rootfs-sha256  <hex>
+KERNEL_SHA256=$(sha256sum /path/to/vmlinux | cut -d' ' -f1)
+ROOTFS_SHA256=$(sha256sum /path/to/rootfs.img | cut -d' ' -f1)
+sudo /opt/ne-enclave/bin/nee image import \
+  --kernel /path/to/vmlinux --kernel-sha256 "$KERNEL_SHA256" \
+  --rootfs /path/to/rootfs.img --rootfs-sha256 "$ROOTFS_SHA256"
 ```
 
-When creating workspaces, specify the image paths explicitly in the
-`CreateWorkspace` request (`kernel_image_path` / `rootfs_image_path` fields).
-The paths recorded in `ne-enclave.env` are informational defaults.
+Import runs with elevated privileges because it creates content-addressed directories in
+the installed managed store, which is owned by `ne:ne` and mode `0750`.
+
+When creating a cold Firecracker workspace, send the same verified values as
+`kernel_sha256` and `rootfs_sha256`. The supervisor resolves only these fixed
+managed-store locations and verifies their contents before allocating VM resources:
+
+```text
+$NE_IMAGE_STORE/kernels/<kernel_sha256>/vmlinux
+$NE_IMAGE_STORE/rootfs/<rootfs_sha256>/rootfs.img
+```
+
+The source images are copied into each jailer chroot as independent files; writable
+rootfs workspaces therefore cannot modify the managed source or another workspace's
+copy. Image failures use stable codes: `INVALID_IMAGE_DIGEST`, `IMAGE_NOT_FOUND`,
+`IMAGE_REJECTED`, `IMAGE_DIGEST_MISMATCH`, and `IMAGE_STAGE_FAILED`.
+
+Snapshot manifests use schema version 5 and sign the kernel/rootfs digest pair.
+Restore and fork re-resolve both digests from the managed store. Manifests older
+than version 5 are rejected, and snapshotting a writable-rootfs workspace is not
+supported; create snapshot sources with `rootfs_read_only=true`.
 
 ---
 
@@ -280,7 +311,7 @@ operator-provided binary already under `/opt/ne-enclave/bin/` is left as-is.
 ```sh
 systemctl --no-pager status ne-supervisor.service ne-api.service
 journalctl -u ne-supervisor.service -u ne-api.service -f
-nee doctor
+/opt/ne-enclave/bin/nee doctor
 ```
 
 ---
@@ -289,10 +320,10 @@ nee doctor
 
 ```sh
 # Remove units + config + ne user; preserve /var/lib/ne-enclave state
-sudo nee uninstall
+sudo /opt/ne-enclave/bin/nee uninstall
 
 # Full removal including workspace + image state
-sudo nee uninstall --purge
+sudo /opt/ne-enclave/bin/nee uninstall --purge
 ```
 
 ---

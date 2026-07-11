@@ -26,6 +26,8 @@ Cargo.lock.bak
 /images/buildroot/dl/
 
 # Editor / OS
+.worktrees/
+.superpowers/
 .idea/
 .vscode/
 *.swp

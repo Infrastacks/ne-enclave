@@ -14,10 +14,6 @@ async fn verify_accepts_good_and_rejects_tampered() {
     tokio::fs::create_dir_all(&snap).await.unwrap();
     tokio::fs::write(snap.join("mem"), b"MEM").await.unwrap();
     tokio::fs::write(snap.join("vmstate"), b"VM").await.unwrap();
-    let rootfs = dir.path().join("rootfs.squashfs");
-    tokio::fs::write(&rootfs, b"ROOT").await.unwrap();
-    let kernel = dir.path().join("vmlinux");
-    tokio::fs::write(&kernel, b"KERNEL").await.unwrap();
     let signer = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
     ne_supervisor::snapshot::write_manifest(
         &snap,
@@ -25,7 +21,8 @@ async fn verify_accepts_good_and_rejects_tampered() {
         "01J0SNAP",
         "ws-a",
         "1.7.0",
-        &rootfs,
+        &"11".repeat(32),
+        &"22".repeat(32),
         ne_protocol::snapshot::GuestIdentity {
             hostname: "ne-enclave".into(),
             mac: "unset".into(),
@@ -34,7 +31,6 @@ async fn verify_accepts_good_and_rejects_tampered() {
             mem_size_mib: 128,
         },
         "console=ttyS0",
-        &kernel,
     )
     .await
     .unwrap();

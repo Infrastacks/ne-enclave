@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
                 firecracker_binary: a.firecracker_binary,
                 jailer_binary: a.jailer_binary,
                 jailer_chroot_base: a.jailer_chroot_base,
+                image_store: a.image_store,
                 jailer_uid: a.jailer_uid,
                 jailer_gid: a.jailer_gid,
                 openshell_sandbox_binary: a.openshell_sandbox_binary,
@@ -160,8 +161,13 @@ async fn main() -> Result<()> {
                 rootfs_sha256,
                 prefix,
             } => {
+                // Validate the complete pair before either import can mutate the store.
+                install::image::validate_sha256(&kernel_sha256)?;
+                install::image::validate_sha256(&rootfs_sha256)?;
+                let fakeroot = prefix.is_some();
                 let root = prefix.unwrap_or_else(|| "/".into());
                 let layout = install::layout::Layout::new(root);
+                install::run::prepare_image_store(&layout, fakeroot)?;
                 install::image::import_artifact(
                     &layout.images_dir(),
                     "kernels",
@@ -176,6 +182,7 @@ async fn main() -> Result<()> {
                     &rootfs,
                     &rootfs_sha256,
                 )?;
+                install::image::harden_store(&layout.images_dir(), fakeroot)?;
                 Ok(())
             }
         },

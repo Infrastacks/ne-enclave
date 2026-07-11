@@ -61,8 +61,8 @@ impl Runtime for RuntimeService {
             .core
             .create_workspace(CreateWorkspaceInput {
                 workspace_id: r.workspace_id,
-                kernel_image_path: r.kernel_image_path,
-                rootfs_image_path: r.rootfs_image_path,
+                kernel_sha256: r.kernel_sha256,
+                rootfs_sha256: r.rootfs_sha256,
                 rootfs_read_only: r.rootfs_read_only,
                 vcpu_count: r.vcpu_count,
                 mem_size_mib: r.mem_size_mib,
@@ -446,15 +446,21 @@ fn kind_to_status(kind: ne_protocol::supervisor::SupervisorErrorKind, message: S
     use ne_protocol::supervisor::SupervisorErrorKind as K;
     match kind {
         K::Unauthorized => Status::permission_denied(message),
-        K::InvalidRequest | K::PathRejected | K::FileTooLarge => Status::invalid_argument(message),
+        K::InvalidRequest | K::InvalidImageDigest | K::PathRejected | K::FileTooLarge => {
+            Status::invalid_argument(message)
+        }
         K::Unsupported => Status::unimplemented(message),
         K::WorkspaceAlreadyExists => Status::already_exists(message),
-        K::WorkspaceNotFound | K::FileNotFound | K::TierNotFound | K::IngressPortNotFound => {
-            Status::not_found(message)
-        }
+        K::WorkspaceNotFound
+        | K::FileNotFound
+        | K::ImageNotFound
+        | K::TierNotFound
+        | K::IngressPortNotFound => Status::not_found(message),
         K::Timeout => Status::deadline_exceeded(message),
         K::GuestUnreachable => Status::unavailable(message),
-        K::InvalidSnapshot
+        K::ImageRejected
+        | K::ImageDigestMismatch
+        | K::InvalidSnapshot
         | K::WorkspaceNotPaused
         | K::WorkspaceAlreadyPaused
         | K::WorkspaceNotNetworked
@@ -462,6 +468,25 @@ fn kind_to_status(kind: ne_protocol::supervisor::SupervisorErrorKind, message: S
         // SnapshotFailed / RestoreFailed / LaunchFailed / GuestProtocolError /
         // IoError / Internal / any future variant → internal.
         _ => Status::internal(message),
+    }
+}
+
+#[cfg(test)]
+mod image_error_mapping_tests {
+    use super::*;
+    use ne_protocol::supervisor::SupervisorErrorKind as K;
+
+    #[test]
+    fn image_errors_map_to_grpc_statuses() {
+        for (kind, code) in [
+            (K::InvalidImageDigest, tonic::Code::InvalidArgument),
+            (K::ImageNotFound, tonic::Code::NotFound),
+            (K::ImageRejected, tonic::Code::FailedPrecondition),
+            (K::ImageDigestMismatch, tonic::Code::FailedPrecondition),
+            (K::ImageStageFailed, tonic::Code::Internal),
+        ] {
+            assert_eq!(kind_to_status(kind, "image error".into()).code(), code);
+        }
     }
 }
 
@@ -615,8 +640,8 @@ mod tests {
         let resp = svc
             .create_workspace(Request::new(pb::CreateWorkspaceRequest {
                 workspace_id: "wks-test-1".into(),
-                kernel_image_path: "/opt/ne-enclave/kernel/vmlinux-spike".into(),
-                rootfs_image_path: "/opt/ne-enclave/rootfs/spike.ext4".into(),
+                kernel_sha256: "11".repeat(32),
+                rootfs_sha256: "22".repeat(32),
                 rootfs_read_only: true,
                 vcpu_count: 1,
                 mem_size_mib: 256,
@@ -686,8 +711,8 @@ mod tests {
         let resp = svc
             .create_workspace(Request::new(pb::CreateWorkspaceRequest {
                 workspace_id: "wks-net-rpc".into(),
-                kernel_image_path: "/opt/ne-enclave/kernel/vmlinux-spike".into(),
-                rootfs_image_path: "/opt/ne-enclave/rootfs/spike.ext4".into(),
+                kernel_sha256: "11".repeat(32),
+                rootfs_sha256: "22".repeat(32),
                 rootfs_read_only: true,
                 vcpu_count: 1,
                 mem_size_mib: 256,
@@ -718,8 +743,8 @@ mod tests {
         let err = svc
             .create_workspace(Request::new(pb::CreateWorkspaceRequest {
                 workspace_id: "wks-test-2".into(),
-                kernel_image_path: "/k".into(),
-                rootfs_image_path: "/r".into(),
+                kernel_sha256: "11".repeat(32),
+                rootfs_sha256: "22".repeat(32),
                 rootfs_read_only: true,
                 vcpu_count: 300, // > u8::MAX
                 mem_size_mib: 256,

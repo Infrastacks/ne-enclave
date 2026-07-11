@@ -24,10 +24,10 @@ pub struct BenchClient {
 pub struct CreateParams {
     /// Caller-supplied workspace id.
     pub workspace_id: String,
-    /// Host path to the guest kernel image.
-    pub kernel_image_path: String,
-    /// Host path to the guest rootfs image.
-    pub rootfs_image_path: String,
+    /// Managed guest kernel SHA-256 digest.
+    pub kernel_sha256: String,
+    /// Managed guest rootfs SHA-256 digest.
+    pub rootfs_sha256: String,
     /// Guest vCPU count.
     pub vcpu_count: u32,
     /// Guest memory in MiB.
@@ -61,8 +61,8 @@ impl BenchClient {
     pub async fn create(&mut self, p: &CreateParams) -> Result<Duration, BenchClientError> {
         let req = pb::CreateWorkspaceRequest {
             workspace_id: p.workspace_id.clone(),
-            kernel_image_path: p.kernel_image_path.clone(),
-            rootfs_image_path: p.rootfs_image_path.clone(),
+            kernel_sha256: p.kernel_sha256.clone(),
+            rootfs_sha256: p.rootfs_sha256.clone(),
             rootfs_read_only: true,
             vcpu_count: p.vcpu_count,
             mem_size_mib: p.mem_size_mib,

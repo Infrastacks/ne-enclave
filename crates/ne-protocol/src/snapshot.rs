@@ -29,7 +29,10 @@ use serde::{Deserialize, Serialize};
 /// v4 (NeuronEdge Enclave rename): the tag rotated to `ne-enclave-snapshot-v1`,
 /// a signing-format break folded into the rename. Pre-v4 manifests are rejected
 /// with [`VerifyError::UnsupportedVersion`]; there is no migration.
-pub const MANIFEST_VERSION: u32 = 4;
+/// v5 (managed images): host image paths were removed and the signed form now
+/// carries the kernel and rootfs SHA-256 content identities. Pre-v5 manifests
+/// are rejected with [`VerifyError::UnsupportedVersion`]; there is no migration.
+pub const MANIFEST_VERSION: u32 = 5;
 
 /// Domain-separation tag embedded in every snapshot manifest signature.
 ///
@@ -44,6 +47,7 @@ pub const SNAPSHOT_DOMAIN_TAG: &str = "ne-enclave-snapshot-v1";
 /// (nested objects are not key-sorted). Reordering fields breaks
 /// verification of existing signatures — bump `MANIFEST_VERSION` if you must.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuestIdentity {
     /// Hostname assigned to the guest.
     pub hostname: String,
@@ -59,6 +63,7 @@ pub struct GuestIdentity {
 
 /// The signed snapshot descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotManifest {
     /// Manifest schema version; must equal [`MANIFEST_VERSION`].
     pub manifest_version: u32,
@@ -72,19 +77,14 @@ pub struct SnapshotManifest {
     pub mem_sha256: String,
     /// Hex-encoded SHA-256 of the `vmstate` artifact file.
     pub vmstate_sha256: String,
-    /// Absolute path to the rootfs image used by the snapshotted VM.
-    pub rootfs_path: String,
+    /// Canonical lowercase SHA-256 of the managed kernel image.
+    pub kernel_sha256: String,
     /// Hex-encoded SHA-256 of the rootfs image.
     pub rootfs_sha256: String,
     /// Guest identity metadata captured at snapshot time.
     pub guest_identity: GuestIdentity,
     /// Kernel boot arguments string.
     pub kernel_boot_args: String,
-    /// Absolute host path to the kernel image used by the snapshotted VM.
-    ///
-    /// Stored in the manifest so `restore()` can locate the kernel without
-    /// a separate per-request `kernel_image_path` argument.
-    pub kernel_path: String,
     /// Base64-encoded Ed25519 public key that signed this manifest.
     /// Carried inside the signed bytes so key-swap forgery is detectable.
     pub signer_pubkey_b64: String,
@@ -137,10 +137,10 @@ pub enum VerifyError {
     /// Failed to produce canonical bytes for signing.
     #[error("canonical bytes: {0}")]
     Canonical(#[from] ManifestError),
-    /// A recorded artifact hash does not match the supplied actual hash.
+    /// A recorded snapshot artifact hash does not match the supplied actual hash.
     #[error("{field} hash mismatch: manifest {expected}, actual {actual}")]
     HashMismatch {
-        /// Artifact field name (`mem`, `vmstate`, or `rootfs`).
+        /// Artifact field name (`mem` or `vmstate`).
         field: &'static str,
         /// Hash recorded in the manifest.
         expected: String,
@@ -251,11 +251,9 @@ pub fn manifest_matches_hashes(
     m: &SnapshotManifest,
     mem_sha256: &str,
     vmstate_sha256: &str,
-    rootfs_sha256: &str,
 ) -> Result<(), VerifyError> {
     check("mem", &m.mem_sha256, mem_sha256)?;
     check("vmstate", &m.vmstate_sha256, vmstate_sha256)?;
-    check("rootfs", &m.rootfs_sha256, rootfs_sha256)?;
     Ok(())
 }
 
@@ -278,14 +276,14 @@ mod tests {
 
     fn sample(signer: &SigningKey) -> SnapshotManifest {
         let mut m = SnapshotManifest {
-            manifest_version: MANIFEST_VERSION,
+            manifest_version: 5,
             snapshot_id: "01J0SNAP".into(),
             created_from_workspace_id: "ws-a".into(),
             firecracker_version: "1.7.0".into(),
             mem_sha256: "aa".into(),
             vmstate_sha256: "bb".into(),
-            rootfs_path: "/opt/rootfs.squashfs".into(),
-            rootfs_sha256: "cc".into(),
+            kernel_sha256: "33".repeat(32),
+            rootfs_sha256: "44".repeat(32),
             guest_identity: GuestIdentity {
                 hostname: "ne-enclave".into(),
                 mac: "06:00:00:00:00:01".into(),
@@ -294,7 +292,6 @@ mod tests {
                 mem_size_mib: 128,
             },
             kernel_boot_args: "console=ttyS0".into(),
-            kernel_path: "/opt/ne-enclave/kernel/vmlinux".into(),
             signer_pubkey_b64: B64.encode(signer.verifying_key().as_bytes()),
             signature_b64: String::new(),
         };
@@ -359,9 +356,9 @@ mod tests {
     fn hash_mismatch_detected() {
         let signer = SigningKey::from_bytes(&[7u8; 32]);
         let m = sample(&signer);
-        assert!(manifest_matches_hashes(&m, "aa", "bb", "cc").is_ok());
+        assert!(manifest_matches_hashes(&m, "aa", "bb").is_ok());
         assert!(matches!(
-            manifest_matches_hashes(&m, "aa", "WRONG", "cc"),
+            manifest_matches_hashes(&m, "aa", "WRONG"),
             Err(VerifyError::HashMismatch {
                 field: "vmstate",
                 ..
@@ -396,22 +393,47 @@ mod tests {
     }
 
     #[test]
-    fn pre_v4_manifest_is_rejected() {
+    fn pre_v5_manifest_is_rejected() {
         // Clean break (S5-F4 + NeuronEdge Enclave rename): manifests written under any prior
         // schema version are rejected with UnsupportedVersion — no migration.
         assert_eq!(
-            MANIFEST_VERSION, 4,
-            "the NeuronEdge Enclave rename rotates signing tags and bumps the manifest version"
+            MANIFEST_VERSION, 5,
+            "managed image digests replace host paths in manifest v5"
         );
         let signer = SigningKey::from_bytes(&[7u8; 32]);
         let mut m = sample(&signer);
-        m.manifest_version = 3;
+        m.manifest_version = 4;
         m.signature_b64 = String::new();
         let sig = signer.sign(&m.canonical_bytes().unwrap());
         m.signature_b64 = B64.encode(sig.to_bytes());
         assert!(matches!(
             verify_manifest_signature(&m),
-            Err(VerifyError::UnsupportedVersion { got: 3, .. })
+            Err(VerifyError::UnsupportedVersion {
+                got: 4,
+                supported: 5
+            })
         ));
+    }
+
+    #[test]
+    fn serialized_v5_manifest_contains_only_image_digests() {
+        let signer = SigningKey::from_bytes(&[7u8; 32]);
+        let json = serde_json::to_string(&sample(&signer)).expect("serialize manifest");
+        assert!(json.contains("\"kernel_sha256\""));
+        assert!(json.contains("\"rootfs_sha256\""));
+        assert!(!json.contains(&["kernel", "path"].join("_")));
+        assert!(!json.contains(&["rootfs", "path"].join("_")));
+    }
+
+    #[test]
+    fn v5_manifest_rejects_unknown_fields() {
+        let signer = SigningKey::from_bytes(&[7u8; 32]);
+        let mut value = serde_json::to_value(sample(&signer)).expect("manifest value");
+        value
+            .as_object_mut()
+            .expect("manifest object")
+            .insert("kernel_path".into(), serde_json::json!("/host/vmlinux"));
+        let error = serde_json::from_value::<SnapshotManifest>(value).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 }

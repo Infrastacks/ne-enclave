@@ -15,10 +15,10 @@ export type EnclaveWorkspaceOptions = {
   vcpuCount?: number;
   /** Default 1024. */
   memSizeMib?: number;
-  /** Default: `NE_KERNEL_IMAGE_PATH`. */
-  kernelImagePath?: string;
-  /** Default: `NE_ROOTFS_IMAGE_PATH`. */
-  rootfsImagePath?: string;
+  /** Default: `NE_KERNEL_SHA256`. */
+  kernelSha256?: string;
+  /** Default: `NE_ROOTFS_SHA256`. */
+  rootfsSha256?: string;
   /** Default: `NE_VSOCK_CID_BASE` (no silent fallback — must be unique per concurrent workspace on a host). */
   guestVsockCid?: number;
   /** Default false — agents need to write. (The SDK server default is true.) */
@@ -83,15 +83,15 @@ export class EnclaveWorkspace {
 
     const workspaceId = this._workspaceId;
 
-    const kernelImagePath = this._opts.kernelImagePath ?? process.env.NE_KERNEL_IMAGE_PATH;
-    const rootfsImagePath = this._opts.rootfsImagePath ?? process.env.NE_ROOTFS_IMAGE_PATH;
+    const kernelSha256 = this._opts.kernelSha256 ?? process.env.NE_KERNEL_SHA256;
+    const rootfsSha256 = this._opts.rootfsSha256 ?? process.env.NE_ROOTFS_SHA256;
     const cidEnv = process.env.NE_VSOCK_CID_BASE;
     const guestVsockCid =
       this._opts.guestVsockCid ?? (cidEnv !== undefined ? Number(cidEnv) : undefined);
 
     const missing: string[] = [];
-    if (!kernelImagePath) missing.push("kernelImagePath");
-    if (!rootfsImagePath) missing.push("rootfsImagePath");
+    if (!kernelSha256) missing.push("kernelSha256");
+    if (!rootfsSha256) missing.push("rootfsSha256");
     if (guestVsockCid === undefined || Number.isNaN(guestVsockCid)) missing.push("guestVsockCid");
     if (missing.length > 0) {
       throw new Error(
@@ -119,8 +119,8 @@ export class EnclaveWorkspace {
     try {
       await client.createWorkspace({
         workspaceId,
-        kernelImagePath: kernelImagePath!, // presence validated in `missing` above
-        rootfsImagePath: rootfsImagePath!, // presence validated in `missing` above
+        kernelSha256: kernelSha256!, // presence validated in `missing` above
+        rootfsSha256: rootfsSha256!, // presence validated in `missing` above
         vcpuCount: this._opts.vcpuCount ?? 2,
         memSizeMib: this._opts.memSizeMib ?? 1024,
         guestVsockCid: guestVsockCid!, // presence + NaN validated in `missing` above

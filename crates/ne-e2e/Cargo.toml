@@ -20,6 +20,11 @@ path = "src/lib.rs"
 default = []
 confidential-cvm = ["ne-supervisor/confidential-cvm"]
 
+[dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+ne-supervisor = { path = "../ne-supervisor" }
+
 [dev-dependencies]
 # `kds` turns on ne-attestation's live AMD KDS VCEK fetcher (`KdsVcekFetcher`),
 # used by the sev_snp.rs e2e's real-silicon SEV-SNP provider. `ne-seal` (its
@@ -29,11 +34,8 @@ confidential-cvm = ["ne-supervisor/confidential-cvm"]
 ne-attestation = { path = "../ne-attestation", features = ["kds"] }
 ne-seal = { path = "../ne-seal" }
 ne-ingress = { path = "../ne-ingress" }
-ne-supervisor = { path = "../ne-supervisor" }
 ne-protocol = { path = "../ne-protocol" }
 ed25519-dalek = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

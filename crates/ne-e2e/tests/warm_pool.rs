@@ -74,10 +74,12 @@ async fn build_base_snapshot(
     snap_id: &str,
     src_id: &str,
 ) {
+    let image_store = state_dir.join("images");
+    let (_, _, verified_images) =
+        ne_e2e::resolve_managed_images(&image_store, &env.kernel, &env.rootfs).await;
     let src = launch(LaunchConfig {
         workspace_id: src_id.to_string(),
-        kernel_image: env.kernel.clone(),
-        rootfs_image: env.rootfs.clone(),
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -122,7 +124,8 @@ async fn build_base_snapshot(
         snap_id,
         &src.workspace_id,
         &fc_version,
-        &src.rootfs_path.clone(),
+        &src.kernel_sha256,
+        &src.rootfs_sha256,
         GuestIdentity {
             hostname: src.workspace_id.clone(),
             mac: "unset".into(),
@@ -131,7 +134,6 @@ async fn build_base_snapshot(
             mem_size_mib: src.mem_size_mib,
         },
         &src.kernel_boot_args.clone(),
-        &src.kernel_path.clone(),
     )
     .await
     .expect("write_manifest");
@@ -183,8 +185,8 @@ async fn wait_pool_at_least(mgr: &WorkspaceManager, n: u32, deadline: Duration) 
 fn tier_create_req(workspace_id: &str) -> CreateWorkspaceRequest {
     CreateWorkspaceRequest {
         workspace_id: workspace_id.to_string(),
-        kernel_image_path: String::new(),
-        rootfs_image_path: String::new(),
+        kernel_sha256: String::new(),
+        rootfs_sha256: String::new(),
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -219,6 +221,7 @@ async fn warm_pool_hit_is_fast_distinct_and_refills() {
     cfg.jailer_binary = env.jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = state_dir.join("images");
     cfg.warm_pool = Some(WarmPoolConfig {
         tier_name: TIER.into(),
         base_snapshot_id: "01J0WARMPOOLSNAP".into(),
@@ -313,6 +316,7 @@ async fn warm_pool_miss_falls_back_to_fork() {
     cfg.jailer_binary = env.jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = state_dir.join("images");
     cfg.warm_pool = Some(WarmPoolConfig {
         tier_name: TIER.into(),
         base_snapshot_id: "01J0WARMPOOLMISS".into(),

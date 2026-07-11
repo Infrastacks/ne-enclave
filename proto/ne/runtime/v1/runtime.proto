@@ -102,10 +102,10 @@ message CreateWorkspaceRequest {
   // does not mint IDs. Must satisfy jailer's grammar
   // ([a-zA-Z0-9-]{1,64}).
   string workspace_id = 1;
-  // Absolute host path to the guest kernel image (uncompressed vmlinux).
-  string kernel_image_path = 2;
-  // Absolute host path to the guest rootfs image (ext4 or squashfs).
-  string rootfs_image_path = 3;
+  // Canonical lowercase SHA-256 digest of the managed guest kernel image.
+  string kernel_sha256 = 2;
+  // Canonical lowercase SHA-256 digest of the managed guest rootfs image.
+  string rootfs_sha256 = 3;
   // Whether the rootfs should be mounted read-only inside the guest.
   bool rootfs_read_only = 4;
   // Guest vCPU count. Protobuf has no u8 — runtime validates 1..=255.

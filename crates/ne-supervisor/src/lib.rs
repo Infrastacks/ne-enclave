@@ -23,6 +23,7 @@ pub mod firecracker;
 // Mac tests) + the gated SSH-control `imp` (Linux + confidential-cvm only).
 // Declared unconditionally so the pure preface tests run off-silicon; the
 // spawn/SSH surface is cfg-gated inside the module.
+pub mod image;
 pub mod ipc;
 #[cfg(target_os = "linux")]
 pub mod network;

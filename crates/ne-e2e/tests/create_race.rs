@@ -7,9 +7,10 @@
 //!
 //! Before the fix, the cold `create` path did a courtesy `contains_key` then a
 //! bare `insert` seconds later; the loser's freshly-booted `Instance` was
-//! silently dropped (leaking its chroot/netns) instead of terminated. The fix
-//! routes both cold paths through `register_or_teardown`, which re-checks under
-//! the final registry lock and terminates the loser.
+//! silently dropped (leaking its chroot/netns) instead of terminated. The
+//! lifecycle claim now rejects a same-id loser before either a cold boot or a
+//! warm-pool checkout can allocate resources; `register_or_teardown` remains a
+//! final registry-lock backstop.
 //!
 //! REAL-HARDWARE NOTE (empirical): on the blank cold path the jailer chroot is
 //! derived directly from the caller-supplied id
@@ -36,10 +37,9 @@
 //! in microseconds with `WorkspaceAlreadyExists` (the boot claim) — the
 //! assertion also tolerates `LaunchFailed` ("jailer exited...", the fail-fast
 //! backstop) — with no leaked chroot and no cross-instance interference. The
-//! `register_or_teardown` *teardown* branch is pinned by
-//! `concurrent_pool_checkout_single_winner` below (warm-pool checkout:
-//! distinct member chroots, shared final registry id). Unique per-boot chroot
-//! ids (also de-risking same-id restore/fork races) stay a filed follow-up.
+//! `concurrent_pool_checkout_single_winner` below pins the same ordering for
+//! warm-pool creates: the loser must not pop or tear down the second ready
+//! member. Unique per-boot chroot ids stay a filed follow-up defense in depth.
 //!
 //! `#[ignore]` by default — needs `/dev/kvm`. Run on a KVM host:
 //! ```sh
@@ -83,11 +83,11 @@ fn env_path(var: &str, default: &str) -> PathBuf {
     PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
 }
 
-fn cold_create_req(kernel: &Path, rootfs: &Path) -> CreateWorkspaceRequest {
+fn cold_create_req(kernel_sha256: &str, rootfs_sha256: &str) -> CreateWorkspaceRequest {
     CreateWorkspaceRequest {
         workspace_id: WS_ID.to_string(),
-        kernel_image_path: kernel.display().to_string(),
-        rootfs_image_path: rootfs.display().to_string(),
+        kernel_sha256: kernel_sha256.to_string(),
+        rootfs_sha256: rootfs_sha256.to_string(),
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -152,12 +152,24 @@ async fn concurrent_same_id_create_has_one_winner() {
     tokio::fs::copy(&rootfs, &rootfs_copy)
         .await
         .expect("copy rootfs fixture");
+    let image_store = state_dir.join("images");
+    let (kernel_sha256, rootfs_sha256) =
+        ne_e2e::prepare_managed_images(&image_store, &kernel_copy, &rootfs_copy);
+    let managed_kernel = image_store
+        .join("kernels")
+        .join(&kernel_sha256)
+        .join("vmlinux");
+    let managed_rootfs = image_store
+        .join("rootfs")
+        .join(&rootfs_sha256)
+        .join("rootfs.img");
 
     let mut cfg = WorkspaceManagerConfig::dev_defaults();
     cfg.firecracker_binary = firecracker.clone();
     cfg.jailer_binary = jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 1024, 32768).expect("workspace manager"));
 
@@ -167,13 +179,19 @@ async fn concurrent_same_id_create_has_one_winner() {
     // registry-lock backstop.
     let a = {
         let mgr = Arc::clone(&mgr);
-        let (kernel, rootfs) = (kernel_copy.clone(), rootfs_copy.clone());
-        async move { mgr.create(cold_create_req(&kernel, &rootfs)).await }
+        let (kernel_sha256, rootfs_sha256) = (kernel_sha256.clone(), rootfs_sha256.clone());
+        async move {
+            mgr.create(cold_create_req(&kernel_sha256, &rootfs_sha256))
+                .await
+        }
     };
     let b = {
         let mgr = Arc::clone(&mgr);
-        let (kernel, rootfs) = (kernel_copy.clone(), rootfs_copy.clone());
-        async move { mgr.create(cold_create_req(&kernel, &rootfs)).await }
+        let (kernel_sha256, rootfs_sha256) = (kernel_sha256.clone(), rootfs_sha256.clone());
+        async move {
+            mgr.create(cold_create_req(&kernel_sha256, &rootfs_sha256))
+                .await
+        }
     };
     let (resp_a, resp_b) = tokio::join!(a, b);
 
@@ -224,16 +242,16 @@ async fn concurrent_same_id_create_has_one_winner() {
         "expected at most one chroot dir for {WS_ID}, found {dirs}"
     );
 
-    // --- 5b end-to-end pin: the staged source images survive the race. ---
-    // Pre-fix, the loser's copy-fallback zeroed the source image through the
-    // winner's hardlinked inode; atomic staging must keep them intact.
-    for p in [&kernel_copy, &rootfs_copy] {
+    // --- 5b end-to-end pin: the managed source images survive the race. ---
+    // Pre-fix, the loser's copy-fallback zeroed the managed source image
+    // through the winner's hardlinked inode; atomic staging must keep it intact.
+    for p in [&managed_kernel, &managed_rootfs] {
         let len = std::fs::metadata(p)
-            .expect("staged source image exists")
+            .expect("managed source image exists")
             .len();
         assert!(
             len > 0,
-            "staged source image {} was truncated by the race (stage_file regression)",
+            "managed source image {} was truncated by the race (stage_file regression)",
             p.display()
         );
     }
@@ -255,7 +273,7 @@ async fn concurrent_same_id_create_has_one_winner() {
 
     // claim must not outlive the workspace: id is reusable after terminate
     let recreate = mgr
-        .create(cold_create_req(&kernel_copy, &rootfs_copy))
+        .create(cold_create_req(&kernel_sha256, &rootfs_sha256))
         .await;
     eprintln!("re-create after terminate = {recreate:?}");
     assert!(
@@ -275,7 +293,7 @@ async fn concurrent_same_id_create_has_one_winner() {
 }
 
 // ---------------------------------------------------------------------------
-// Pool-checkout race: pins `register_or_teardown`'s teardown branch.
+// Pool-checkout race: pins lifecycle-claim ordering before pool adoption.
 // ---------------------------------------------------------------------------
 
 /// Build a signed base snapshot from a throwaway workspace (mirrors the
@@ -291,10 +309,12 @@ async fn build_base_snapshot(
     snap_id: &str,
     src_id: &str,
 ) {
+    let image_store = state_dir.join("images");
+    let (_, _, verified_images) =
+        ne_e2e::resolve_managed_images(&image_store, kernel, rootfs).await;
     let src = launch(LaunchConfig {
         workspace_id: src_id.to_string(),
-        kernel_image: kernel.to_path_buf(),
-        rootfs_image: rootfs.to_path_buf(),
+        verified_images,
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -339,7 +359,8 @@ async fn build_base_snapshot(
         snap_id,
         &src.workspace_id,
         &fc_version,
-        &src.rootfs_path.clone(),
+        &src.kernel_sha256,
+        &src.rootfs_sha256,
         GuestIdentity {
             hostname: src.workspace_id.clone(),
             mac: "unset".into(),
@@ -348,7 +369,6 @@ async fn build_base_snapshot(
             mem_size_mib: src.mem_size_mib,
         },
         &src.kernel_boot_args.clone(),
-        &src.kernel_path.clone(),
     )
     .await
     .expect("write_manifest");
@@ -399,8 +419,8 @@ fn pool_member_dirs(chroot_base: &Path) -> BTreeSet<String> {
 fn tier_create_req(workspace_id: &str) -> CreateWorkspaceRequest {
     CreateWorkspaceRequest {
         workspace_id: workspace_id.to_string(),
-        kernel_image_path: String::new(),
-        rootfs_image_path: String::new(),
+        kernel_sha256: String::new(),
+        rootfs_sha256: String::new(),
         rootfs_read_only: true,
         vcpu_count: 1,
         mem_size_mib: 128,
@@ -411,16 +431,9 @@ fn tier_create_req(workspace_id: &str) -> CreateWorkspaceRequest {
     }
 }
 
-/// Pins `register_or_teardown`'s teardown branch end-to-end (the fix-
-/// discriminating ordering the blank cold path cannot reach — see the module
-/// docs). On the warm-pool checkout path each racer pops a DISTINCT pool
-/// member (each booted in its own `pool-{ulid}` chroot) and rewrites only the
-/// in-memory `workspace_id` to the shared caller id, so BOTH "boots" succeed
-/// and collide at the final registry insert. Under the pre-fix bare-insert
-/// logic the second insert would silently overwrite the first: both callers
-/// would get `WorkspaceCreated` (two winners for one id) and the displaced
-/// member's `Instance` would be dropped, leaking its chroot dir — failing both
-/// the one-winner assertion and the loser-chroot-torn-down assertion below.
+/// Pins the lifecycle claim ahead of warm-pool checkout. Two same-id callers
+/// race for the claim; exactly one may pop and adopt a member. The loser must
+/// fail before touching the pool, leaving the other ready member intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn concurrent_pool_checkout_single_winner() {
@@ -463,6 +476,7 @@ async fn concurrent_pool_checkout_single_winner() {
     cfg.jailer_binary = jailer.clone();
     cfg.chroot_base = chroot_base.clone();
     cfg.state_dir = state_dir.clone();
+    cfg.image_store = state_dir.join("images");
     cfg.warm_pool = Some(WarmPoolConfig {
         tier_name: TIER.into(),
         base_snapshot_id: "01J0RACEPOOLSNAP".into(),
@@ -474,15 +488,14 @@ async fn concurrent_pool_checkout_single_winner() {
     mgr.spawn_refill();
 
     // Two ready members, no boots in flight: the on-disk `pool-*` dir set is
-    // exactly the two members the racers will pop.
+    // exactly the two members whose preservation the race will check.
     wait_pool_settled(&mgr, 2, Duration::from_secs(120)).await;
     let pre_dirs = pool_member_dirs(&chroot_base);
     eprintln!("pre-race pool member dirs: {pre_dirs:?}");
     assert_eq!(pre_dirs.len(), 2, "expected exactly 2 settled pool members");
 
-    // Race: two concurrent checkouts of the SAME caller id. Both pass the
-    // courtesy contains_key gate, both pop a distinct ready member, and the
-    // loser is decided inside register_or_teardown under the final lock.
+    // Race: two concurrent creates of the SAME caller id. The lifecycle claim
+    // admits one caller to checkout and rejects the other before pool.pop().
     let a = {
         let mgr = Arc::clone(&mgr);
         async move { mgr.create(tier_create_req(POOL_WS_ID)).await }
@@ -505,8 +518,7 @@ async fn concurrent_pool_checkout_single_winner() {
         }
     }
 
-    // Exactly one winner + one WorkspaceAlreadyExists. A bare double-insert
-    // would have returned TWO WorkspaceCreated for the same id.
+    // Exactly one winner + one WorkspaceAlreadyExists.
     assert_eq!(
         created.len(),
         1,
@@ -525,11 +537,9 @@ async fn concurrent_pool_checkout_single_winner() {
     );
 
     // The winner keeps its member's pool chroot (registry id rewritten, chroot
-    // name kept). The LOSER's popped member must be fully torn down: of the two
-    // pre-race member dirs, only the winner's may survive. (The teardown is
-    // awaited inside the losing create() call, so no settling wait is needed;
-    // refill respawns members under NEW pool-{ulid} names, which cannot
-    // re-enter `pre_dirs`.)
+    // name kept). The loser never pops the other member, so BOTH pre-race dirs
+    // remain: one registered to the winner and one still pooled. Refill may
+    // add a new member, but cannot change this intersection.
     let winner = &created[0];
     assert_eq!(winner.workspace_id, POOL_WS_ID);
     let winner_dir = PathBuf::from(&winner.jailer_chroot)
@@ -546,9 +556,8 @@ async fn concurrent_pool_checkout_single_winner() {
         .collect();
     eprintln!("surviving pre-race member dirs: {surviving:?}");
     assert_eq!(
-        surviving,
-        BTreeSet::from([winner_dir.clone()]),
-        "loser's pool-member chroot must be torn down (leak!) and the winner's kept"
+        surviving, pre_dirs,
+        "the loser must be rejected before checkout, leaving both pre-race member dirs intact"
     );
 
     // Winner is live and terminable; its chroot goes away with it.
@@ -566,6 +575,14 @@ async fn concurrent_pool_checkout_single_winner() {
     assert!(
         !pool_member_dirs(&chroot_base).contains(&winner_dir),
         "winner chroot should be reaped by terminate"
+    );
+    let untouched_member = pre_dirs
+        .iter()
+        .find(|dir| *dir != &winner_dir)
+        .expect("two distinct pre-race pool members");
+    assert!(
+        pool_member_dirs(&chroot_base).contains(untouched_member),
+        "the member untouched by the losing create must remain pooled"
     );
 
     // Reap the refilled pool so no Firecracker process outlives the test.

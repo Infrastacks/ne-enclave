@@ -161,8 +161,8 @@ mod tests {
         let d = test_dispatcher().await;
         let req = SupervisorRequest::CreateWorkspace(CreateWorkspaceRequest {
             workspace_id: "wks_test".into(),
-            kernel_image_path: "/tmp/k".into(),
-            rootfs_image_path: "/tmp/r".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 1,
             mem_size_mib: 256,

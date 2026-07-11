@@ -80,6 +80,11 @@ pub fn supervisor_kind_code(kind: SupervisorErrorKind) -> &'static str {
     match kind {
         K::Unauthorized => "UNAUTHORIZED",
         K::InvalidRequest => "INVALID_REQUEST",
+        K::InvalidImageDigest => "INVALID_IMAGE_DIGEST",
+        K::ImageNotFound => "IMAGE_NOT_FOUND",
+        K::ImageRejected => "IMAGE_REJECTED",
+        K::ImageDigestMismatch => "IMAGE_DIGEST_MISMATCH",
+        K::ImageStageFailed => "IMAGE_STAGE_FAILED",
         K::Unsupported => "UNSUPPORTED",
         K::WorkspaceAlreadyExists => "WORKSPACE_ALREADY_EXISTS",
         K::WorkspaceNotFound => "WORKSPACE_NOT_FOUND",
@@ -142,10 +147,10 @@ pub struct NetworkInput {
 pub struct CreateWorkspaceInput {
     /// Caller-chosen workspace id.
     pub workspace_id: String,
-    /// Absolute host path to the guest kernel image.
-    pub kernel_image_path: String,
-    /// Absolute host path to the guest rootfs image.
-    pub rootfs_image_path: String,
+    /// Canonical lowercase SHA-256 digest of the managed guest kernel image.
+    pub kernel_sha256: String,
+    /// Canonical lowercase SHA-256 digest of the managed guest rootfs image.
+    pub rootfs_sha256: String,
     /// Mount the rootfs read-only inside the guest.
     pub rootfs_read_only: bool,
     /// Guest vCPU count; validated to `1..=255`.
@@ -287,8 +292,8 @@ impl RuntimeCore {
 
         let req = SupervisorRequest::CreateWorkspace(sup::CreateWorkspaceRequest {
             workspace_id: input.workspace_id,
-            kernel_image_path: input.kernel_image_path,
-            rootfs_image_path: input.rootfs_image_path,
+            kernel_sha256: input.kernel_sha256,
+            rootfs_sha256: input.rootfs_sha256,
             rootfs_read_only: input.rootfs_read_only,
             vcpu_count,
             mem_size_mib: input.mem_size_mib,
@@ -666,6 +671,25 @@ mod tests {
         assert_eq!(err.code(), "WORKSPACE_NOT_FOUND");
     }
 
+    #[test]
+    fn image_error_codes_are_stable() {
+        for (kind, code) in [
+            (
+                SupervisorErrorKind::InvalidImageDigest,
+                "INVALID_IMAGE_DIGEST",
+            ),
+            (SupervisorErrorKind::ImageNotFound, "IMAGE_NOT_FOUND"),
+            (SupervisorErrorKind::ImageRejected, "IMAGE_REJECTED"),
+            (
+                SupervisorErrorKind::ImageDigestMismatch,
+                "IMAGE_DIGEST_MISMATCH",
+            ),
+            (SupervisorErrorKind::ImageStageFailed, "IMAGE_STAGE_FAILED"),
+        ] {
+            assert_eq!(supervisor_kind_code(kind), code);
+        }
+    }
+
     #[tokio::test]
     async fn create_workspace_relays_and_maps_network() {
         use ne_protocol::supervisor as sup;
@@ -692,8 +716,8 @@ mod tests {
         let out = core
             .create_workspace(CreateWorkspaceInput {
                 workspace_id: "wks-1".into(),
-                kernel_image_path: "/k".into(),
-                rootfs_image_path: "/r".into(),
+                kernel_sha256: "11".repeat(32),
+                rootfs_sha256: "22".repeat(32),
                 rootfs_read_only: true,
                 vcpu_count: 2,
                 mem_size_mib: 256,
@@ -722,8 +746,8 @@ mod tests {
         });
         let base = || CreateWorkspaceInput {
             workspace_id: "w".into(),
-            kernel_image_path: "/k".into(),
-            rootfs_image_path: "/r".into(),
+            kernel_sha256: "11".repeat(32),
+            rootfs_sha256: "22".repeat(32),
             rootfs_read_only: true,
             vcpu_count: 0,
             mem_size_mib: 256,

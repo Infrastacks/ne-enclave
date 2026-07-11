@@ -65,6 +65,8 @@ pub struct SupervisorConfig {
     pub jailer_binary: PathBuf,
     /// Base directory under which jailer creates per-workspace chroots.
     pub jailer_chroot_base: PathBuf,
+    /// Supervisor-owned content-addressed kernel and rootfs image store.
+    pub image_store: PathBuf,
     /// UID that jailer drops Firecracker to.
     pub jailer_uid: u32,
     /// GID that jailer drops Firecracker to.
@@ -307,6 +309,7 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
                 firecracker_binary: cfg.firecracker_binary,
                 jailer_binary: cfg.jailer_binary,
                 chroot_base: cfg.jailer_chroot_base,
+                image_store: cfg.image_store,
                 jailer_uid: cfg.jailer_uid,
                 jailer_gid: cfg.jailer_gid,
                 openshell_sandbox_binary: cfg.openshell_sandbox_binary,
@@ -430,6 +433,7 @@ mod tests {
             firecracker_binary: "/opt/ne-enclave/bin/firecracker".into(),
             jailer_binary: "/opt/ne-enclave/bin/jailer".into(),
             jailer_chroot_base: "/srv/jailer".into(),
+            image_store: "/var/lib/ne-enclave/images".into(),
             jailer_uid: 1000,
             jailer_gid: 1000,
             openshell_sandbox_binary: "/opt/ne-enclave/bin/openshell-sandbox".into(),

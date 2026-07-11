@@ -44,6 +44,20 @@ fn fakeroot_install_creates_layout_and_files() {
         env.contains("NE_DEV_MODE=true"),
         "env missing dev-mode line:\n{env}"
     );
+    assert!(!env.contains("NE_KERNEL_PATH"));
+    assert!(!env.contains("NE_ROOTFS_PATH"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(layout.images_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(mode & 0o022, 0, "service identity could write image store");
+    }
 
     assert!(
         layout.supervisor_unit().exists(),
@@ -92,4 +106,111 @@ fn fakeroot_reinstall_preserves_operator_policy_edits() {
         after, "enforcement: block\n",
         "re-install clobbered operator policy"
     );
+}
+
+#[test]
+fn fakeroot_reinstall_corrects_existing_image_store_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = Layout::new(tmp.path());
+    let artifact = layout
+        .images_dir()
+        .join("kernels")
+        .join("a".repeat(64))
+        .join("vmlinux");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"kernel").unwrap();
+    std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o666)).unwrap();
+    std::fs::set_permissions(
+        artifact.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+
+    install(InstallOptions {
+        layout,
+        fakeroot: true,
+        no_start: true,
+        no_image: true,
+        dry_run: false,
+        ne_uid: 991,
+    })
+    .unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&artifact).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    assert_eq!(
+        std::fs::metadata(artifact.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn fakeroot_reinstall_rejects_legacy_state_child_symlinks_without_touching_targets() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    for child in ["images", "workspaces", "snapshots"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(tmp.path());
+        std::fs::create_dir_all(layout.state_dir()).unwrap();
+        let sentinel = tmp.path().join(format!("{child}-sentinel"));
+        std::fs::create_dir(&sentinel).unwrap();
+        std::fs::write(sentinel.join("payload"), b"must-not-change").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o711)).unwrap();
+        let before = std::fs::metadata(&sentinel).unwrap();
+        symlink(&sentinel, layout.state_dir().join(child)).unwrap();
+
+        let result = install(InstallOptions {
+            layout,
+            fakeroot: true,
+            no_start: true,
+            no_image: true,
+            dry_run: false,
+            ne_uid: 991,
+        });
+
+        assert!(result.is_err(), "accepted legacy {child} symlink");
+        assert_eq!(
+            std::fs::read(sentinel.join("payload")).unwrap(),
+            b"must-not-change"
+        );
+        let after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(after.mode(), before.mode(), "changed {child} target mode");
+        assert_eq!(after.uid(), before.uid(), "changed {child} target owner");
+        assert_eq!(after.gid(), before.gid(), "changed {child} target group");
+    }
+}
+
+#[test]
+fn direct_import_prepare_rejects_image_store_symlink_without_touching_target() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = Layout::new(tmp.path());
+    std::fs::create_dir_all(layout.state_dir()).unwrap();
+    let sentinel = tmp.path().join("import-sentinel");
+    std::fs::create_dir(&sentinel).unwrap();
+    std::fs::write(sentinel.join("payload"), b"must-not-change").unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o711)).unwrap();
+    let before = std::fs::metadata(&sentinel).unwrap();
+    symlink(&sentinel, layout.images_dir()).unwrap();
+
+    let result = ne::install::run::prepare_image_store(&layout, true);
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(sentinel.join("payload")).unwrap(),
+        b"must-not-change"
+    );
+    let after = std::fs::metadata(&sentinel).unwrap();
+    assert_eq!(after.mode(), before.mode());
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.gid(), before.gid());
 }

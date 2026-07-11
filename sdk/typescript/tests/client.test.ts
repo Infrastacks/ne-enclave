@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { status as grpcStatus } from "@grpc/grpc-js";
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -92,16 +93,16 @@ describe("Client", () => {
     try {
       const resp = await client.createWorkspace({
         workspaceId: "wks-ts-1",
-        kernelImagePath: "/k",
-        rootfsImagePath: "/r",
+        kernelSha256: "11".repeat(32),
+        rootfsSha256: "22".repeat(32),
         vcpuCount: 2,
         memSizeMib: 512,
         guestVsockCid: 3,
         kernelBootArgs: "console=ttyS0",
       });
       expect(seen?.workspaceId).toBe("wks-ts-1");
-      expect(seen?.kernelImagePath).toBe("/k");
-      expect(seen?.rootfsImagePath).toBe("/r");
+      expect(seen?.kernelSha256).toBe("11".repeat(32));
+      expect(seen?.rootfsSha256).toBe("22".repeat(32));
       expect(seen?.vcpuCount).toBe(2);
       expect(seen?.memSizeMib).toBe(512);
       expect(seen?.guestVsockCid).toBe(3);
@@ -114,6 +115,75 @@ describe("Client", () => {
       client.close();
     }
   });
+
+  test("createWorkspace source exposes only digest image options", () => {
+    const source = readFileSync(new URL("../src/client.ts", import.meta.url), "utf8");
+    expect(source).toContain("kernelSha256");
+    expect(source).toContain("rootfsSha256");
+    expect(source).not.toContain(["kernel", "Image", "Path"].join(""));
+    expect(source).not.toContain(["rootfs", "Image", "Path"].join(""));
+  });
+
+  test("createWorkspace tier omits managed image digests", async () => {
+    let seen: CreateWorkspaceRequest | undefined;
+    server = await startFakeServer({
+      createWorkspace: (req) => {
+        seen = req;
+        return {
+          workspaceId: req.workspaceId,
+          firecrackerPid: 99,
+          vsockHostSocket: "/x",
+          jailerChroot: "/y",
+          network: undefined,
+        };
+      },
+    });
+    const client = new Client({ target: server.target });
+    try {
+      await client.createWorkspace({
+        workspaceId: "wks-ts-tier",
+        vcpuCount: 1,
+        memSizeMib: 256,
+        guestVsockCid: 3,
+        tier: "warm-small",
+      });
+      expect(seen?.kernelSha256).toBe("");
+      expect(seen?.rootfsSha256).toBe("");
+      expect(seen?.tier).toBe("warm-small");
+    } finally {
+      client.close();
+    }
+  });
+
+  test.each([{ kernelSha256: "11".repeat(32) }, { rootfsSha256: "22".repeat(32) }])(
+    "createWorkspace rejects a half digest pair",
+    async (digestOptions) => {
+      server = await startFakeServer({
+        createWorkspace: (req) => ({
+          workspaceId: req.workspaceId,
+          firecrackerPid: 99,
+          vsockHostSocket: "/x",
+          jailerChroot: "/y",
+          network: undefined,
+        }),
+      });
+      const client = new Client({ target: server.target });
+      try {
+        await expect(
+          client.createWorkspace({
+            workspaceId: "wks-ts-half",
+            vcpuCount: 1,
+            memSizeMib: 256,
+            guestVsockCid: 3,
+            tier: "warm-small",
+            ...digestOptions,
+          }),
+        ).rejects.toThrow("provided together");
+      } finally {
+        client.close();
+      }
+    },
+  );
 
   test("createWorkspace with network populates allowCidrs and allowHostnames", async () => {
     let seen: CreateWorkspaceRequest | undefined;
@@ -139,8 +209,8 @@ describe("Client", () => {
     try {
       const resp = await client.createWorkspace({
         workspaceId: "wks-ts-net",
-        kernelImagePath: "/k",
-        rootfsImagePath: "/r",
+        kernelSha256: "11".repeat(32),
+        rootfsSha256: "22".repeat(32),
         vcpuCount: 1,
         memSizeMib: 256,
         guestVsockCid: 3,
@@ -178,8 +248,8 @@ describe("Client", () => {
     try {
       await client.createWorkspace({
         workspaceId: "wks-ts-privacy",
-        kernelImagePath: "/k",
-        rootfsImagePath: "/r",
+        kernelSha256: "11".repeat(32),
+        rootfsSha256: "22".repeat(32),
         vcpuCount: 1,
         memSizeMib: 256,
         guestVsockCid: 3,
@@ -202,13 +272,39 @@ describe("Client", () => {
       await expect(
         client.createWorkspace({
           workspaceId: "bad",
-          kernelImagePath: "/k",
-          rootfsImagePath: "/r",
+          kernelSha256: "11".repeat(32),
+          rootfsSha256: "22".repeat(32),
           vcpuCount: 999,
           memSizeMib: 256,
           guestVsockCid: 3,
         }),
       ).rejects.toMatchObject({ code: grpcStatus.INVALID_ARGUMENT });
+    } finally {
+      client.close();
+    }
+  });
+
+  test.each([
+    [grpcStatus.NOT_FOUND, "kernel image not found"],
+    [grpcStatus.FAILED_PRECONDITION, "rootfs image digest mismatch"],
+    [grpcStatus.INTERNAL, "rootfs image staging failed"],
+  ])("createWorkspace preserves image error status %s and details", async (code, details) => {
+    server = await startFakeServer({
+      createWorkspace: () => statusError(code, details),
+    });
+    const client = new Client({ target: server.target });
+    try {
+      const error = await client
+        .createWorkspace({
+          workspaceId: "wks-image-error",
+          kernelSha256: "11".repeat(32),
+          rootfsSha256: "22".repeat(32),
+          vcpuCount: 1,
+          memSizeMib: 256,
+          guestVsockCid: 3,
+        })
+        .catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code, details });
     } finally {
       client.close();
     }
@@ -493,8 +589,8 @@ describe("Client", () => {
     try {
       await client.createWorkspace({
         workspaceId: "wks-ep",
-        kernelImagePath: "/k",
-        rootfsImagePath: "/r",
+        kernelSha256: "11".repeat(32),
+        rootfsSha256: "22".repeat(32),
         vcpuCount: 1,
         memSizeMib: 256,
         guestVsockCid: 3,
@@ -620,7 +716,12 @@ describe("Client", () => {
             nonce: req.nonce,
             issuedAt: 1,
             reportData: new Uint8Array([1, 2]),
-            proof: { signature: new Uint8Array(64), signerPubkey: new Uint8Array(32) },
+            proof: {
+              signature: new Uint8Array(64),
+              signerPubkey: new Uint8Array(32),
+              sevSnpReport: new Uint8Array(),
+              sevSnpVcekChain: new Uint8Array(),
+            },
           },
         };
       },

@@ -17,23 +17,29 @@ function options(
 ): EnclaveWorkspaceOptions {
   return {
     target: "127.0.0.1:50051",
-    kernelImagePath: "/k/kernel",
-    rootfsImagePath: "/r/rootfs",
+    kernelSha256: "11".repeat(32),
+    rootfsSha256: "22".repeat(32),
     guestVsockCid: 42,
     _clientFactory: () => toClient(fake),
     ...overrides,
   };
 }
 
-const ENV_KEYS = ["NE_KERNEL_IMAGE_PATH", "NE_ROOTFS_IMAGE_PATH", "NE_VSOCK_CID_BASE"] as const;
+const ENV_KEYS = [
+  "NE_KERNEL_SHA256",
+  "NE_ROOTFS_SHA256",
+  "NE_KERNEL_IMAGE_PATH",
+  "NE_ROOTFS_IMAGE_PATH",
+  "NE_VSOCK_CID_BASE",
+] as const;
 
 afterEach(() => {
   for (const key of ENV_KEYS) delete process.env[key];
 });
 
 function setEnv(): void {
-  process.env.NE_KERNEL_IMAGE_PATH = "/k/kernel";
-  process.env.NE_ROOTFS_IMAGE_PATH = "/r/rootfs";
+  process.env.NE_KERNEL_SHA256 = "11".repeat(32);
+  process.env.NE_ROOTFS_SHA256 = "22".repeat(32);
   process.env.NE_VSOCK_CID_BASE = "42";
 }
 
@@ -45,8 +51,8 @@ describe("EnclaveWorkspace.start", () => {
     const call = fake.createCalls[0];
     expect(call?.workspaceId).toBe(ws.workspaceId);
     expect(ws.workspaceId).toMatch(/^agent-[0-9a-f]+$/);
-    expect(call?.kernelImagePath).toBe("/k/kernel");
-    expect(call?.rootfsImagePath).toBe("/r/rootfs");
+    expect(call?.kernelSha256).toBe("11".repeat(32));
+    expect(call?.rootfsSha256).toBe("22".repeat(32));
     expect(call?.guestVsockCid).toBe(42);
     expect(call?.vcpuCount).toBe(2);
     expect(call?.memSizeMib).toBe(1024);
@@ -60,8 +66,8 @@ describe("EnclaveWorkspace.start", () => {
     const ws = new EnclaveWorkspace(
       options(fake, {
         workspaceId: "my-ws",
-        kernelImagePath: "/x/k",
-        rootfsImagePath: "/x/r",
+        kernelSha256: "33".repeat(32),
+        rootfsSha256: "44".repeat(32),
         guestVsockCid: 99,
         vcpuCount: 4,
         memSizeMib: 2048,
@@ -70,37 +76,38 @@ describe("EnclaveWorkspace.start", () => {
     await ws.start();
     const call = fake.createCalls[0];
     expect(call?.workspaceId).toBe("my-ws");
-    expect(call?.kernelImagePath).toBe("/x/k");
+    expect(call?.kernelSha256).toBe("33".repeat(32));
+    expect(call?.rootfsSha256).toBe("44".repeat(32));
     expect(call?.guestVsockCid).toBe(99);
     expect(call?.vcpuCount).toBe(4);
     await ws.stop();
   });
 
-  it("throws before any RPC when kernelImagePath is missing (no option, no env)", async () => {
+  it("throws before any RPC when kernelSha256 is missing (no option, no env)", async () => {
     // biome-ignore lint/performance/noDelete: process.env stringifies assigned values; delete is the only correct unset.
-    delete process.env.NE_KERNEL_IMAGE_PATH;
+    delete process.env.NE_KERNEL_SHA256;
     const fake = new FakeClient();
     const ws = new EnclaveWorkspace({
       target: "127.0.0.1:50051",
-      rootfsImagePath: "/r/rootfs",
+      rootfsSha256: "22".repeat(32),
       guestVsockCid: 42,
       _clientFactory: () => toClient(fake),
     });
-    await expect(ws.start()).rejects.toThrow(/kernelImagePath/);
+    await expect(ws.start()).rejects.toThrow(/kernelSha256/);
     expect(fake.createCalls.length).toBe(0);
   });
 
-  it("throws before any RPC when rootfsImagePath is missing (no option, no env)", async () => {
+  it("throws before any RPC when rootfsSha256 is missing (no option, no env)", async () => {
     // biome-ignore lint/performance/noDelete: process.env stringifies assigned values; delete is the only correct unset.
-    delete process.env.NE_ROOTFS_IMAGE_PATH;
+    delete process.env.NE_ROOTFS_SHA256;
     const fake = new FakeClient();
     const ws = new EnclaveWorkspace({
       target: "127.0.0.1:50051",
-      kernelImagePath: "/k/kernel",
+      kernelSha256: "11".repeat(32),
       guestVsockCid: 42,
       _clientFactory: () => toClient(fake),
     });
-    await expect(ws.start()).rejects.toThrow(/rootfsImagePath/);
+    await expect(ws.start()).rejects.toThrow(/rootfsSha256/);
     expect(fake.createCalls.length).toBe(0);
   });
 
@@ -110,11 +117,24 @@ describe("EnclaveWorkspace.start", () => {
     const fake = new FakeClient();
     const ws = new EnclaveWorkspace({
       target: "127.0.0.1:50051",
-      kernelImagePath: "/k/kernel",
-      rootfsImagePath: "/r/rootfs",
+      kernelSha256: "11".repeat(32),
+      rootfsSha256: "22".repeat(32),
       _clientFactory: () => toClient(fake),
     });
     await expect(ws.start()).rejects.toThrow(/guestVsockCid/);
+    expect(fake.createCalls.length).toBe(0);
+  });
+
+  it("ignores legacy image path environment variables", async () => {
+    process.env.NE_KERNEL_IMAGE_PATH = "/legacy/kernel";
+    process.env.NE_ROOTFS_IMAGE_PATH = "/legacy/rootfs";
+    const fake = new FakeClient();
+    const ws = new EnclaveWorkspace({
+      target: "127.0.0.1:50051",
+      guestVsockCid: 42,
+      _clientFactory: () => toClient(fake),
+    });
+    await expect(ws.start()).rejects.toThrow(/kernelSha256, rootfsSha256/);
     expect(fake.createCalls.length).toBe(0);
   });
 

@@ -14,6 +14,8 @@ use clap::{ArgAction, Parser, Subcommand};
 
 use ne_privacy_router::proxy::DEFAULT_MAX_BODY_BYTES;
 
+const DEFAULT_IMAGE_STORE: &str = "/var/lib/ne-enclave/images";
+
 #[derive(Debug, Parser)]
 #[command(name = "nee", version, about = "NeuronEdge Enclave runtime")]
 pub struct Cli {
@@ -127,6 +129,14 @@ pub struct ServeSupervisorArgs {
     /// Base directory under which jailer creates per-workspace chroots.
     #[arg(long, env = "NE_JAILER_CHROOT_BASE", default_value = "/srv/jailer")]
     pub jailer_chroot_base: PathBuf,
+
+    /// Supervisor-owned content-addressed kernel and rootfs image store.
+    #[arg(
+        long,
+        env = "NE_IMAGE_STORE",
+        default_value = DEFAULT_IMAGE_STORE
+    )]
+    pub image_store: PathBuf,
 
     /// UID that jailer drops Firecracker to.
     #[arg(long, env = "NE_JAILER_UID", default_value_t = 1000)]
@@ -395,7 +405,7 @@ pub struct SnapshotArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SnapshotCommand {
-    /// Verify a snapshot artifact directory (signature + mem/vmstate/rootfs hashes).
+    /// Verify a snapshot artifact directory (signature + mem/vmstate hashes).
     Verify {
         /// Path to the snapshot artifact directory (contains manifest.json).
         path: PathBuf,
@@ -471,4 +481,24 @@ fn parse_header_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .ok_or_else(|| format!("expected NAME=VALUE, got {s:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_image_store_default_is_managed_store() {
+        let cli =
+            Cli::try_parse_from(["nee", "serve-supervisor", "--dev-mode"]).expect("parse defaults");
+        match &cli.command {
+            Command::ServeSupervisor(args) => {
+                assert_eq!(args.image_store, PathBuf::from(DEFAULT_IMAGE_STORE));
+            }
+            other => assert!(
+                matches!(other, Command::ServeSupervisor(_)),
+                "expected serve-supervisor"
+            ),
+        }
+    }
 }
