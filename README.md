@@ -66,13 +66,13 @@ Both tiers share the same API, SDKs, and audit surface. See [deploy/README.md](d
 curl -fsSL https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh | sh
 
 # 2. Verify
-nee doctor                          # preflight: KVM, Firecracker, jailer
+/opt/ne-enclave/bin/nee doctor      # preflight: KVM, Firecracker, jailer
 systemctl status ne-supervisor ne-api
 
 # 3. Import into the privileged managed store and retain its verified digests
 KERNEL_SHA256=$(sha256sum /path/to/vmlinux | cut -d' ' -f1)
 ROOTFS_SHA256=$(sha256sum /path/to/rootfs.img | cut -d' ' -f1)
-sudo nee image import \
+sudo /opt/ne-enclave/bin/nee image import \
   --kernel /path/to/vmlinux --kernel-sha256 "$KERNEL_SHA256" \
   --rootfs /path/to/rootfs.img --rootfs-sha256 "$ROOTFS_SHA256"
 

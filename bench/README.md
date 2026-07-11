@@ -13,7 +13,8 @@ method — is described inline below.
 
 2. **NeuronEdge Enclave installed and both systemd units running.** Follow
    [`../deploy/README.md`](../deploy/README.md) to install the `nee` binary, run
-   `nee install`, import a guest image, and verify the two units are active:
+   `sudo /opt/ne-enclave/bin/nee install`, import a guest image, and verify the two units
+   are active:
 
    ```bash
    systemctl --no-pager status ne-supervisor.service ne-api.service
@@ -30,15 +31,21 @@ method — is described inline below.
 
    The binary lands at `target/release/ne-bench`.
 
-4. **Guest image digests.** After `nee image import` the content-addressed paths are:
+4. **Guest image digests.** Compute and retain the digests before importing into the
+   privileged managed store:
 
-   ```
-   /var/lib/ne-enclave/images/kernels/<ksum>/vmlinux
-   /var/lib/ne-enclave/images/rootfs/<rsum>/rootfs.img
+   ```bash
+   KERNEL=/path/to/vmlinux
+   ROOTFS=/path/to/rootfs.img
+   KERNEL_SHA256=$(sha256sum "$KERNEL" | cut -d' ' -f1)
+   ROOTFS_SHA256=$(sha256sum "$ROOTFS" | cut -d' ' -f1)
+   sudo /opt/ne-enclave/bin/nee image import \
+     --kernel "$KERNEL" --kernel-sha256 "$KERNEL_SHA256" \
+     --rootfs "$ROOTFS" --rootfs-sha256 "$ROOTFS_SHA256"
    ```
 
-   Substitute `<ksum>` and `<rsum>` in the commands below with the SHA-256 values
-   printed by `nee image import` or by `ls /var/lib/ne-enclave/images/kernels/`.
+   Keep `KERNEL_SHA256` and `ROOTFS_SHA256` set in the shell used for the benchmark
+   commands below. Image import verifies the supplied values but does not print them.
 
 ---
 
@@ -52,7 +59,7 @@ BIN=target/release/ne-bench
 
 COMMON="--endpoint http://127.0.0.1:50051 --output-dir results/$(date -u +%Y-%m-%d) \
   --run-timestamp $(date -u +%FT%TZ) \
-  --kernel-sha256 <ksum> --rootfs-sha256 <rsum> \
+  --kernel-sha256 $KERNEL_SHA256 --rootfs-sha256 $ROOTFS_SHA256 \
   --instance-sku <vm-size> --storage-backend 'ext4 on NVMe' \
   --environment-notes 'cloud VM, nested KVM; floor not ceiling' \
   --vcpu-count 1 --mem-size-mib 256"

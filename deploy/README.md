@@ -16,7 +16,8 @@ Validated on Ubuntu 24.04 / x86_64 with KVM.
 
 NeuronEdge Enclave does not bundle Firecracker or jailer. Install them from the
 [Firecracker releases page](https://github.com/firecracker-microvm/firecracker/releases)
-and place both binaries at `/opt/ne-enclave/bin/` before running `nee install`.
+and place both binaries at `/opt/ne-enclave/bin/` before running
+`sudo /opt/ne-enclave/bin/nee install`.
 
 ---
 
@@ -42,7 +43,8 @@ The thin `install.sh` (in this directory) does three things:
 
 1. Downloads the static-musl `nee` binary from the GitHub release.
 2. Verifies the SHA-256 checksum against the published `SHA256SUMS` file.
-3. Drops the binary to `/opt/ne-enclave/bin/nee` and execs `sudo nee install`.
+3. Drops the binary to `/opt/ne-enclave/bin/nee` and execs
+   `sudo /opt/ne-enclave/bin/nee install`.
 
 Cosign signature verification is a documented future step (see the commented
 block in `deploy/install.sh`).
@@ -63,7 +65,7 @@ host (re-renders config; does not restart running services unless asked).
 
 Steps in order:
 
-1. **Preflight** — runs `nee doctor` (checks `/dev/kvm`, `firecracker`,
+1. **Preflight** — runs `/opt/ne-enclave/bin/nee doctor` (checks `/dev/kvm`, `firecracker`,
    `jailer` at expected paths, kernel module state).
 2. **System user/group** — creates the `nee` system user + group if absent.
 3. **Directory layout** — creates all directories listed in the
@@ -225,12 +227,12 @@ TPM-Quote nonce, validated against the genuine AMD Milan ARK).
 
 ```sh
 # 1. Install without fetching the default image
-sudo nee install --no-image
+sudo /opt/ne-enclave/bin/nee install --no-image
 
 # 2. Import your own kernel + rootfs (SHA-256 values are verified on import)
 KERNEL_SHA256=$(sha256sum /path/to/vmlinux | cut -d' ' -f1)
 ROOTFS_SHA256=$(sha256sum /path/to/rootfs.img | cut -d' ' -f1)
-sudo nee image import \
+sudo /opt/ne-enclave/bin/nee image import \
   --kernel /path/to/vmlinux --kernel-sha256 "$KERNEL_SHA256" \
   --rootfs /path/to/rootfs.img --rootfs-sha256 "$ROOTFS_SHA256"
 ```
@@ -288,7 +290,7 @@ operator-provided binary already under `/opt/ne-enclave/bin/` is left as-is.
 ```sh
 systemctl --no-pager status ne-supervisor.service ne-api.service
 journalctl -u ne-supervisor.service -u ne-api.service -f
-nee doctor
+/opt/ne-enclave/bin/nee doctor
 ```
 
 ---
@@ -297,10 +299,10 @@ nee doctor
 
 ```sh
 # Remove units + config + ne user; preserve /var/lib/ne-enclave state
-sudo nee uninstall
+sudo /opt/ne-enclave/bin/nee uninstall
 
 # Full removal including workspace + image state
-sudo nee uninstall --purge
+sudo /opt/ne-enclave/bin/nee uninstall --purge
 ```
 
 ---
