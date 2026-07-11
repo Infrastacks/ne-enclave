@@ -27,6 +27,7 @@ Cargo.lock.bak
 
 # Editor / OS
 .worktrees/
+.superpowers/
 .idea/
 .vscode/
 *.swp
