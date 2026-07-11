@@ -76,8 +76,10 @@ into a reusable artifact (`crates/ne-supervisor/src/firecracker.rs` `snapshot_cr
 Ed25519-signed manifest and snapshot artifact hashes are verified before managed images are resolved on restore
 (`crates/ne-supervisor/src/snapshot.rs` `verify_artifact`); the standalone `nee snapshot
 verify` CLI runs the same verification offline. Version 4 and older manifests are rejected.
-Snapshots require `rootfs_read_only=true` and remain limited to non-networked workspaces; sealed
-snapshots remain a later phase (§9). **Fork from snapshot and fork identity reset are
+Snapshots require `rootfs_read_only=true` and remain limited to non-networked workspaces.
+Unsealed snapshot artifacts remain plaintext at rest. The runtime-side sealed format is
+shipped, but hardware-rooted sealed-snapshot confidentiality and live control-plane KMS /
+silicon validation remain unclaimed (§4, §9). **Fork from snapshot and fork identity reset are
 shipped**: `ForkWorkspace` spawns a fresh Firecracker process that loads the
 snapshot via `PUT /snapshot/load {resume_vm: true}` — the same restore path, immune to the
 deferred in-place Pause/Resume vsock bug — then sends a `ResetIdentity` vsock RPC to the

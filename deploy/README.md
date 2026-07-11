@@ -52,9 +52,12 @@ block in `deploy/install.sh`).
 To pin a specific release:
 
 ```sh
-NE_VERSION=v0.3.0 curl -fsSL \
-  https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh | sh
+curl -fsSL \
+  https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh |
+  NE_VERSION=v0.3.0 sh
 ```
+
+The assignment is attached to `sh`, so the downloaded installer receives `NE_VERSION`.
 
 ---
 
