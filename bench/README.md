@@ -52,9 +52,7 @@ BIN=target/release/ne-bench
 
 COMMON="--endpoint http://127.0.0.1:50051 --output-dir results/$(date -u +%Y-%m-%d) \
   --run-timestamp $(date -u +%FT%TZ) \
-  --kernel-path /var/lib/ne-enclave/images/kernels/<ksum>/vmlinux \
-  --rootfs-path /var/lib/ne-enclave/images/rootfs/<rsum>/rootfs.img \
-  --kernel-digest <ksum> --rootfs-digest <rsum> \
+  --kernel-sha256 <ksum> --rootfs-sha256 <rsum> \
   --instance-sku <vm-size> --storage-backend 'ext4 on NVMe' \
   --environment-notes 'cloud VM, nested KVM; floor not ceiling' \
   --vcpu-count 1 --mem-size-mib 256"

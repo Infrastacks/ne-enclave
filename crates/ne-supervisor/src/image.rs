@@ -109,6 +109,25 @@ pub enum ImageError {
     },
 }
 
+impl ImageError {
+    pub(crate) fn with_cleanup_failure(self, operation: &str, cleanup: io::Error) -> Self {
+        let (kind, digest) = match &self {
+            Self::InvalidDigest { kind, digest }
+            | Self::NotFound { kind, digest }
+            | Self::Rejected { kind, digest, .. }
+            | Self::DigestMismatch { kind, digest, .. }
+            | Self::Stage { kind, digest, .. } => (*kind, digest.clone()),
+        };
+        Self::Stage {
+            kind,
+            digest,
+            source: io::Error::other(format!(
+                "primary staging failure: {self}; {operation}: {cleanup}"
+            )),
+        }
+    }
+}
+
 /// Root of the digest-addressed managed image store.
 #[derive(Debug, Clone)]
 pub struct ImageStore {
@@ -182,7 +201,7 @@ impl ImageStore {
             let count = file
                 .read(&mut buffer)
                 .await
-                .map_err(|source| rejected(kind, &requested, source.to_string()))?;
+                .map_err(|source| operational_error(kind, &requested, source))?;
             if count == 0 {
                 break;
             }
@@ -198,7 +217,7 @@ impl ImageStore {
         }
         file.rewind()
             .await
-            .map_err(|source| rejected(kind, digest.as_str(), source.to_string()))?;
+            .map_err(|source| operational_error(kind, digest.as_str(), source))?;
 
         Ok(VerifiedImageFile { kind, digest, file })
     }
@@ -230,6 +249,23 @@ impl VerifiedImageFile {
         uid: u32,
         gid: u32,
     ) -> Result<(), ImageError> {
+        self.stage_with_cleanup(destination, mode, uid, gid, |path| {
+            std::fs::remove_file(path)
+        })
+        .await
+    }
+
+    async fn stage_with_cleanup<F>(
+        &mut self,
+        destination: &Path,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        cleanup: F,
+    ) -> Result<(), ImageError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
         let mode_is_valid = match self.kind {
             ImageKind::Kernel => mode == 0o400,
             ImageKind::Rootfs => matches!(mode, 0o400 | 0o600),
@@ -264,8 +300,12 @@ impl VerifiedImageFile {
 
         drop(staged);
         if let Err(source) = result {
-            let _ = tokio::fs::remove_file(destination).await;
-            return Err(self.stage_error(source));
+            let primary = self.stage_error(source);
+            return match cleanup(destination) {
+                Ok(()) => Err(primary),
+                Err(cleanup_error) => Err(primary
+                    .with_cleanup_failure("removing partially staged destination", cleanup_error)),
+            };
         }
         Ok(())
     }
@@ -288,6 +328,30 @@ pub async fn stage_verified_pair(
     uid: u32,
     gid: u32,
 ) -> Result<(), ImageError> {
+    stage_verified_pair_with_cleanup(
+        pair,
+        kernel_destination,
+        rootfs_destination,
+        rootfs_read_only,
+        uid,
+        gid,
+        |path| std::fs::remove_file(path),
+    )
+    .await
+}
+
+async fn stage_verified_pair_with_cleanup<F>(
+    pair: &mut VerifiedImagePair,
+    kernel_destination: &Path,
+    rootfs_destination: &Path,
+    rootfs_read_only: bool,
+    uid: u32,
+    gid: u32,
+    cleanup: F,
+) -> Result<(), ImageError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
     pair.kernel
         .stage(kernel_destination, 0o400, uid, gid)
         .await?;
@@ -297,8 +361,13 @@ pub async fn stage_verified_pair(
         .stage(rootfs_destination, rootfs_mode, uid, gid)
         .await
     {
-        let _ = tokio::fs::remove_file(kernel_destination).await;
-        return Err(error);
+        return match cleanup(kernel_destination) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.with_cleanup_failure(
+                "rolling back staged kernel after rootfs failure",
+                cleanup_error,
+            )),
+        };
     }
     Ok(())
 }
@@ -323,7 +392,15 @@ fn map_resolve_io(kind: ImageKind, digest: &str, source: io::Error) -> ImageErro
             digest: digest.to_owned(),
         }
     } else {
-        rejected(kind, digest, source.to_string())
+        operational_error(kind, digest, source)
+    }
+}
+
+fn operational_error(kind: ImageKind, digest: &str, source: io::Error) -> ImageError {
+    ImageError::Stage {
+        kind,
+        digest: digest.to_owned(),
+        source,
     }
 }
 
@@ -332,6 +409,38 @@ fn rejected(kind: ImageKind, digest: &str, reason: impl Into<String>) -> ImageEr
         kind,
         digest: digest.to_owned(),
         reason: reason.into(),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) async fn cleanup_failed_workspace(
+    jailer_chroot: &Path,
+    primary: ImageError,
+) -> ImageError {
+    let workspace_root = jailer_chroot.parent().unwrap_or(jailer_chroot);
+    match tokio::fs::remove_dir_all(workspace_root).await {
+        Ok(()) => primary,
+        Err(cleanup_error) => {
+            primary.with_cleanup_failure("removing failed workspace tree", cleanup_error)
+        }
+    }
+}
+
+#[cfg(test)]
+fn cleanup_failed_workspace_with<F>(
+    jailer_chroot: &Path,
+    primary: ImageError,
+    cleanup: F,
+) -> ImageError
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let workspace_root = jailer_chroot.parent().unwrap_or(jailer_chroot);
+    match cleanup(workspace_root) {
+        Ok(()) => primary,
+        Err(cleanup_error) => {
+            primary.with_cleanup_failure("removing failed workspace tree", cleanup_error)
+        }
     }
 }
 
@@ -359,6 +468,27 @@ mod tests {
                 Err(ImageError::InvalidDigest { .. })
             ));
         }
+    }
+
+    #[test]
+    fn operational_resolver_io_is_stage_failed_while_absence_is_not_found() {
+        let digest = "ab".repeat(32);
+        assert!(matches!(
+            map_resolve_io(
+                ImageKind::Kernel,
+                &digest,
+                io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+            ),
+            ImageError::Stage { .. }
+        ));
+        assert!(matches!(
+            map_resolve_io(
+                ImageKind::Kernel,
+                &digest,
+                io::Error::new(io::ErrorKind::NotFound, "gone"),
+            ),
+            ImageError::NotFound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -820,5 +950,181 @@ mod tests {
                 .is_err()
         );
         assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn staging_surfaces_primary_and_cleanup_failures() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("write-only-cleanup");
+        tokio::fs::write(&source, b"rootfs").await.unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let mut verified = VerifiedImageFile {
+            kind: ImageKind::Rootfs,
+            digest: ImageDigest::parse(ImageKind::Rootfs, &"ab".repeat(32)).unwrap(),
+            file: tokio::fs::File::from_std(file),
+        };
+        let destination = temp.path().join("partial-cleanup");
+
+        let error = verified
+            .stage_with_cleanup(&destination, 0o600, metadata.uid(), metadata.gid(), |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cleanup denied",
+                ))
+            })
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cleanup denied"), "{message}");
+        assert!(message.contains("primary staging failure"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn pair_rollback_failure_preserves_primary_and_cleanup_context() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
+        let rootfs_digest = hex::encode(sha2::Sha256::digest(b"rootfs"));
+        let kernel_source = temp
+            .path()
+            .join("kernels")
+            .join(&kernel_digest)
+            .join("vmlinux");
+        let rootfs_source = temp
+            .path()
+            .join("rootfs")
+            .join(&rootfs_digest)
+            .join("rootfs.img");
+        tokio::fs::create_dir_all(kernel_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(rootfs_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&kernel_source, b"kernel").await.unwrap();
+        tokio::fs::write(&rootfs_source, b"rootfs").await.unwrap();
+        let metadata = std::fs::metadata(&kernel_source).unwrap();
+        let mut pair = ImageStore::new(temp.path().to_path_buf())
+            .resolve_pair(&kernel_digest, &rootfs_digest)
+            .await
+            .unwrap();
+        let stage_dir = temp.path().join("pair-rollback-failure");
+        tokio::fs::create_dir_all(&stage_dir).await.unwrap();
+        let kernel_destination = stage_dir.join("vmlinux");
+        let rootfs_destination = stage_dir.join("rootfs.img");
+        tokio::fs::write(&rootfs_destination, b"pre-existing")
+            .await
+            .unwrap();
+
+        let error = stage_verified_pair_with_cleanup(
+            &mut pair,
+            &kernel_destination,
+            &rootfs_destination,
+            false,
+            metadata.uid(),
+            metadata.gid(),
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "rollback denied",
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("rollback denied"), "{message}");
+        assert!(message.contains("primary staging failure"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_cleanup_removes_only_target_and_preserves_sibling() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let firecracker = temp.path().join("firecracker");
+        let failing_chroot = firecracker.join("ws-failing").join("root");
+        let sibling = firecracker.join("ws-sibling");
+        std::fs::create_dir_all(&failing_chroot).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("sentinel"), b"keep").unwrap();
+        let kernel_digest = hex::encode(sha2::Sha256::digest(b"kernel"));
+        let rootfs_digest = hex::encode(sha2::Sha256::digest(b"rootfs"));
+        let kernel_source = temp
+            .path()
+            .join("images/kernels")
+            .join(&kernel_digest)
+            .join("vmlinux");
+        let rootfs_source = temp
+            .path()
+            .join("images/rootfs")
+            .join(&rootfs_digest)
+            .join("rootfs.img");
+        tokio::fs::create_dir_all(kernel_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(rootfs_source.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&kernel_source, b"kernel").await.unwrap();
+        tokio::fs::write(&rootfs_source, b"rootfs").await.unwrap();
+        let metadata = std::fs::metadata(&kernel_source).unwrap();
+        let mut pair = ImageStore::new(temp.path().join("images"))
+            .resolve_pair(&kernel_digest, &rootfs_digest)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            failing_chroot.join("rootfs.img"),
+            b"force create_new failure",
+        )
+        .await
+        .unwrap();
+        let primary = stage_verified_pair(
+            &mut pair,
+            &failing_chroot.join("vmlinux"),
+            &failing_chroot.join("rootfs.img"),
+            false,
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .await
+        .unwrap_err();
+
+        let error = cleanup_failed_workspace(&failing_chroot, primary).await;
+
+        assert!(matches!(error, ImageError::Stage { .. }));
+        assert!(!firecracker.join("ws-failing").exists());
+        assert_eq!(std::fs::read(sibling.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn failed_workspace_cleanup_surfaces_cleanup_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let chroot = temp.path().join("firecracker/ws/root");
+        std::fs::create_dir_all(&chroot).unwrap();
+        let primary = ImageError::Stage {
+            kind: ImageKind::Rootfs,
+            digest: "cd".repeat(32),
+            source: io::Error::other("forced staging failure"),
+        };
+
+        let error = cleanup_failed_workspace_with(&chroot, primary, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workspace cleanup denied",
+            ))
+        });
+        let message = error.to_string();
+        assert!(message.contains("forced staging failure"), "{message}");
+        assert!(message.contains("workspace cleanup denied"), "{message}");
     }
 }

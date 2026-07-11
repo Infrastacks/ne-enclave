@@ -28,21 +28,13 @@ pub struct Args {
     #[arg(long)]
     pub run_timestamp: String,
 
-    /// Guest kernel image host path.
-    #[arg(long)]
-    pub kernel_path: String,
+    /// Canonical lowercase SHA-256 digest of the managed guest kernel image.
+    #[arg(long, value_parser = parse_sha256)]
+    pub kernel_sha256: String,
 
-    /// Guest rootfs image host path.
-    #[arg(long)]
-    pub rootfs_path: String,
-
-    /// Guest kernel image digest (for the manifest).
-    #[arg(long, default_value = "unknown")]
-    pub kernel_digest: String,
-
-    /// Guest rootfs image digest (for the manifest).
-    #[arg(long, default_value = "unknown")]
-    pub rootfs_digest: String,
+    /// Canonical lowercase SHA-256 digest of the managed guest rootfs image.
+    #[arg(long, value_parser = parse_sha256)]
+    pub rootfs_sha256: String,
 
     /// Cloud SKU / instance type, recorded in the manifest.
     #[arg(long, default_value = "unknown")]
@@ -114,6 +106,18 @@ pub enum Command {
     },
 }
 
+fn parse_sha256(raw: &str) -> Result<String, String> {
+    if raw.len() == 64
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(raw.to_owned())
+    } else {
+        Err("expected exactly 64 lowercase hexadecimal characters".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,16 +134,18 @@ mod tests {
             "ne-bench",
             "--run-timestamp",
             "2026-05-31T12:00:00Z",
-            "--kernel-path",
-            "/k",
-            "--rootfs-path",
-            "/r",
+            "--kernel-sha256",
+            &"11".repeat(32),
+            "--rootfs-sha256",
+            &"22".repeat(32),
             "cold-start",
         ])
         .unwrap();
         assert_eq!(a.endpoint, "http://127.0.0.1:50051");
         assert_eq!(a.vcpu_count, 1);
         assert_eq!(a.mem_size_mib, 256);
+        assert_eq!(a.kernel_sha256, "11".repeat(32));
+        assert_eq!(a.rootfs_sha256, "22".repeat(32));
         assert!(matches!(a.command, Command::ColdStart { iterations: 1000 }));
     }
 
@@ -149,10 +155,10 @@ mod tests {
             "ne-bench",
             "--run-timestamp",
             "t",
-            "--kernel-path",
-            "/k",
-            "--rootfs-path",
-            "/r",
+            "--kernel-sha256",
+            &"11".repeat(32),
+            "--rootfs-sha256",
+            &"22".repeat(32),
             "density",
             "--ram-stop-percent",
             "90",
@@ -172,8 +178,38 @@ mod tests {
 
     #[test]
     fn missing_required_flags_errors() {
-        // run-timestamp / kernel-path / rootfs-path are required.
+        // run-timestamp / kernel-sha256 / rootfs-sha256 are required.
         let r = Args::try_parse_from(["ne-bench", "cold-start"]);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn obsolete_image_path_flags_are_rejected() {
+        let result = Args::try_parse_from([
+            "ne-bench",
+            "--run-timestamp",
+            "t",
+            "--kernel-path",
+            "/k",
+            "--rootfs-path",
+            "/r",
+            "cold-start",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn noncanonical_sha256_is_rejected() {
+        let result = Args::try_parse_from([
+            "ne-bench",
+            "--run-timestamp",
+            "t",
+            "--kernel-sha256",
+            &"AA".repeat(32),
+            "--rootfs-sha256",
+            &"22".repeat(32),
+            "cold-start",
+        ]);
+        assert!(result.is_err());
     }
 }

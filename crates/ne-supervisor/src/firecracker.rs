@@ -32,7 +32,7 @@ use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use crate::image::{ImageError, VerifiedImagePair, stage_verified_pair};
+use crate::image::{ImageError, VerifiedImagePair, cleanup_failed_workspace, stage_verified_pair};
 
 /// Inputs to a single workspace launch. The supervisor builds this
 /// from a [`ne_protocol::supervisor::CreateWorkspaceRequest`]
@@ -272,12 +272,21 @@ async fn spawn_jailed_firecracker(
         .map_err(LaunchError::from)
     };
     if let Err(error) = stage_result {
-        let workspace_root = jailer_chroot
-            .parent()
-            .and_then(Path::parent)
-            .unwrap_or(&jailer_chroot);
-        let _ = tokio::fs::remove_dir_all(workspace_root).await;
-        return Err(error);
+        return match error {
+            LaunchError::Image(image_error) => Err(LaunchError::Image(
+                cleanup_failed_workspace(&jailer_chroot, image_error).await,
+            )),
+            other => {
+                let workspace_root = jailer_chroot.parent().unwrap_or(&jailer_chroot);
+                match tokio::fs::remove_dir_all(workspace_root).await {
+                    Ok(()) => Err(other),
+                    Err(cleanup_error) => Err(LaunchError::Io(io::Error::other(format!(
+                        "primary staging failure: {other}; removing failed workspace tree: \
+                         {cleanup_error}"
+                    )))),
+                }
+            }
+        };
     }
 
     // Host-side path to the vsock UDS. Firecracker (running inside
@@ -740,8 +749,13 @@ async fn stage_restore_file(
     }
     .await
     {
-        let _ = tokio::fs::remove_file(dst).await;
-        return Err(error);
+        return match tokio::fs::remove_file(dst).await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(io::Error::other(format!(
+                "primary staging failure: {error}; removing partially staged restore artifact: \
+                 {cleanup_error}"
+            ))),
+        };
     }
     Ok(())
 }
