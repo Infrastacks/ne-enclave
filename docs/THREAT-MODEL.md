@@ -1,6 +1,6 @@
 # NeuronEdge Enclave — Public Threat Model
 
-**Status:** As-built security audit complete. First pass fixed 1 Critical (restore/fork ID path traversal) + 4 High (snapshot-manifest host-key pinning, audit front-truncation detection, fork CRNG reseed, dev-mode non-loopback refusal); follow-up pass closed all remaining filed items — ingress connection cap + read timeouts, IPC hardening (`0660` / frame cap / veth anti-spoof), `run_command` output cap + guest frame cap, audit event hygiene, and a breaking schema change (`ctx` domain tags on audit + snapshot canonical forms, `MANIFEST_VERSION 2`, clean pre-1.0 break — no migration).
+**Status:** As-built security audit complete. First pass fixed 1 Critical (restore/fork ID path traversal) + 4 High (snapshot-manifest host-key pinning, audit front-truncation detection, fork CRNG reseed, dev-mode non-loopback refusal); follow-up passes added ingress and IPC hardening, output caps, audit event hygiene, and the breaking managed-image contract with snapshot manifest version 5 (clean pre-1.0 break — no migration).
 **Date:** June 2026
 **Scope:** The Apache-2.0 NeuronEdge Enclave **runtime** as shipped. The **control-plane key-release Worker** (`control-plane/`) is a separate surface referenced where it bears on the runtime's sealed-snapshot path; its authoritative gate + anti-replay are synthetic-tested, with live AWS KMS + real silicon unclaimed.
 **Canonical:** This document is the canonical, as-built threat model. The architecture doc is design intent; this is ground truth.
@@ -69,13 +69,14 @@ produce an independently-verifiable, externally-pinnable artifact from the signe
 Merkle chain — operators can ship the chain off-host and any party can confirm it is
 unedited. Immutable off-host *storage* (WORM) remains the operator's responsibility
 (see §7 T5, §9). **The attestation foundation is shipped**: the `ne-attestation` crate ships an `AttestationProvider` trait, a `SoftwareProvider` software-fallback (Ed25519, runtime-key-rooted, NOT firmware-rooted), and a pure `verify()`. The on-demand challenge–response evidence API is threaded end-to-end (proto → gRPC → REST → Python/TS SDK → `nee workspace attest` CLI). Three signed audit events flow through the Merkle chain: `AttestationEvidenceIssued` (evidence generated and signed by the host and issued to the caller — the supervisor cannot observe the caller's client-side `verify()`, so the event records issuance, **not** verification), `AttestationFailed` (provider error, or measurement/nonce validation failure), `AttestationReplayed` (nonce already seen; replay rejected). The production software-attestation gate is a startup `bail!` (refuses to serve before any audit sink exists) and so emits **no** audit event. Event payloads carry only hashes — `nonce_sha256`, `measurement_sha256`, `provider_type` — never the raw nonce, signing key, or proof bytes. See §4 / §9 for the honest software-evidence trust caveat. **There is still no live hardware-rooted attestation and no confidential
-mode** — the SEV-SNP verify tier is production code but synthetic-unit-tested and silicon-unvalidated for the `/dev/sev-guest` path (report-fetch ioctl + e2e gated on a DCasv5); the host operator sees guest memory in cleartext. Sealed snapshots ship runtime-side and the CP-mediated key-release service is synthetic-tested (live AWS KMS + real silicon unclaimed — see §4), but neither advances the hardware-rooted claim. **Paused-VM snapshot/restore
-with a signed manifest is shipped**: a PAUSED microVM can be snapshotted
+mode** — the SEV-SNP verify tier is production code but synthetic-unit-tested and silicon-unvalidated for the `/dev/sev-guest` path (report-fetch ioctl + e2e gated on a DCasv5); the host operator sees guest memory in cleartext. Sealed snapshots ship runtime-side and the CP-mediated key-release service is synthetic-tested (live AWS KMS + real silicon unclaimed — see §4), but neither advances the hardware-rooted claim. **Managed image enforcement is shipped**: cold create accepts only lowercase kernel/rootfs SHA-256 digests, resolves their fixed locations beneath the supervisor-owned image store, hashes retained no-follow file handles, and copies verified bytes into independent per-workspace files before launch (`crates/ne-supervisor/src/image.rs`, `crates/ne-supervisor/src/workspace.rs`). Restore and fork use the same resolver for the digest pair signed into the manifest. This prevents callers from supplying arbitrary host paths and prevents writable rootfs aliasing between the store or workspaces. It does not defend against a hostile host root, which remains trusted. **Paused-VM snapshot/restore
+with a signed version-5 manifest is shipped**: a read-only-rootfs PAUSED microVM can be snapshotted
 into a reusable artifact (`crates/ne-supervisor/src/firecracker.rs` `snapshot_create`,
 `crates/ne-supervisor/src/workspace.rs` `WorkspaceManager::snapshot`); the artifact's
-Ed25519-signed manifest is verified before any file is opened on restore
+Ed25519-signed manifest and snapshot artifact hashes are verified before managed images are resolved on restore
 (`crates/ne-supervisor/src/snapshot.rs` `verify_artifact`); the standalone `nee snapshot
-verify` CLI runs the same verification offline. Non-networked workspaces only; sealed
+verify` CLI runs the same verification offline. Version 4 and older manifests are rejected.
+Snapshots require `rootfs_read_only=true` and remain limited to non-networked workspaces; sealed
 snapshots remain a later phase (§9). **Fork from snapshot and fork identity reset are
 shipped**: `ForkWorkspace` spawns a fresh Firecracker process that loads the
 snapshot via `PUT /snapshot/load {resume_vm: true}` — the same restore path, immune to the
@@ -99,7 +100,7 @@ What the runtime is trying to protect, as it exists today.
 | Audit event chain | High (tamper-evidence required) | Protected by the signed Merkle chain, §5/§7 (T5). |
 | Runtime audit signing key | High | Ed25519 keypair generated on the host at first run, persisted private-key `0600` under the state dir, and loaded on subsequent runs; the public half is inlined in every event so verifiers need no out-of-band key — `crates/ne-supervisor/src/audit.rs`. **Not** embedded in deployment artifacts (it is generated locally). There is **no rotation today**: the protocol can accommodate a later rotation without invalidating prior entries, but none is performed (key rotation is a future capability). |
 | Operator credentials | High | Host-side operator access. |
-| Image artifacts (guest kernel, rootfs) | Medium | Verified at install against a pinned SHA-256 digest before placement (§4); may carry upstream CVEs. |
+| Image artifacts (guest kernel, rootfs) | Medium | Imported into a supervisor-owned content-addressed store, then re-verified by digest on create and restore before independent staging (§4); may carry upstream CVEs. |
 | Telemetry / event metadata | Medium | Emitted for the security event surface. |
 
 > **Confidential-mode assets (not yet shipped as hardware-rooted).** The following are
@@ -132,10 +133,12 @@ storage metadata; and the audit signing key. Be precise about the host binaries:
 **no independent runtime signature or digest verification** of `ne-api` /
 `ne-supervisor` / Firecracker today — they are trusted because the operator installed
 them. Build-time artifact signing (cosign) + SBOM is a release-pipeline item
-and is **⏳ Planned**, not an as-built control. What **is** verified
-at install is the guest image: the kernel and rootfs are checked against a pinned SHA-256
-digest before placement — **✅** `crates/ne/src/install/image.rs` (the install path
-rejects the placeholder digests, so real release digests must be populated at release time).
+and is **⏳ Planned**, not an as-built control. Guest kernels and rootfs images are checked
+against operator-supplied SHA-256 values during import (`crates/ne/src/install/image.rs`).
+Cold create, restore, and fork then resolve only fixed artifact names beneath the configured
+managed store, reject symlinks and non-regular files, verify bytes through retained no-follow
+handles, and copy them into independent chroot files (`crates/ne-supervisor/src/image.rs`,
+`crates/ne-supervisor/src/workspace.rs`).
 **The host operator is trusted today.** With no confidential mode, the operator can read
 guest memory; we do not pretend otherwise (§6, §9).
 
@@ -198,7 +201,7 @@ Per-surface, as shipped. Every ✅ cites a code path that exists at the current 
 | Host networking (egress) | Guest network access | Per-workspace netns + TAP + nftables **deny-by-default** egress; guest has no `CAP_NET_ADMIN` to rewrite host policy — `crates/ne-supervisor/src/network.rs` | ✅ |
 | DNS mediation | Name resolution from the guest | Host-controlled resolver / DNS filter mediates guest lookups — `crates/ne-dns-filter/src/lib.rs` | ✅ |
 | Privacy router (LLM egress) | PII / credentials on LLM-bound traffic | Intercepts LLM egress and redacts PII — `crates/ne-privacy-router/{lib,proxy,policy_loader}.rs`. **Limits:** HTTP/1.1 cleartext only, tier-1 regex matching only, request-direction only; NER and HTTPS interception are deferred (see §9). | ◐ |
-| Snapshot artifact integrity | Snapshot files on the host filesystem (mem image, vmstate, rootfs reference) | Artifact is covered by a signed `SnapshotManifest` (`crates/ne-protocol/src/snapshot.rs`). On the restore/fork trust path, `verify_artifact_pinned` (`crates/ne-supervisor/src/snapshot.rs`) pins the Ed25519 signature to the **host's own signing key** (`AuditLog::verifying_key()`) — the key embedded in the (untrusted) manifest is only a consistency check, rejected as `UntrustedSigner` if it differs — then checks SHA-256 of mem / vmstate / rootfs before the manifest's `rootfs_path` is used to open any file; fail-closed. This is **authenticity**, not just integrity: a manifest self-signed with an attacker key is rejected (closes a path-traversal on restore/fork IDs; the offline `nee snapshot verify` diagnostic remains integrity-only by design). Signed by the same host key as the audit chain (`crate::signing`). **Limits:** artifact is plaintext at rest (no encryption for this path); non-networked workspaces only (see §9). | ◐ |
+| Snapshot artifact and image integrity | Snapshot files on the host filesystem plus managed kernel/rootfs identities | Version-5 `SnapshotManifest` signs the snapshot hashes and both managed image digests (`crates/ne-protocol/src/snapshot.rs`). On restore/fork, `verify_artifact_pinned` (`crates/ne-supervisor/src/snapshot.rs`) pins the Ed25519 signature to the **host's own signing key** (`AuditLog::verifying_key()`) and verifies the memory/vmstate hashes. The supervisor then resolves and hashes the signed image digests through the same managed-image resolver used by cold create, staging independent files before launch. Pre-version-5 manifests, missing images, mutated images, symlinks, and non-regular artifacts fail closed. A self-signed manifest with an attacker key is rejected; the offline `nee snapshot verify` diagnostic remains integrity-only by design. **Limits:** writable-rootfs and networked workspaces cannot be snapshotted; a hostile host root remains trusted; sealed-snapshot confidentiality retains the caveats below. | ◐ |
 | Runtime supply-chain enforcement | Package installs / dependency fetches at execution time | **Not absorbed into the runtime workspace.** The OSV / OPA / CVSS runtime-supply-chain engine lives in the OpenShell fork and is not wired into `crates/` at this revision. | ⏳ |
 
 ---

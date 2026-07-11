@@ -1,8 +1,9 @@
 /**
  * Manual end-to-end smoke (not run in CI).
  *
- * Requires a running `nee` daemon and the env vars NE_KERNEL_IMAGE_PATH /
- * NE_ROOTFS_IMAGE_PATH / NE_VSOCK_CID_BASE. Run with:
+ * Requires a running `nee` daemon and the env vars NE_KERNEL_SHA256 /
+ * NE_ROOTFS_SHA256 / NE_VSOCK_CID_BASE. Use the digests supplied to
+ * `nee image import`, then run with:
  *   npx tsx sdk/typescript-mastra/examples/quickstart.ts
  */
 import { withWorkspace } from "../src/index.js";

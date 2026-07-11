@@ -73,10 +73,8 @@ rsum="$(sha256sum "$ROOTFS" | awk '{print $1}')"
 /opt/ne-enclave/bin/nee image import \
   --kernel "$KERNEL" --kernel-sha256 "$ksum" \
   --rootfs "$ROOTFS" --rootfs-sha256 "$rsum"
-KERNEL_PATH="/var/lib/ne-enclave/images/kernels/${ksum}/vmlinux"
-ROOTFS_PATH="/var/lib/ne-enclave/images/rootfs/${rsum}/rootfs.img"
-echo "kernel -> $KERNEL_PATH"
-echo "rootfs -> $ROOTFS_PATH"
+echo "kernel sha256 -> $ksum"
+echo "rootfs sha256 -> $rsum"
 
 echo "== Starting units =="
 systemctl daemon-reload
@@ -94,8 +92,8 @@ echo "create $wsid"
 curl -fsS -X POST "${api}/workspaces" -H 'content-type: application/json' -d @- <<JSON
 {
   "workspace_id": "${wsid}",
-  "kernel_image_path": "${KERNEL_PATH}",
-  "rootfs_image_path": "${ROOTFS_PATH}",
+  "kernel_sha256": "${ksum}",
+  "rootfs_sha256": "${rsum}",
   "rootfs_read_only": true,
   "vcpu_count": 1,
   "mem_size_mib": 256,

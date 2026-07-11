@@ -18,8 +18,8 @@ def _factory(monkeypatch):
 
 
 def _env(monkeypatch, **kw):
-    monkeypatch.setenv("NE_KERNEL_IMAGE_PATH", "/k/kernel")
-    monkeypatch.setenv("NE_ROOTFS_IMAGE_PATH", "/r/rootfs")
+    monkeypatch.setenv("NE_KERNEL_SHA256", "11" * 32)
+    monkeypatch.setenv("NE_ROOTFS_SHA256", "22" * 32)
     monkeypatch.setenv("NE_VSOCK_CID_BASE", "42")
     for k, v in kw.items():
         if v is None:
@@ -34,8 +34,8 @@ def test_enter_creates_workspace_with_env_defaults(monkeypatch):
     with EnclaveWorkspace(target="127.0.0.1:50051") as ws:
         assert ws.workspace_id.startswith("agent-")
         call = fake.create_calls[-1]
-        assert call["kernel_image_path"] == "/k/kernel"
-        assert call["rootfs_image_path"] == "/r/rootfs"
+        assert call["kernel_sha256"] == "11" * 32
+        assert call["rootfs_sha256"] == "22" * 32
         assert call["guest_vsock_cid"] == 42
         assert call["vcpu_count"] == 2
         assert call["mem_size_mib"] == 1024
@@ -48,15 +48,16 @@ def test_explicit_kwargs_override_env(monkeypatch):
     with EnclaveWorkspace(
         target="127.0.0.1:50051",
         workspace_id="my-ws",
-        kernel_image_path="/x/k",
-        rootfs_image_path="/x/r",
+        kernel_sha256="33" * 32,
+        rootfs_sha256="44" * 32,
         guest_vsock_cid=99,
         vcpu_count=4,
         mem_size_mib=2048,
     ) as ws:
         assert ws.workspace_id == "my-ws"
         call = fake.create_calls[-1]
-        assert call["kernel_image_path"] == "/x/k"
+        assert call["kernel_sha256"] == "33" * 32
+        assert call["rootfs_sha256"] == "44" * 32
         assert call["guest_vsock_cid"] == 99
         assert call["vcpu_count"] == 4
 
@@ -64,8 +65,8 @@ def test_explicit_kwargs_override_env(monkeypatch):
 @pytest.mark.parametrize(
     ("missing_env", "field"),
     [
-        ("NE_KERNEL_IMAGE_PATH", "kernel_image_path"),
-        ("NE_ROOTFS_IMAGE_PATH", "rootfs_image_path"),
+        ("NE_KERNEL_SHA256", "kernel_sha256"),
+        ("NE_ROOTFS_SHA256", "rootfs_sha256"),
         ("NE_VSOCK_CID_BASE", "guest_vsock_cid"),
     ],
 )
@@ -73,6 +74,18 @@ def test_missing_required_input_raises_before_rpc(monkeypatch, missing_env, fiel
     _factory(monkeypatch)
     _env(monkeypatch, **{missing_env: None})
     with pytest.raises(ValueError, match=field), EnclaveWorkspace(target="127.0.0.1:50051"):
+        pass
+
+
+def test_legacy_image_path_environment_variables_are_ignored(monkeypatch):
+    _factory(monkeypatch)
+    _env(monkeypatch, NE_KERNEL_SHA256=None, NE_ROOTFS_SHA256=None)
+    monkeypatch.setenv("NE_KERNEL_IMAGE_PATH", "/legacy/kernel")
+    monkeypatch.setenv("NE_ROOTFS_IMAGE_PATH", "/legacy/rootfs")
+    with (
+        pytest.raises(ValueError, match=r"kernel_sha256.*rootfs_sha256"),
+        EnclaveWorkspace(target="127.0.0.1:50051"),
+    ):
         pass
 
 
@@ -88,8 +101,9 @@ def test_exit_destroys_on_normal_exit(monkeypatch):
 def test_exit_destroys_on_exception_and_reraises(monkeypatch):
     fake = _factory(monkeypatch)
     _env(monkeypatch)
-    with pytest.raises(RuntimeError, match="boom"), EnclaveWorkspace(
-        target="127.0.0.1:50051", workspace_id="ws-b"
+    with (
+        pytest.raises(RuntimeError, match="boom"),
+        EnclaveWorkspace(target="127.0.0.1:50051", workspace_id="ws-b"),
     ):
         raise RuntimeError("boom")
     assert fake.destroy_calls and fake.destroy_calls[-1]["workspace_id"] == "ws-b"

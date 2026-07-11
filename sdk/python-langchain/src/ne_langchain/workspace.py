@@ -18,7 +18,7 @@ _log = logging.getLogger("ne_langchain")
 class EnclaveWorkspace:
     """Owns one Firecracker microVM workspace for the lifetime of a ``with`` block.
 
-    On enter: resolves kernel/rootfs/vsock-cid from kwargs or ``NE_*`` env
+    On enter: resolves kernel/rootfs digests and vsock-cid from kwargs or ``NE_*`` env
     vars (raising ``ValueError`` if any are missing), opens a base-SDK
     ``ne.Client`` (insecure channel in this phase), and calls
     ``create_workspace``. On exit: always calls ``destroy_workspace``;
@@ -38,8 +38,8 @@ class EnclaveWorkspace:
         workspace_id: str | None = None,
         vcpu_count: int = 2,
         mem_size_mib: int = 1024,
-        kernel_image_path: str | None = None,
-        rootfs_image_path: str | None = None,
+        kernel_sha256: str | None = None,
+        rootfs_sha256: str | None = None,
         guest_vsock_cid: int | None = None,
         rootfs_read_only: bool = False,
         kernel_boot_args: str | None = None,
@@ -50,8 +50,8 @@ class EnclaveWorkspace:
         self._workspace_id = workspace_id or f"agent-{uuid.uuid4().hex}"
         self._vcpu_count = vcpu_count
         self._mem_size_mib = mem_size_mib
-        self._kernel_image_path = kernel_image_path
-        self._rootfs_image_path = rootfs_image_path
+        self._kernel_sha256 = kernel_sha256
+        self._rootfs_sha256 = rootfs_sha256
         self._guest_vsock_cid = guest_vsock_cid
         self._rootfs_read_only = rootfs_read_only
         self._kernel_boot_args = kernel_boot_args
@@ -66,7 +66,9 @@ class EnclaveWorkspace:
     @property
     def client(self) -> ne.Client:
         if self._client is None:
-            raise RuntimeError("EnclaveWorkspace not entered; use 'with EnclaveWorkspace(...) as ws:'")
+            raise RuntimeError(
+                "EnclaveWorkspace not entered; use 'with EnclaveWorkspace(...) as ws:'"
+            )
         return self._client
 
     @property
@@ -74,31 +76,36 @@ class EnclaveWorkspace:
         return EnclaveToolkit(client=self.client, workspace_id=self._workspace_id)
 
     def __enter__(self) -> EnclaveWorkspace:
-        kernel = self._kernel_image_path or os.environ.get("NE_KERNEL_IMAGE_PATH")
-        rootfs = self._rootfs_image_path or os.environ.get("NE_ROOTFS_IMAGE_PATH")
+        kernel = self._kernel_sha256 or os.environ.get("NE_KERNEL_SHA256")
+        rootfs = self._rootfs_sha256 or os.environ.get("NE_ROOTFS_SHA256")
         cid_env = os.environ.get("NE_VSOCK_CID_BASE")
-        cid = self._guest_vsock_cid if self._guest_vsock_cid is not None else (int(cid_env) if cid_env else None)
+        cid = (
+            self._guest_vsock_cid
+            if self._guest_vsock_cid is not None
+            else (int(cid_env) if cid_env else None)
+        )
 
         missing = [
             name
             for name, value in (
-                ("kernel_image_path", kernel),
-                ("rootfs_image_path", rootfs),
+                ("kernel_sha256", kernel),
+                ("rootfs_sha256", rootfs),
                 ("guest_vsock_cid", cid),
             )
             if not value
         ]
         if missing:
             raise ValueError(
-                "EnclaveWorkspace missing required inputs (pass as kwargs or set NE_* env): " + ", ".join(missing)
+                "EnclaveWorkspace missing required inputs (pass as kwargs or set NE_* env): "
+                + ", ".join(missing)
             )
 
         client = ne.Client(self._target, channel_options=list(self._channel_options or ()))
         try:
             client.create_workspace(
                 workspace_id=self._workspace_id,
-                kernel_image_path=kernel,
-                rootfs_image_path=rootfs,
+                kernel_sha256=kernel,
+                rootfs_sha256=rootfs,
                 vcpu_count=self._vcpu_count,
                 mem_size_mib=self._mem_size_mib,
                 guest_vsock_cid=int(cid),  # type: ignore[arg-type]

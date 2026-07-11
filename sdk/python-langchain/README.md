@@ -28,12 +28,12 @@ with EnclaveWorkspace(target="127.0.0.1:50051") as ws:
 
 ## Configuration
 
-`EnclaveWorkspace` reads the guest image location from environment variables by default (any can be overridden by a matching kwarg):
+Import the guest images with `nee image import`, then configure `EnclaveWorkspace` with the same lowercase SHA-256 values. Any environment value can be overridden by a matching kwarg.
 
 | Env var | Meaning |
 |---|---|
-| `NE_KERNEL_IMAGE_PATH` | Path to the guest kernel image |
-| `NE_ROOTFS_IMAGE_PATH` | Path to the guest rootfs image |
+| `NE_KERNEL_SHA256` | SHA-256 of the managed guest kernel |
+| `NE_ROOTFS_SHA256` | SHA-256 of the managed guest rootfs |
 | `NE_VSOCK_CID_BASE` | Guest vsock CID (must be unique per concurrent workspace on a host) |
 
 ## Tools

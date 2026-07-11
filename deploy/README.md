@@ -128,6 +128,12 @@ One fused static binary at `/opt/ne-enclave/bin/nee`. Subcommands:
 /etc/tmpfiles.d/ne-enclave.conf
 ```
 
+The supervisor's environment file sets the managed image root explicitly:
+
+```sh
+NE_IMAGE_STORE=/var/lib/ne-enclave/images
+```
+
 ---
 
 ## The two systemd units
@@ -227,9 +233,24 @@ nee image import \
   --rootfs   /path/to/rootfs.img    --rootfs-sha256  <hex>
 ```
 
-When creating workspaces, specify the image paths explicitly in the
-`CreateWorkspace` request (`kernel_image_path` / `rootfs_image_path` fields).
-The paths recorded in `ne-enclave.env` are informational defaults.
+When creating a cold Firecracker workspace, send the same verified values as
+`kernel_sha256` and `rootfs_sha256`. The supervisor resolves only these fixed
+managed-store locations and verifies their contents before allocating VM resources:
+
+```text
+$NE_IMAGE_STORE/kernels/<kernel_sha256>/vmlinux
+$NE_IMAGE_STORE/rootfs/<rootfs_sha256>/rootfs.img
+```
+
+The source images are copied into each jailer chroot as independent files; writable
+rootfs workspaces therefore cannot modify the managed source or another workspace's
+copy. Image failures use stable codes: `INVALID_IMAGE_DIGEST`, `IMAGE_NOT_FOUND`,
+`IMAGE_REJECTED`, `IMAGE_DIGEST_MISMATCH`, and `IMAGE_STAGE_FAILED`.
+
+Snapshot manifests use schema version 5 and sign the kernel/rootfs digest pair.
+Restore and fork re-resolve both digests from the managed store. Manifests older
+than version 5 are rejected, and snapshotting a writable-rootfs workspace is not
+supported; create snapshot sources with `rootfs_read_only=true`.
 
 ---
 
