@@ -14,6 +14,7 @@
 - Missing fakeroot prefixes must be created without changing production `/` behavior.
 - No CI-only directory-creation workaround may replace the CLI fix.
 - The KVM timeout test must accept either the guest or host timeout at the shared deadline and must retain the 800 ms wall-clock bound.
+- Full and runtime-only TypeScript SDK npm audits must report zero vulnerabilities on Node 22-compatible dependencies.
 - The release tag and all workflow-enforced version sources must be exactly `0.1.3`.
 - Follow feature branch → `dev` → `main` → tag → `dev` gitflow.
 
@@ -148,7 +149,52 @@ git add crates/ne-e2e/tests/firecracker_host_timeout.rs
 git commit -m "test(e2e): accept guest timeout race outcome"
 ```
 
-### Task 4: Review, verify, integrate, and release
+### Task 4: Remediate TypeScript SDK dependency advisories
+
+**Files:**
+- Modify: `sdk/typescript/package.json`
+- Modify: `sdk/typescript/package-lock.json`
+
+**Interfaces:**
+- Consumes: Node 22 release environment, Vitest/coverage peer contract, existing SDK scripts.
+- Produces: Vitest and `@vitest/coverage-v8` at 4.1.10 with patched transitive runtime/build dependencies and zero npm audit findings.
+
+- [ ] **Step 1: Record RED audit evidence**
+
+Run full and `--omit=dev` JSON audits. Expected before remediation: full audit
+reports 8 findings (5 moderate, 1 high, 2 critical); runtime-only reports one
+moderate `protobufjs` finding.
+
+- [ ] **Step 2: Update the constrained dependencies**
+
+Update `vitest` and `@vitest/coverage-v8` together to exactly `^4.1.10` and
+refresh the lockfile so `protobufjs` resolves above 7.6.2 and `tar` resolves
+above 7.5.15. Do not add either transitive package as a direct dependency.
+
+- [ ] **Step 3: Verify GREEN audits and SDK behavior**
+
+```bash
+npm ci --prefix sdk/typescript
+npm audit --prefix sdk/typescript --json
+npm audit --prefix sdk/typescript --omit=dev --json
+npm run --prefix sdk/typescript lint
+npm run --prefix sdk/typescript typecheck
+npm run --prefix sdk/typescript test
+npm run --prefix sdk/typescript build
+```
+
+Expected: both audits report zero total findings and all SDK scripts exit
+zero. Confirm the lockfile has no `protobufjs` version at or below 7.6.2 and
+no `tar` version at or below 7.5.15.
+
+- [ ] **Step 4: Commit the dependency remediation**
+
+```bash
+git add sdk/typescript/package.json sdk/typescript/package-lock.json
+git commit -m "fix(sdk): update vulnerable test dependencies"
+```
+
+### Task 5: Review, verify, integrate, and release
 
 **Files:**
 - Verify: all files changed since `dev`
