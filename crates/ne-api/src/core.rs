@@ -274,6 +274,16 @@ impl RuntimeCore {
         }
     }
 
+    /// Return the supervisor's resolved runtime capabilities.
+    pub async fn runtime_capabilities(
+        &self,
+    ) -> Result<ne_protocol::profile::RuntimeCapabilitiesInfo, CoreError> {
+        match self.call(SupervisorRequest::GetCapabilities).await? {
+            SupervisorResponse::Capabilities(capabilities) => Ok(capabilities),
+            other => Err(Self::unexpected("GetCapabilities", &other)),
+        }
+    }
+
     /// Launch a workspace. Validates `vcpu_count` before narrowing to
     /// the supervisor's `u8`.
     pub async fn create_workspace(
@@ -657,6 +667,18 @@ mod tests {
         assert_eq!(out.supervisor_version, "0.0.0-fake");
         assert_eq!(out.supervisor_uptime_ms, 7);
         assert_eq!(out.api_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn runtime_capabilities_relay_profile_contract() {
+        let expected =
+            ne_protocol::profile::ExecutionProfile::ConfidentialAzure.capabilities("0.2.0", 1);
+        let response = expected.clone();
+        let (core, _tmp) = make_core(move |_| SupervisorResponse::Capabilities(response.clone()));
+        assert_eq!(
+            core.runtime_capabilities().await.expect("capabilities"),
+            expected
+        );
     }
 
     #[tokio::test]

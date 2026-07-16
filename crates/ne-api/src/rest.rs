@@ -36,6 +36,7 @@ const REST_MAX_BODY_BYTES: usize = 15 * 1024 * 1024;
 pub fn router(core: Arc<RuntimeCore>) -> Router {
     Router::new()
         .route("/v1/host/health", get(health))
+        .route("/v1/runtime/capabilities", get(runtime_capabilities))
         .route("/v1/workspaces", post(create_workspace))
         .route("/v1/workspaces/:workspace_id", delete(destroy_workspace))
         .route("/v1/workspaces/:workspace_id/exec", post(execute_command))
@@ -229,6 +230,12 @@ async fn health(State(core): State<Arc<RuntimeCore>>) -> Result<Json<HealthRespo
         supervisor_version: out.supervisor_version,
         supervisor_uptime_ms: out.supervisor_uptime_ms,
     }))
+}
+
+async fn runtime_capabilities(
+    State(core): State<Arc<RuntimeCore>>,
+) -> Result<Json<ne_protocol::profile::RuntimeCapabilitiesInfo>, ApiError> {
+    Ok(Json(core.runtime_capabilities().await?))
 }
 
 /// `POST /v1/workspaces` request body. `network.privacy_router` present

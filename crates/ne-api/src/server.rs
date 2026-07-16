@@ -51,6 +51,19 @@ impl Runtime for RuntimeService {
         }))
     }
 
+    async fn get_runtime_capabilities(
+        &self,
+        _request: Request<pb::GetRuntimeCapabilitiesRequest>,
+    ) -> Result<Response<pb::GetRuntimeCapabilitiesResponse>, Status> {
+        debug!("get_runtime_capabilities received");
+        let capabilities = self
+            .core
+            .runtime_capabilities()
+            .await
+            .map_err(core_error_to_status)?;
+        Ok(Response::new(capabilities_to_pb(capabilities)))
+    }
+
     async fn create_workspace(
         &self,
         request: Request<pb::CreateWorkspaceRequest>,
@@ -470,6 +483,58 @@ fn kind_to_status(kind: ne_protocol::supervisor::SupervisorErrorKind, message: S
         // SnapshotFailed / RestoreFailed / LaunchFailed / GuestProtocolError /
         // IoError / Internal / any future variant → internal.
         _ => Status::internal(message),
+    }
+}
+
+fn capabilities_to_pb(
+    capabilities: ne_protocol::profile::RuntimeCapabilitiesInfo,
+) -> pb::GetRuntimeCapabilitiesResponse {
+    use ne_protocol::profile::{
+        AttestationBackend, ExecutionBackend, ExecutionProfile, WorkspaceOperation,
+    };
+
+    let execution_profile = match capabilities.execution_profile {
+        ExecutionProfile::Standard => pb::ExecutionProfile::Standard,
+        ExecutionProfile::ConfidentialAzure => pb::ExecutionProfile::ConfidentialAzure,
+    };
+    let execution_backend = match capabilities.execution_backend {
+        ExecutionBackend::Firecracker => pb::ExecutionBackend::Firecracker,
+        ExecutionBackend::OpenShell => pb::ExecutionBackend::OpenShell,
+    };
+    let attestation_backend = match capabilities.attestation_backend {
+        AttestationBackend::Software => pb::AttestationBackend::Software,
+        AttestationBackend::SevSnpDirect => pb::AttestationBackend::SevSnpDirect,
+        AttestationBackend::SevSnpAzure => pb::AttestationBackend::SevSnpAzure,
+    };
+    let supported_operations = capabilities
+        .supported_operations
+        .into_iter()
+        .map(|operation| match operation {
+            WorkspaceOperation::Create => pb::WorkspaceOperation::Create as i32,
+            WorkspaceOperation::Destroy => pb::WorkspaceOperation::Destroy as i32,
+            WorkspaceOperation::Execute => pb::WorkspaceOperation::Execute as i32,
+            WorkspaceOperation::WriteFile => pb::WorkspaceOperation::WriteFile as i32,
+            WorkspaceOperation::ReadFile => pb::WorkspaceOperation::ReadFile as i32,
+            WorkspaceOperation::Pause => pb::WorkspaceOperation::Pause as i32,
+            WorkspaceOperation::Resume => pb::WorkspaceOperation::Resume as i32,
+            WorkspaceOperation::Snapshot => pb::WorkspaceOperation::Snapshot as i32,
+            WorkspaceOperation::Restore => pb::WorkspaceOperation::Restore as i32,
+            WorkspaceOperation::Fork => pb::WorkspaceOperation::Fork as i32,
+            WorkspaceOperation::WarmPool => pb::WorkspaceOperation::WarmPool as i32,
+            WorkspaceOperation::Ingress => pb::WorkspaceOperation::Ingress as i32,
+            WorkspaceOperation::Attest => pb::WorkspaceOperation::Attest as i32,
+        })
+        .collect();
+
+    pb::GetRuntimeCapabilitiesResponse {
+        runtime_version: capabilities.runtime_version,
+        execution_profile: execution_profile as i32,
+        execution_backend: execution_backend as i32,
+        attestation_backend: attestation_backend as i32,
+        supported_operations,
+        hard_workspace_capacity: capabilities.hard_workspace_capacity,
+        confidential_snapshot_supported: capabilities.confidential_snapshot_supported,
+        evidence_schema_version: capabilities.evidence_schema_version,
     }
 }
 

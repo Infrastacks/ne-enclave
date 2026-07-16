@@ -96,7 +96,66 @@ pub enum WorkspaceOperation {
     Attest,
 }
 
+/// Transport-neutral capability description for one running runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapabilitiesInfo {
+    /// Runtime semantic version.
+    pub runtime_version: String,
+    /// Selected customer-visible execution profile.
+    pub execution_profile: ExecutionProfile,
+    /// Concrete execution substrate.
+    pub execution_backend: ExecutionBackend,
+    /// Concrete attestation provider.
+    pub attestation_backend: AttestationBackend,
+    /// Operations accepted by the selected profile.
+    pub supported_operations: Vec<WorkspaceOperation>,
+    /// Hard profile-specific workspace capacity, when present.
+    pub hard_workspace_capacity: Option<u32>,
+    /// Whether the confidential profile supports snapshot semantics.
+    pub confidential_snapshot_supported: bool,
+    /// Public evidence-envelope schema version.
+    pub evidence_schema_version: u32,
+}
+
 impl ExecutionProfile {
+    /// Build the transport-neutral capabilities advertised by this runtime.
+    #[must_use]
+    pub fn capabilities(
+        self,
+        runtime_version: impl Into<String>,
+        evidence_schema_version: u32,
+    ) -> RuntimeCapabilitiesInfo {
+        let supported_operations = [
+            WorkspaceOperation::Create,
+            WorkspaceOperation::Destroy,
+            WorkspaceOperation::Execute,
+            WorkspaceOperation::WriteFile,
+            WorkspaceOperation::ReadFile,
+            WorkspaceOperation::Pause,
+            WorkspaceOperation::Resume,
+            WorkspaceOperation::Snapshot,
+            WorkspaceOperation::Restore,
+            WorkspaceOperation::Fork,
+            WorkspaceOperation::WarmPool,
+            WorkspaceOperation::Ingress,
+            WorkspaceOperation::Attest,
+        ]
+        .into_iter()
+        .filter(|operation| self.supports(*operation))
+        .collect();
+
+        RuntimeCapabilitiesInfo {
+            runtime_version: runtime_version.into(),
+            execution_profile: self,
+            execution_backend: self.execution_backend(),
+            attestation_backend: self.attestation_backend(),
+            supported_operations,
+            hard_workspace_capacity: self.hard_workspace_capacity(),
+            confidential_snapshot_supported: false,
+            evidence_schema_version,
+        }
+    }
+
     /// Resolve the execution substrate selected by this profile.
     #[must_use]
     pub fn execution_backend(self) -> ExecutionBackend {
@@ -202,5 +261,24 @@ mod tests {
         assert!(!profile.supports(WorkspaceOperation::Fork));
         assert!(!profile.supports(WorkspaceOperation::WarmPool));
         assert!(!profile.supports(WorkspaceOperation::Ingress));
+    }
+
+    #[test]
+    fn confidential_azure_capabilities_report_hard_capacity_without_snapshot() {
+        let capabilities = ExecutionProfile::ConfidentialAzure.capabilities("0.2.0", 1);
+        assert_eq!(capabilities.runtime_version, "0.2.0");
+        assert_eq!(capabilities.hard_workspace_capacity, Some(1));
+        assert!(
+            capabilities
+                .supported_operations
+                .contains(&WorkspaceOperation::Attest)
+        );
+        assert!(
+            !capabilities
+                .supported_operations
+                .contains(&WorkspaceOperation::Snapshot)
+        );
+        assert!(!capabilities.confidential_snapshot_supported);
+        assert_eq!(capabilities.evidence_schema_version, 1);
     }
 }

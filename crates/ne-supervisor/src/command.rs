@@ -60,6 +60,12 @@ impl Dispatcher {
                 version: self.version.to_string(),
                 uptime_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
             },
+            SupervisorRequest::GetCapabilities => {
+                SupervisorResponse::Capabilities(self.workspaces.execution_profile().capabilities(
+                    self.version,
+                    ne_protocol::attestation::PUBLIC_EVIDENCE_SCHEMA_VERSION,
+                ))
+            }
             SupervisorRequest::CreateWorkspace(req) => self.workspaces.create(req).await,
             SupervisorRequest::Terminate(req) => self.workspaces.terminate(req).await,
             SupervisorRequest::RunCommand(req) => self.workspaces.run_command(req).await,
@@ -171,6 +177,26 @@ mod tests {
                 assert_eq!(kind, SupervisorErrorKind::UnsupportedForProfile);
             }
             other => panic!("expected UnsupportedForProfile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_derived_from_the_selected_profile() {
+        let d =
+            test_dispatcher_for(ne_protocol::profile::ExecutionProfile::ConfidentialAzure).await;
+        match d.dispatch(SupervisorRequest::GetCapabilities).await {
+            SupervisorResponse::Capabilities(capabilities) => {
+                assert_eq!(
+                    capabilities.execution_profile,
+                    ne_protocol::profile::ExecutionProfile::ConfidentialAzure
+                );
+                assert_eq!(capabilities.hard_workspace_capacity, Some(1));
+                assert_eq!(
+                    capabilities.evidence_schema_version,
+                    ne_protocol::attestation::PUBLIC_EVIDENCE_SCHEMA_VERSION
+                );
+            }
+            other => panic!("expected capabilities, got {other:?}"),
         }
     }
 

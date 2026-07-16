@@ -41,6 +41,8 @@ pub const MAX_INLINE_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub enum SupervisorRequest {
     /// Liveness probe. Always replies with [`SupervisorResponse::Pong`].
     Ping,
+    /// Return the runtime's resolved execution and evidence capabilities.
+    GetCapabilities,
     /// Launch a workspace using the selected execution profile. Linux-only;
     /// macOS builds reply with [`SupervisorErrorKind::Unsupported`].
     CreateWorkspace(CreateWorkspaceRequest),
@@ -106,7 +108,7 @@ impl SupervisorRequest {
             Self::PoolStatus(_) => Some(Op::WarmPool),
             Self::ExposePort(_) | Self::UnexposePort(_) => Some(Op::Ingress),
             Self::GetAttestationEvidence(_) => Some(Op::Attest),
-            Self::Ping | Self::ListEvents(_) => None,
+            Self::Ping | Self::GetCapabilities | Self::ListEvents(_) => None,
         }
     }
 }
@@ -590,6 +592,8 @@ pub enum SupervisorResponse {
         /// Milliseconds since the supervisor started accepting connections.
         uptime_ms: u64,
     },
+    /// Reply to a successful [`SupervisorRequest::GetCapabilities`].
+    Capabilities(crate::profile::RuntimeCapabilitiesInfo),
     /// Reply to a successful [`SupervisorRequest::CreateWorkspace`].
     WorkspaceCreated(WorkspaceCreated),
     /// Reply to a successful [`SupervisorRequest::Terminate`].
@@ -1062,6 +1066,26 @@ mod tests {
         assert_eq!(
             req.workspace_operation(),
             Some(crate::profile::WorkspaceOperation::Snapshot)
+        );
+    }
+
+    #[test]
+    fn capabilities_request_and_response_roundtrip() {
+        let request = SupervisorRequest::GetCapabilities;
+        let request_json = serde_json::to_string(&request).expect("serialize request");
+        assert_eq!(request_json, r#"{"op":"get_capabilities"}"#);
+        assert_eq!(
+            serde_json::from_str::<SupervisorRequest>(&request_json).expect("request"),
+            request
+        );
+
+        let response = SupervisorResponse::Capabilities(
+            crate::profile::ExecutionProfile::ConfidentialAzure.capabilities("0.2.0", 1),
+        );
+        let response_json = serde_json::to_string(&response).expect("serialize response");
+        assert_eq!(
+            serde_json::from_str::<SupervisorResponse>(&response_json).expect("response"),
+            response
         );
     }
 
