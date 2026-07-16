@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
+pub mod attestation_factory;
 pub mod audit;
 pub mod command;
 #[cfg(target_os = "linux")]

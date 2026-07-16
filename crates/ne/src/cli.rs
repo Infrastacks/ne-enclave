@@ -157,10 +157,9 @@ pub struct ServeSupervisorArgs {
 
     /// Path to the `openshell-sandbox` binary on the host.
     ///
-    /// Only used on the **confidential tier** (single-CVM-direct, B;
-    /// `NE_CONFIDENTIAL_MODE=1`). The supervisor spawns this binary as a
-    /// subprocess per workspace and controls it over SSH. Unused on the
-    /// standard (Firecracker) tier.
+    /// Only used by the `confidential-azure` execution profile. The supervisor
+    /// spawns this binary as a subprocess per workspace and controls it over
+    /// SSH. Unused by the standard (Firecracker) profile.
     #[arg(
         long,
         env = "NE_OPENSHELL_SANDBOX_BIN",

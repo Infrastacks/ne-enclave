@@ -97,11 +97,17 @@ mod tests {
         // this leak is bounded per-test.
         let state_dir = Box::leak(Box::new(tmp)).path().to_path_buf();
         let audit = AuditLog::open(&state_dir).await.expect("audit open");
+        let attestation = crate::attestation_factory::build_provider(
+            ne_protocol::profile::AttestationBackend::Software,
+            audit.signing_key(),
+        )
+        .expect("software provider");
         // Generous test ceilings: these dispatcher tests aren't exercising
         // admission control and must not spuriously hit it.
         let mgr = WorkspaceManager::new(
             WorkspaceManagerConfig::dev_defaults(),
             audit.clone(),
+            attestation,
             1024,
             32768,
         )

@@ -11,6 +11,7 @@
 //! the Linux integration lands.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ne_protocol::supervisor::{
@@ -82,8 +83,6 @@ use ne_protocol::supervisor::{
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
-use std::sync::Arc;
-#[cfg(target_os = "linux")]
 use tokio::sync::Mutex;
 #[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
@@ -93,25 +92,7 @@ use tracing::{info, warn};
 #[cfg(target_os = "linux")]
 use crate::network::NetworkController;
 
-/// Which attestation provider the supervisor should construct.
-///
-/// `serve()` resolves this from `NE_CONFIDENTIAL_MODE` + `/dev/sev-guest`
-/// presence (see [`crate::serve`]) and injects it here so the
-/// provider-selection decision is unit-testable independent of process state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttestationProfile {
-    /// Ed25519 software-fallback provider (still gated by
-    /// `NE_ATTEST_ALLOW_SOFTWARE` / dev mode in `serve()`).
-    Software,
-    /// AMD SEV-SNP firmware-rooted provider (Linux + `/dev/sev-guest`).
-    SevSnp,
-}
-
-/// Which execution backend a workspace lands on. The standard tier
-/// (Firecracker microVM) and the confidential tier (single-CVM-direct, B;
-/// OpenShell) are dispatched on the [`AttestationProfile`] resolved at
-/// `serve()` time. This is the value type of the live-workspace registry;
-/// see [`WorkspaceManager`](struct@WorkspaceManager).
+/// Which execution backend a workspace lands on.
 #[derive(Debug)]
 #[cfg(target_os = "linux")]
 pub enum WorkspaceExec {
@@ -138,45 +119,6 @@ enum SnapshotFinalize {
     /// PATCH can never hit a replacement boot's reused socket) and record
     /// `Running` — or `Paused` if the resume fails.
     ResumeInPlace,
-}
-
-/// Pure decision: which [`WorkspaceExec`] variant does the given profile route to?
-///
-/// Extracted so the routing table is unit-testable on macOS (no CVM needed).
-/// `Software` → the standard Firecracker tier; `SevSnp` → the confidential
-/// OpenShell tier (B).
-#[must_use]
-pub fn exec_backend_for_profile(profile: AttestationProfile) -> &'static str {
-    match profile {
-        AttestationProfile::Software => "firecracker",
-        AttestationProfile::SevSnp => "openshell",
-    }
-}
-
-/// Pure decision: is any CVM hardware signal present?
-///
-/// "CVM present" is `/dev/sev-guest` (GCP/bare-metal/AWS direct SNP) **OR**
-/// `/dev/tpmrm0` (the Azure `OpenHCL` paravisor path — Wedge 5 proved Azure
-/// `DCasv5` has **no** `/dev/sev-guest`; the vTPM device is the CVM signal).
-/// Either is sufficient to construct the SEV-SNP provider. Extracted so the
-/// truth table is unit-testable on macOS.
-#[must_use]
-#[allow(clippy::similar_names)]
-pub fn cvm_hardware_present(sev_present: bool, vtpm_present: bool) -> bool {
-    sev_present || vtpm_present
-}
-
-/// Pure decision for the confidential-mode fail-closed gate.
-///
-/// Returns `true` when a confidential deployment MUST refuse to start because
-/// no CVM hardware is available — i.e. the operator asked for confidential mode
-/// but neither `/dev/sev-guest` nor `/dev/tpmrm0` is present. Extracted from
-/// `serve()` so the table is unit-testable on macOS (the real `Path::exists`
-/// + env read happens at the call site).
-#[must_use]
-#[allow(clippy::similar_names)]
-pub fn refuse_software_in_confidential_mode(confidential: bool, cvm_present: bool) -> bool {
-    confidential && !cvm_present
 }
 
 /// Derive a safe default concurrent-workspace ceiling from host RAM: ~512 MiB
@@ -215,10 +157,8 @@ pub struct WorkspaceManagerConfig {
     /// Kernel boot args used when a `CreateWorkspace` request omits its
     /// own `kernel_boot_args` field.
     pub default_kernel_boot_args: String,
-    /// Which attestation provider to construct. Resolved in `serve()` from
-    /// `NE_CONFIDENTIAL_MODE` + `/dev/sev-guest` presence; see
-    /// [`AttestationProfile`] and [`refuse_software_in_confidential_mode`].
-    pub attestation_profile: AttestationProfile,
+    /// Execution profile resolved once by `serve()`.
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
     /// Optional network controller. When `Some`, a workspace request
     /// that carries a [`ne_protocol::supervisor::NetworkConfig`]
     /// gets a per-workspace netns + TAP + NAT. When `None`, requests
@@ -250,7 +190,7 @@ impl WorkspaceManagerConfig {
             openshell_sandbox_binary: PathBuf::from("/opt/ne-enclave/bin/openshell-sandbox"),
             api_socket_timeout: Duration::from_secs(10),
             default_kernel_boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_string(),
-            attestation_profile: AttestationProfile::Software,
+            execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
             #[cfg(target_os = "linux")]
             network: None,
             state_dir: PathBuf::from("/var/lib/ne-enclave"),
@@ -526,15 +466,15 @@ impl WorkspaceManager {
     /// Construct an empty registry that returns `Unsupported` for every
     /// workspace op (non-Linux build, PRD NFR-5.1).
     ///
-    /// Returns `Result` for signature parity with the Linux impl (whose
-    /// SEV-SNP provider construction is fallible); on non-Linux this never
-    /// errors.
+    /// Returns `Result` for signature parity with the Linux implementation;
+    /// provider construction happens before the manager is created.
     ///
     /// # Errors
     /// Never on non-Linux.
     pub fn new(
         cfg: WorkspaceManagerConfig,
         audit: AuditLog,
+        _attestation: Arc<dyn ne_attestation::AttestationProvider>,
         max_workspaces: usize,
         max_workspace_mem_mib: u32,
     ) -> anyhow::Result<Self> {
@@ -694,18 +634,16 @@ impl WorkspaceManager {
 impl WorkspaceManager {
     /// Construct an empty registry that uses `cfg` for every launch.
     ///
-    /// Fallible because the SEV-SNP provider opens `/dev/sev-guest` (Task 9
-    /// fills the ioctl; until then `open()` is an unsupported-error stub). A
-    /// confidential deployment that cannot initialize the hardware provider
-    /// fails here rather than silently dropping to software attestation.
+    /// Provider selection and construction happen in `serve()` before this
+    /// registry is created, so this constructor cannot silently switch
+    /// attestation backends.
     ///
     /// # Errors
-    /// `anyhow::Error` if the resolved attestation provider could not be
-    /// constructed (e.g. `/dev/sev-guest` open failure under the SEV-SNP
-    /// profile).
+    /// `anyhow::Error` if registry initialization fails.
     pub fn new(
         cfg: WorkspaceManagerConfig,
         audit: AuditLog,
+        attestation: Arc<dyn ne_attestation::AttestationProvider>,
         max_workspaces: usize,
         max_workspace_mem_mib: u32,
     ) -> anyhow::Result<Self> {
@@ -720,11 +658,6 @@ impl WorkspaceManager {
                 )
             },
         );
-        let attestation_signing_key = audit.signing_key();
-        // Read the profile BEFORE `cfg` is moved into the struct literal below
-        // (otherwise the `match cfg.attestation_profile` is a use-after-move on
-        // Linux, where the SevSnp arm's IoctlSnpReportSource is in scope).
-        let attestation_profile = cfg.attestation_profile;
         Ok(Self {
             cfg,
             audit,
@@ -735,32 +668,7 @@ impl WorkspaceManager {
             refill_tx,
             refill_rx,
             ingress: ne_ingress::IngressRegistry::new(),
-            // Provider selection: the profile is resolved in `serve()` from
-            // NE_CONFIDENTIAL_MODE + /dev/sev-guest presence, and the
-            // confidential-mode fail-closed gate
-            // (refuse_software_in_confidential_mode) has already refused to
-            // start if confidential was requested without SEV hardware.
-            // SevSnp construction is Linux-only; IoctlSnpReportSource::open()
-            // is still a Task-9 stub but the wiring is in place.
-            attestation: match attestation_profile {
-                AttestationProfile::Software => {
-                    let provider: Arc<dyn ne_attestation::AttestationProvider> = Arc::new(
-                        ne_attestation::SoftwareProvider::new(attestation_signing_key),
-                    );
-                    provider
-                }
-                AttestationProfile::SevSnp => {
-                    use ne_attestation::snp_source::IoctlSnpReportSource;
-                    use ne_attestation::vcek::{KdsVcekFetcher, VcekCache, VcekFetcher};
-                    let source: Arc<dyn ne_attestation::SnpReportSource> =
-                        Arc::new(IoctlSnpReportSource::open()?);
-                    let vcek: Arc<dyn VcekFetcher> =
-                        Arc::new(VcekCache::new(KdsVcekFetcher::new()));
-                    let provider: Arc<dyn ne_attestation::AttestationProvider> =
-                        Arc::new(ne_attestation::SevSnpProvider::new(source, vcek));
-                    provider
-                }
-            },
+            attestation,
             attestation_nonces: Mutex::new(HashMap::new()),
             lifecycle_claims: LifecycleClaims::default(),
         })
@@ -861,21 +769,27 @@ impl WorkspaceManager {
                 message: format!("at workspace capacity ({})", self.max_workspaces),
             };
         }
-        // Two-tier dispatch (R1): the confidential profile (SevSnp) routes to
+        // Two-tier dispatch (R1): the confidential profile routes to
         // the OpenShell-in-CVM substrate (single-CVM-direct, B); the software
         // profile routes to the Firecracker microVM path below. The OpenShell
         // path is Linux + `confidential-cvm` only.
         #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
-        if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
+        if matches!(
+            self.cfg.execution_profile,
+            ne_protocol::profile::ExecutionProfile::ConfidentialAzure
+        ) {
             return self.create_confidential(req).await;
         }
 
         #[cfg(not(all(target_os = "linux", feature = "confidential-cvm")))]
-        if matches!(self.cfg.attestation_profile, AttestationProfile::SevSnp) {
+        if matches!(
+            self.cfg.execution_profile,
+            ne_protocol::profile::ExecutionProfile::ConfidentialAzure
+        ) {
             return SupervisorResponse::Error {
                 kind: SupervisorErrorKind::Unsupported,
                 message: format!(
-                    "confidential tier (SevSnp) requires Linux + the confidential-cvm feature; \
+                    "confidential-azure requires Linux + the confidential-cvm feature; \
                      workspace {} cannot be created on this build",
                     req.workspace_id
                 ),
@@ -3525,8 +3439,17 @@ mod tests {
         CreateWorkspaceRequest, ForkRequest, RestoreRequest, SnapshotRequest,
         SupervisorErrorKind as S, SupervisorResponse, WorkspaceRef, WorkspaceState,
     };
+    use std::sync::Arc;
 
     use crate::audit::AuditLog;
+
+    fn software_provider(audit: &AuditLog) -> Arc<dyn ne_attestation::AttestationProvider> {
+        crate::attestation_factory::build_provider(
+            ne_protocol::profile::AttestationBackend::Software,
+            audit.signing_key(),
+        )
+        .expect("software provider")
+    }
 
     /// Build a minimal `WorkspaceManager` backed by a tempdir state + audit
     /// log, with generous admission ceilings that no test here is meant to
@@ -3551,8 +3474,15 @@ mod tests {
         let audit = AuditLog::open(&state_dir).await.expect("audit open");
         let mut cfg = WorkspaceManagerConfig::dev_defaults();
         cfg.state_dir = state_dir;
-        WorkspaceManager::new(cfg, audit, max_workspaces, max_workspace_mem_mib)
-            .expect("workspace manager")
+        let attestation = software_provider(&audit);
+        WorkspaceManager::new(
+            cfg,
+            audit,
+            attestation,
+            max_workspaces,
+            max_workspace_mem_mib,
+        )
+        .expect("workspace manager")
     }
 
     /// Fabricate a registered Firecracker instance with a known boot token.
@@ -4126,7 +4056,9 @@ mod tests {
             target_size: 2,
             max_in_flight: 2,
         });
-        let mgr = WorkspaceManager::new(cfg, audit, 2, 32768).expect("workspace manager");
+        let attestation = software_provider(&audit);
+        let mgr =
+            WorkspaceManager::new(cfg, audit, attestation, 2, 32768).expect("workspace manager");
         assert_eq!(mgr.live_vm_count().await, 0);
 
         // Simulate two live pool VMs without booting anything: reserved
@@ -4295,7 +4227,9 @@ mod tests {
             None,
             None,
         ));
-        let mgr = WorkspaceManager::new(cfg, audit, 1024, 32768).expect("workspace manager");
+        let attestation = software_provider(&audit);
+        let mgr =
+            WorkspaceManager::new(cfg, audit, attestation, 1024, 32768).expect("workspace manager");
         let response = mgr
             .create(CreateWorkspaceRequest {
                 workspace_id: "missing-image".into(),
@@ -4357,75 +4291,6 @@ mod tests {
             "after CAP distinct inserts, `a` was evicted and is fresh again"
         );
         assert!(ring.seen.len() <= NonceRing::CAP, "set never exceeds CAP");
-    }
-}
-
-/// Cross-platform unit tests for the confidential-mode fail-closed gate.
-/// The gate logic is pure (env + path checks happen at the call site in
-/// `serve()`), so these run on macOS too.
-#[cfg(test)]
-mod gate_tests {
-    use super::{cvm_hardware_present, refuse_software_in_confidential_mode};
-
-    #[test]
-    fn non_confidential_never_refuses() {
-        // Software deployment (default): no confidential mode, CVM irrelevant.
-        assert!(!refuse_software_in_confidential_mode(false, false));
-        assert!(!refuse_software_in_confidential_mode(false, true));
-    }
-
-    #[test]
-    fn confidential_without_sev_refuses() {
-        // The fail-closed case: confidential requested but no CVM hardware.
-        assert!(refuse_software_in_confidential_mode(true, false));
-    }
-
-    #[test]
-    fn confidential_with_sev_proceeds() {
-        // Confidential deployment on hardware: SEV-SNP provider is constructed.
-        assert!(!refuse_software_in_confidential_mode(true, true));
-    }
-
-    #[test]
-    fn cvm_present_via_either_device() {
-        // `/dev/sev-guest` (GCP/bare-metal) OR `/dev/tpmrm0` (Azure) is a CVM.
-        assert!(cvm_hardware_present(true, false));
-        assert!(cvm_hardware_present(false, true));
-        assert!(cvm_hardware_present(true, true));
-        assert!(!cvm_hardware_present(false, false));
-    }
-
-    #[test]
-    fn confidential_with_only_vtpm_proceeds() {
-        // The Azure DCasv5 case (Wedge 5): no /dev/sev-guest, but /dev/tpmrm0.
-        let cvm = cvm_hardware_present(false, true);
-        assert!(!refuse_software_in_confidential_mode(true, cvm));
-    }
-}
-
-/// Cross-platform unit tests for the two-tier execution-backend routing
-/// (R1). Pure, so they run on macOS — the actual OpenShell spawn is
-/// Linux + `confidential-cvm` only (verified on the `DCasv5`).
-#[cfg(test)]
-mod exec_routing_tests {
-    use super::{AttestationProfile, exec_backend_for_profile};
-
-    #[test]
-    fn software_profile_routes_to_firecracker() {
-        // Standard tier (default): Firecracker microVM isolation.
-        assert_eq!(
-            exec_backend_for_profile(AttestationProfile::Software),
-            "firecracker"
-        );
-    }
-
-    #[test]
-    fn sevsnp_profile_routes_to_openshell() {
-        // Confidential tier (single-CVM-direct, B): OpenShell in-CVM.
-        assert_eq!(
-            exec_backend_for_profile(AttestationProfile::SevSnp),
-            "openshell"
-        );
     }
 }
 

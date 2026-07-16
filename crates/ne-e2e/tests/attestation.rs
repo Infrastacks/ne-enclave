@@ -102,8 +102,14 @@ async fn attestation_generate_verify_replay() {
     cfg.image_store = image_store;
     // network stays None: attestation is purely in-process (measurement
     // is computed from the FC launch config, no vsock interaction needed).
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
     let mgr = Arc::new(
-        WorkspaceManager::new(cfg, audit.clone(), 1024, 32768).expect("workspace manager"),
+        WorkspaceManager::new(cfg, audit.clone(), attestation, 1024, 32768)
+            .expect("workspace manager"),
     );
 
     // --- Step 1: Create ws-att ---
