@@ -25,9 +25,13 @@ Cargo.lock.bak
 /images/buildroot/output/
 /images/buildroot/dl/
 
+# Internal agent specs, plans, and isolated working trees
+/.superpowers/
+/docs/superpowers/
+/.worktrees/
+/worktrees/
+
 # Editor / OS
-.worktrees/
-.superpowers/
 .idea/
 .vscode/
 *.swp

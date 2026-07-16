@@ -94,6 +94,15 @@ pub struct ServeApiArgs {
 
 #[derive(Debug, Parser)]
 pub struct ServeSupervisorArgs {
+    /// Execution and attestation profile for this supervisor.
+    #[arg(
+        long,
+        env = "NE_EXECUTION_PROFILE",
+        default_value = "standard",
+        value_parser = parse_execution_profile
+    )]
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
+
     /// Path to the unix domain socket the API daemon connects on.
     #[arg(
         long,
@@ -281,6 +290,15 @@ pub struct PrivacyRouterArgs {
 
 #[derive(Debug, Parser)]
 pub struct InstallArgs {
+    /// Execution profile to provision.
+    #[arg(
+        long,
+        env = "NE_EXECUTION_PROFILE",
+        default_value = "standard",
+        value_parser = parse_execution_profile
+    )]
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
+
     /// Redirect all paths under this root (fakeroot testing). Skips
     /// user/group creation and systemctl when set.
     #[arg(long)]
@@ -308,6 +326,15 @@ pub struct UninstallArgs {
 
 #[derive(Debug, Parser)]
 pub struct DoctorArgs {
+    /// Execution profile whose host requirements should be checked.
+    #[arg(
+        long,
+        env = "NE_EXECUTION_PROFILE",
+        default_value = "standard",
+        value_parser = parse_execution_profile
+    )]
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
+
     #[arg(long)]
     pub prefix: Option<PathBuf>,
 }
@@ -483,6 +510,10 @@ fn parse_header_kv(s: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("expected NAME=VALUE, got {s:?}"))
 }
 
+fn parse_execution_profile(value: &str) -> Result<ne_protocol::profile::ExecutionProfile, String> {
+    value.parse()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +531,31 @@ mod tests {
                 "expected serve-supervisor"
             ),
         }
+    }
+
+    #[test]
+    fn execution_profile_defaults_to_standard() {
+        let cli = Cli::try_parse_from(["nee", "serve-supervisor", "--dev-mode"]).expect("parse");
+        let Command::ServeSupervisor(args) = cli.command else {
+            panic!("expected supervisor command");
+        };
+        assert_eq!(
+            args.execution_profile,
+            ne_protocol::profile::ExecutionProfile::Standard
+        );
+    }
+
+    #[test]
+    fn execution_profile_accepts_confidential_azure() {
+        let cli =
+            Cli::try_parse_from(["nee", "doctor", "--execution-profile", "confidential-azure"])
+                .expect("parse");
+        let Command::Doctor(args) = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert_eq!(
+            args.execution_profile,
+            ne_protocol::profile::ExecutionProfile::ConfidentialAzure
+        );
     }
 }

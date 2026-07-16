@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use ne_protocol::profile::ExecutionProfile;
 
 use crate::install::image;
 use crate::install::layout::Layout;
@@ -21,6 +22,8 @@ use crate::install::render::{self, RenderVars};
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
+    /// Execution profile being provisioned.
+    pub execution_profile: ExecutionProfile,
     /// Resolved filesystem layout (carries the `--prefix` root).
     pub layout: Layout,
     /// True when `--prefix` is set: skip user/group + systemctl.
@@ -275,7 +278,7 @@ pub fn uninstall(layout: &Layout, purge: bool, fakeroot: bool) -> Result<()> {
 }
 
 /// Preflight wrapper for `nee doctor`.
-pub fn doctor(l: &Layout) -> preflight::Report {
+pub fn doctor(l: &Layout, _execution_profile: ExecutionProfile) -> preflight::Report {
     // /dev/kvm is always the real host device, even under `--prefix`: the
     // prefix redirects install paths, not the kernel's KVM character device.
     preflight::run_report(&l.bin_dir(), Path::new("/dev/kvm"))

@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
             install_parent_death_signal();
             let a = *a;
             ne_supervisor::serve::serve(ne_supervisor::serve::SupervisorConfig {
+                execution_profile: a.execution_profile,
                 socket: a.socket,
                 expected_peer_uid: a.expected_peer_uid,
                 dev_mode: a.dev_mode,
@@ -127,6 +128,7 @@ async fn main() -> Result<()> {
             let layout = install::layout::Layout::new(root);
             let ne_uid = resolve_ne_uid(a.prefix.is_some());
             install::run::install(install::run::InstallOptions {
+                execution_profile: a.execution_profile,
                 layout,
                 fakeroot: a.prefix.is_some(),
                 no_start: a.no_start,
@@ -138,7 +140,7 @@ async fn main() -> Result<()> {
         Command::Doctor(a) => {
             let root = a.prefix.unwrap_or_else(|| "/".into());
             let layout = install::layout::Layout::new(root);
-            let report = install::run::doctor(&layout);
+            let report = install::run::doctor(&layout, a.execution_profile);
             for c in &report.checks {
                 tracing::info!(name = %c.name, ok = c.ok, detail = %c.detail, "preflight check");
             }

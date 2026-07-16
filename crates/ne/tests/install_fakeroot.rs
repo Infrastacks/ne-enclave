@@ -16,6 +16,7 @@ fn fakeroot_install_creates_missing_prefix_root() {
     let layout = Layout::new(&root);
 
     install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: layout.clone(),
         fakeroot: true,
         no_start: true,
@@ -48,6 +49,7 @@ fn fakeroot_install_rejects_symlink_prefix_without_touching_target() {
     symlink(&sentinel, &root).unwrap();
 
     let result = install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: Layout::new(&root),
         fakeroot: true,
         no_start: true,
@@ -75,6 +77,7 @@ fn fakeroot_install_rejects_regular_file_prefix_without_changing_contents() {
     std::fs::write(&root, b"must-not-change").unwrap();
 
     let result = install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: Layout::new(&root),
         fakeroot: true,
         no_start: true,
@@ -94,6 +97,7 @@ fn fakeroot_install_creates_layout_and_files() {
     let layout = Layout::new(root);
 
     install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: layout.clone(),
         fakeroot: true,
         no_start: true,
@@ -166,6 +170,7 @@ fn fakeroot_reinstall_preserves_operator_policy_edits() {
     let layout = Layout::new(root);
 
     let opts = InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: layout.clone(),
         fakeroot: true,
         no_start: true,
@@ -208,6 +213,7 @@ fn fakeroot_reinstall_corrects_existing_image_store_modes() {
     .unwrap();
 
     install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout,
         fakeroot: true,
         no_start: true,
@@ -247,6 +253,7 @@ fn fakeroot_reinstall_rejects_legacy_state_child_symlinks_without_touching_targe
         symlink(&sentinel, layout.state_dir().join(child)).unwrap();
 
         let result = install(InstallOptions {
+            execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
             layout,
             fakeroot: true,
             no_start: true,

@@ -12,6 +12,7 @@
 
 pub mod audit;
 pub mod guest;
+pub mod profile;
 pub mod snapshot;
 pub mod supervisor;
 

@@ -53,6 +53,8 @@ fn read_host_ram_mib() -> u64 {
 /// `ne-supervisor` CLI flags 1:1 so behavior is unchanged).
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
+    /// Execution and attestation profile selected for this process.
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
     /// Path to the unix domain socket the API daemon connects on.
     pub socket: PathBuf,
     /// Expected UID of the API daemon. Required in production.
@@ -427,6 +429,7 @@ mod tests {
 
     fn base() -> SupervisorConfig {
         SupervisorConfig {
+            execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
             socket: "/run/ne-enclave/supervisor.sock".into(),
             expected_peer_uid: None,
             dev_mode: false,
