@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# NeuronEdge Enclave install smoke: install from a locally-built nee binary, start
-# the systemd units, and drive one workspace create->exec->write->read->
-# destroy through the INSTALLED REST api. Idempotent; safe to re-run.
+# NeuronEdge Enclave standard-profile release smoke: install from the exact
+# signed candidate bundle, start the systemd units, and drive one workspace
+# create->exec->write->read->destroy through the INSTALLED REST API.
+# Idempotent; safe to re-run.
 #
 # Firecracker + jailer are staged into /opt/ne-enclave/bin/ (where the installed
 # supervisor expects them) from NE_E2E_FIRECRACKER/NE_E2E_JAILER, then
 # /usr/local/bin, then PATH — erroring with guidance if neither is found. A real
 # operator-provided binary already under /opt/ne-enclave/bin/ is left as-is.
 #
-# Usage: sudo deploy/smoke-install.sh /path/to/nee /path/to/vmlinux /path/to/rootfs.img
+# Usage:
+#   sudo deploy/smoke-install.sh /path/to/staging /path/to/vmlinux /path/to/rootfs.img
 set -euo pipefail
 
-NE_BIN="${1:?path to built nee binary required}"
+BUNDLE_DIR="${1:?path to signed candidate bundle required}"
 KERNEL="${2:?path to vmlinux required}"
 ROOTFS="${3:?path to rootfs image required}"
+
+test -d "$BUNDLE_DIR"
+test -f "${BUNDLE_DIR}/install.sh"
 
 # Stage a runtime binary (firecracker/jailer) into the install bin dir so the
 # installed supervisor — which reads NE_FIRECRACKER_BIN/NE_JAILER_BIN defaulting
@@ -56,16 +61,15 @@ stage_runtime_bin () {
   echo "    ${name}: ${dest} -> ${src}"
 }
 
-echo "== Installing nee from ${NE_BIN} =="
-install -d -m 0755 /opt/ne-enclave/bin
-install -m 0755 "$NE_BIN" /opt/ne-enclave/bin/nee
-
 echo "== Staging firecracker + jailer into /opt/ne-enclave/bin/ =="
+install -d -m 0755 /opt/ne-enclave/bin
 stage_runtime_bin firecracker NE_E2E_FIRECRACKER
 stage_runtime_bin jailer      NE_E2E_JAILER
 
-# Provision host (no image fetch; we import the locally-built image next).
-/opt/ne-enclave/bin/nee install --no-start --no-image
+echo "== Installing and verifying signed standard candidate =="
+NE_RELEASE_BASE_URL="file://${BUNDLE_DIR}" \
+NE_EXECUTION_PROFILE=standard \
+sh "${BUNDLE_DIR}/install.sh" --no-start --no-image
 
 echo "== Importing guest image =="
 ksum="$(sha256sum "$KERNEL" | awk '{print $1}')"
@@ -86,6 +90,11 @@ systemctl --no-pager --full status ne-supervisor.service ne-api.service | head -
 echo "== Driving a workspace through the installed REST api =="
 api="http://127.0.0.1:8080/v1"
 curl -fsS "${api}/host/health"; echo
+curl -fsS "${api}/runtime/capabilities" |
+  jq -e '
+    .execution_profile == "standard"
+    and .execution_backend == "firecracker"
+  '
 
 wsid="smoke-$(date +%s)"
 echo "create $wsid"
