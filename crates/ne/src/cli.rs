@@ -45,6 +45,10 @@ pub enum Command {
     ApiKey(ApiKeyArgs),
     /// Export and verify the signed audit chain.
     Audit(AuditArgs),
+    /// Verify exported attestation evidence offline.
+    Attestation(AttestationArgs),
+    /// Inspect runtime capabilities.
+    Runtime(RuntimeArgs),
     /// Generate a self-signed TLS cert for dev/test (NOT for production).
     Tls(TlsArgs),
     /// Inspect and verify snapshot artifacts.
@@ -415,6 +419,45 @@ pub enum AuditCommand {
 }
 
 #[derive(Debug, Parser)]
+pub struct AttestationArgs {
+    #[command(subcommand)]
+    pub command: AttestationCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AttestationCommand {
+    /// Verify public evidence JSON against an explicit offline policy.
+    Verify {
+        /// Path to the public evidence JSON file.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// Path to the verification policy JSON file.
+        #[arg(long)]
+        policy: PathBuf,
+    },
+}
+
+#[derive(Debug, Parser)]
+pub struct RuntimeArgs {
+    #[command(subcommand)]
+    pub command: RuntimeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuntimeCommand {
+    /// Print the running runtime's resolved capability contract as JSON.
+    Capabilities {
+        /// gRPC API endpoint.
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
+        endpoint: String,
+    },
+}
+
+#[derive(Debug, Parser)]
 pub struct TlsArgs {
     #[command(subcommand)]
     pub command: TlsCommand,
@@ -461,7 +504,11 @@ pub enum PoolCommand {
     /// convenience command does not perform API-key/TLS auth.
     Status {
         /// API gRPC endpoint URL.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
 }
@@ -470,6 +517,14 @@ pub enum PoolCommand {
 pub struct WorkspaceArgs {
     #[command(subcommand)]
     pub command: WorkspaceCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EvidenceOutput {
+    /// Human-readable provider and binding summary.
+    Summary,
+    /// Complete versioned public evidence envelope as JSON.
+    Json,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -485,7 +540,11 @@ pub enum WorkspaceCommand {
         #[arg(long = "header", value_parser = parse_header_kv)]
         headers: Vec<(String, String)>,
         /// gRPC API endpoint.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
     /// Stop routing ingress to a previously exposed guest port.
@@ -496,7 +555,11 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         port: u16,
         /// gRPC API endpoint.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
     /// Generate attestation evidence for a workspace (challenge-response).
@@ -507,8 +570,18 @@ pub enum WorkspaceCommand {
         /// 32-byte nonce is generated.
         #[arg(long)]
         nonce: Option<String>,
+        /// Evidence output format.
+        #[arg(long, value_enum, default_value_t = EvidenceOutput::Summary)]
+        output: EvidenceOutput,
+        /// Write output to this file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// gRPC API endpoint.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
 }
@@ -598,5 +671,66 @@ mod tests {
             args.openshell_policy_data_source,
             Some(PathBuf::from("/tmp/policy.yaml"))
         );
+    }
+
+    #[test]
+    fn attestation_verify_accepts_evidence_and_policy_paths() {
+        let cli = Cli::try_parse_from([
+            "nee",
+            "attestation",
+            "verify",
+            "--evidence",
+            "evidence.json",
+            "--policy",
+            "policy.json",
+        ])
+        .expect("parse attestation verify");
+        let Command::Attestation(args) = cli.command else {
+            panic!("expected attestation command");
+        };
+        let AttestationCommand::Verify { evidence, policy } = args.command;
+        assert_eq!(evidence, PathBuf::from("evidence.json"));
+        assert_eq!(policy, PathBuf::from("policy.json"));
+    }
+
+    #[test]
+    fn workspace_attest_accepts_json_output_file() {
+        let cli = Cli::try_parse_from([
+            "nee",
+            "workspace",
+            "attest",
+            "secret-1",
+            "--output",
+            "json",
+            "--out",
+            "evidence.json",
+        ])
+        .expect("parse workspace attest output");
+        let Command::Workspace(args) = cli.command else {
+            panic!("expected workspace command");
+        };
+        let WorkspaceCommand::Attest {
+            output,
+            out,
+            endpoint,
+            ..
+        } = args.command
+        else {
+            panic!("expected attest command");
+        };
+        assert_eq!(output, EvidenceOutput::Json);
+        assert_eq!(out, Some(PathBuf::from("evidence.json")));
+        assert_eq!(endpoint, "http://127.0.0.1:50051");
+    }
+
+    #[test]
+    fn runtime_capabilities_defaults_to_grpc_endpoint() {
+        let cli =
+            Cli::try_parse_from(["nee", "runtime", "capabilities"]).expect("parse capabilities");
+        let Command::Runtime(args) = cli.command else {
+            panic!("expected runtime command");
+        };
+        let RuntimeCommand::Capabilities { endpoint } = args.command;
+        assert_eq!(endpoint, "http://127.0.0.1:50051");
     }
 }

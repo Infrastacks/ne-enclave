@@ -3,7 +3,7 @@
 
 //! NeuronEdge Enclave single fused binary entry point.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod cli;
 
@@ -32,6 +32,8 @@ async fn main() -> Result<()> {
         | Command::ApiKey(_)
         | Command::Tls(_)
         | Command::Audit(_)
+        | Command::Attestation(_)
+        | Command::Runtime(_)
         | Command::Snapshot(_)
         | Command::Pool(_)
         | Command::Workspace(_) => {
@@ -225,6 +227,28 @@ async fn main() -> Result<()> {
             }
             cli::AuditCommand::Verify { path } => ne::audit_cli::verify(&path),
         },
+        Command::Attestation(a) => match a.command {
+            cli::AttestationCommand::Verify { evidence, policy } => {
+                ne::attestation_cli::verify_files(&evidence, &policy)
+            }
+        },
+        Command::Runtime(a) => match a.command {
+            cli::RuntimeCommand::Capabilities { endpoint } => {
+                use ne_protocol::grpc::runtime::v1::GetRuntimeCapabilitiesRequest;
+                use ne_protocol::grpc::runtime::v1::runtime_client::RuntimeClient;
+
+                let mut client = RuntimeClient::connect(endpoint)
+                    .await
+                    .context("connecting to Enclave API gRPC endpoint")?;
+                let response = client
+                    .get_runtime_capabilities(GetRuntimeCapabilitiesRequest {})
+                    .await
+                    .context("GetRuntimeCapabilities RPC failed")?
+                    .into_inner();
+                let body = render_runtime_capabilities(&response)?;
+                write_cli_output(&body, None)
+            }
+        },
         Command::Snapshot(a) => match a.command {
             cli::SnapshotCommand::Verify { path } => ne::snapshot_cli::verify(&path).await,
         },
@@ -305,6 +329,8 @@ async fn main() -> Result<()> {
             cli::WorkspaceCommand::Attest {
                 workspace_id,
                 nonce,
+                output,
+                out,
                 endpoint,
             } => {
                 use ne_protocol::grpc::runtime::v1::GetAttestationEvidenceRequest;
@@ -328,11 +354,8 @@ async fn main() -> Result<()> {
                     .await
                     .context("GetAttestationEvidence RPC failed")?
                     .into_inner();
-                print_attestation_evidence(
-                    resp.public_evidence.as_ref(),
-                    legacy_attestation_evidence(&resp),
-                )?;
-                Ok(())
+                let body = render_attestation_evidence(&resp, output)?;
+                write_cli_output(&body, out.as_deref())
             }
         },
     }
@@ -408,18 +431,29 @@ fn print_unexpose_port_result(workspace_id: &str, port: u32) {
     println!("unexposed {workspace_id}:{port}");
 }
 
-/// Print the attestation evidence returned by `nee workspace attest`.
-///
-/// Output goes to stdout so operators and scripts can capture it directly.
-#[allow(clippy::print_stdout)]
-fn print_attestation_evidence(
-    public: Option<&ne_protocol::grpc::runtime::v1::PublicAttestationEvidence>,
-    legacy: Option<&ne_protocol::grpc::runtime::v1::AttestationEvidence>,
-) -> Result<()> {
-    for line in attestation_evidence_lines(public, legacy)? {
-        println!("{line}");
+fn render_attestation_evidence(
+    response: &ne_protocol::grpc::runtime::v1::GetAttestationEvidenceResponse,
+    output: cli::EvidenceOutput,
+) -> Result<String> {
+    match output {
+        cli::EvidenceOutput::Summary => {
+            let lines = attestation_evidence_lines(
+                response.public_evidence.as_ref(),
+                legacy_attestation_evidence(response),
+            )?;
+            Ok(format!("{}\n", lines.join("\n")))
+        }
+        cli::EvidenceOutput::Json => {
+            let public = response.public_evidence.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime did not return versioned public evidence; upgrade the runtime before exporting JSON"
+                )
+            })?;
+            let public = ne_protocol::PublicAttestationEvidence::try_from(public.clone())
+                .context("invalid public attestation evidence returned by runtime")?;
+            Ok(format!("{}\n", serde_json::to_string_pretty(&public)?))
+        }
     }
-    Ok(())
 }
 
 fn attestation_evidence_lines(
@@ -455,6 +489,94 @@ fn attestation_evidence_lines(
         ]);
     }
     Ok(vec!["(no evidence returned)".to_string()])
+}
+
+fn render_runtime_capabilities(
+    response: &ne_protocol::grpc::runtime::v1::GetRuntimeCapabilitiesResponse,
+) -> Result<String> {
+    use ne_protocol::grpc::runtime::v1 as pb;
+    use ne_protocol::profile::{
+        AttestationBackend, ExecutionBackend, ExecutionProfile, RuntimeCapabilitiesInfo,
+        WorkspaceOperation,
+    };
+
+    let execution_profile = match pb::ExecutionProfile::try_from(response.execution_profile) {
+        Ok(pb::ExecutionProfile::Standard) => ExecutionProfile::Standard,
+        Ok(pb::ExecutionProfile::ConfidentialAzure) => ExecutionProfile::ConfidentialAzure,
+        Ok(pb::ExecutionProfile::Unspecified) | Err(_) => {
+            anyhow::bail!(
+                "runtime returned invalid execution profile value {}",
+                response.execution_profile
+            )
+        }
+    };
+    let execution_backend = match pb::ExecutionBackend::try_from(response.execution_backend) {
+        Ok(pb::ExecutionBackend::Firecracker) => ExecutionBackend::Firecracker,
+        Ok(pb::ExecutionBackend::OpenShell) => ExecutionBackend::OpenShell,
+        Ok(pb::ExecutionBackend::Unspecified) | Err(_) => {
+            anyhow::bail!(
+                "runtime returned invalid execution backend value {}",
+                response.execution_backend
+            )
+        }
+    };
+    let attestation_backend = match pb::AttestationBackend::try_from(response.attestation_backend) {
+        Ok(pb::AttestationBackend::Software) => AttestationBackend::Software,
+        Ok(pb::AttestationBackend::SevSnpDirect) => AttestationBackend::SevSnpDirect,
+        Ok(pb::AttestationBackend::SevSnpAzure) => AttestationBackend::SevSnpAzure,
+        Ok(pb::AttestationBackend::Unspecified) | Err(_) => {
+            anyhow::bail!(
+                "runtime returned invalid attestation backend value {}",
+                response.attestation_backend
+            )
+        }
+    };
+    let supported_operations = response
+        .supported_operations
+        .iter()
+        .map(|value| match pb::WorkspaceOperation::try_from(*value) {
+            Ok(pb::WorkspaceOperation::Create) => Ok(WorkspaceOperation::Create),
+            Ok(pb::WorkspaceOperation::Destroy) => Ok(WorkspaceOperation::Destroy),
+            Ok(pb::WorkspaceOperation::Execute) => Ok(WorkspaceOperation::Execute),
+            Ok(pb::WorkspaceOperation::WriteFile) => Ok(WorkspaceOperation::WriteFile),
+            Ok(pb::WorkspaceOperation::ReadFile) => Ok(WorkspaceOperation::ReadFile),
+            Ok(pb::WorkspaceOperation::Pause) => Ok(WorkspaceOperation::Pause),
+            Ok(pb::WorkspaceOperation::Resume) => Ok(WorkspaceOperation::Resume),
+            Ok(pb::WorkspaceOperation::Snapshot) => Ok(WorkspaceOperation::Snapshot),
+            Ok(pb::WorkspaceOperation::Restore) => Ok(WorkspaceOperation::Restore),
+            Ok(pb::WorkspaceOperation::Fork) => Ok(WorkspaceOperation::Fork),
+            Ok(pb::WorkspaceOperation::WarmPool) => Ok(WorkspaceOperation::WarmPool),
+            Ok(pb::WorkspaceOperation::Ingress) => Ok(WorkspaceOperation::Ingress),
+            Ok(pb::WorkspaceOperation::Attest) => Ok(WorkspaceOperation::Attest),
+            Ok(pb::WorkspaceOperation::Unspecified) | Err(_) => {
+                Err(anyhow::anyhow!("invalid workspace operation value {value}"))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let capabilities = RuntimeCapabilitiesInfo {
+        runtime_version: response.runtime_version.clone(),
+        execution_profile,
+        execution_backend,
+        attestation_backend,
+        supported_operations,
+        hard_workspace_capacity: response.hard_workspace_capacity,
+        confidential_snapshot_supported: response.confidential_snapshot_supported,
+        evidence_schema_version: response.evidence_schema_version,
+    };
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&capabilities)?
+    ))
+}
+
+#[allow(clippy::print_stdout)]
+fn write_cli_output(body: &str, out: Option<&std::path::Path>) -> Result<()> {
+    if let Some(path) = out {
+        std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+    } else {
+        print!("{body}");
+    }
+    Ok(())
 }
 
 #[allow(deprecated)]
@@ -520,6 +642,12 @@ fn init_tracing_stderr() -> Result<()> {
 #[cfg(test)]
 mod attestation_output_tests {
     use super::*;
+    use crate::cli::EvidenceOutput;
+    use base64::Engine as _;
+    use ed25519_dalek::SigningKey;
+    use ne_attestation::{
+        AttestationProvider as _, EvidenceRequest, Measurement, Nonce, SoftwareProvider,
+    };
     use ne_protocol::grpc::runtime::v1 as pb;
 
     fn public_software_evidence() -> pb::PublicAttestationEvidence {
@@ -585,5 +713,151 @@ mod attestation_output_tests {
             lines[2],
             format!("measurement: {}", hex::encode([0x66; 32]))
         );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn attestation_json_output_preserves_complete_azure_proof() {
+        let response = pb::GetAttestationEvidenceResponse {
+            evidence: None,
+            public_evidence: Some(pb::PublicAttestationEvidence {
+                schema_version: 1,
+                provider: pb::AttestationProvider::SevSnpAzure as i32,
+                workspace_id: "ws-azure".into(),
+                workspace_measurement: vec![0x11; 32],
+                nonce: vec![0x22; 16],
+                issued_at: 1_700_000_013,
+                report_data: vec![0x33],
+                proof: Some(pb::public_attestation_evidence::Proof::SevSnpAzure(
+                    pb::SevSnpAzureProof {
+                        report: vec![1],
+                        vcek_cert_chain: vec![2],
+                        var_data: vec![3],
+                        ak_pub_tpm2b: vec![4],
+                        quote_msg: vec![5],
+                        quote_sig: vec![6],
+                    },
+                )),
+            }),
+        };
+
+        let body =
+            render_attestation_evidence(&response, EvidenceOutput::Json).expect("render JSON");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(json["provider"], "sev_snp_azure");
+        assert_eq!(json["proof"]["proof_type"], "sev_snp_azure");
+        assert_eq!(
+            json["proof"]["var_data"],
+            base64::prelude::BASE64_STANDARD.encode([3])
+        );
+        assert_eq!(
+            json["proof"]["ak_pub_tpm2b"],
+            base64::prelude::BASE64_STANDARD.encode([4])
+        );
+        assert_eq!(
+            json["proof"]["quote_msg"],
+            base64::prelude::BASE64_STANDARD.encode([5])
+        );
+        assert_eq!(
+            json["proof"]["quote_sig"],
+            base64::prelude::BASE64_STANDARD.encode([6])
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn attestation_json_output_requires_versioned_public_evidence() {
+        let response = pb::GetAttestationEvidenceResponse {
+            evidence: Some(legacy_evidence()),
+            public_evidence: None,
+        };
+
+        let error = render_attestation_evidence(&response, EvidenceOutput::Json)
+            .expect_err("legacy envelope is incomplete for JSON export");
+        assert!(error.to_string().contains("versioned public evidence"));
+    }
+
+    #[test]
+    fn capabilities_json_uses_stable_public_names() {
+        let response = pb::GetRuntimeCapabilitiesResponse {
+            runtime_version: "0.2.0".into(),
+            execution_profile: pb::ExecutionProfile::ConfidentialAzure as i32,
+            execution_backend: pb::ExecutionBackend::OpenShell as i32,
+            attestation_backend: pb::AttestationBackend::SevSnpAzure as i32,
+            supported_operations: vec![
+                pb::WorkspaceOperation::Create as i32,
+                pb::WorkspaceOperation::Attest as i32,
+            ],
+            hard_workspace_capacity: Some(1),
+            confidential_snapshot_supported: false,
+            evidence_schema_version: 1,
+        };
+
+        let body = render_runtime_capabilities(&response).expect("render capabilities");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(json["execution_profile"], "confidential-azure");
+        assert_eq!(json["execution_backend"], "open_shell");
+        assert_eq!(json["attestation_backend"], "sev_snp_azure");
+        assert_eq!(
+            json["supported_operations"],
+            serde_json::json!(["create", "attest"])
+        );
+        assert_eq!(json["hard_workspace_capacity"], 1);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn exported_json_verifies_offline() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time")
+            .as_secs();
+        let now = i64::try_from(now).expect("timestamp fits i64");
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let signer = signing_key.verifying_key();
+        let domain = SoftwareProvider::new(signing_key)
+            .generate(
+                &EvidenceRequest {
+                    workspace_id: "secret-1".into(),
+                    measurement: Measurement([0x11; 32]),
+                    nonce: Nonce::new(vec![0xaa; 16]).expect("valid nonce"),
+                },
+                now,
+            )
+            .expect("generate evidence");
+        let public =
+            ne_protocol::PublicAttestationEvidence::try_from(domain).expect("domain -> public");
+        let response = pb::GetAttestationEvidenceResponse {
+            evidence: None,
+            public_evidence: Some(
+                pb::PublicAttestationEvidence::try_from(public).expect("public -> protobuf"),
+            ),
+        };
+        let body =
+            render_attestation_evidence(&response, EvidenceOutput::Json).expect("render JSON");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let evidence_path = dir.path().join("evidence.json");
+        let policy_path = dir.path().join("policy.json");
+        write_cli_output(&body, Some(&evidence_path)).expect("write evidence");
+        std::fs::write(
+            &policy_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "accepted_providers": ["software"],
+                "expected_workspace_id": "secret-1",
+                "expected_nonce_hex": "aa".repeat(16),
+                "freshness_seconds": 300,
+                "expected_workspace_measurement_hex": null,
+                "expected_host_cvm_measurement_hex": null,
+                "expected_signer_b64": base64::prelude::BASE64_STANDARD.encode(signer.as_bytes()),
+                "min_tcb": 0,
+                "guest_policy": 0
+            }))
+            .expect("policy JSON"),
+        )
+        .expect("write policy");
+
+        ne::attestation_cli::verify_files(&evidence_path, &policy_path)
+            .expect("exported evidence verifies offline");
     }
 }

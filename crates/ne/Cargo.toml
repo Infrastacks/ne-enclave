@@ -34,12 +34,15 @@ ne-supervisor = { path = "../ne-supervisor" }
 ne-dns-filter = { path = "../ne-dns-filter" }
 ne-privacy-router = { path = "../ne-privacy-router" }
 ne-protocol = { path = "../ne-protocol", features = ["grpc"] }
+ne-attestation = { path = "../ne-attestation" }
 tonic = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 nix = { workspace = true }
 rand = { workspace = true }
@@ -54,6 +57,5 @@ ulid = { workspace = true }
 [dev-dependencies]
 ne-supervisor = { path = "../ne-supervisor" }
 ne-protocol = { path = "../ne-protocol" }
-ed25519-dalek = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
