@@ -14,6 +14,7 @@
     "checksums": "SHA256SUMS",
     "installer": "install.sh"
   },
+  "resolved_sha256": {},
   "openshell": {
     "repository": "https://github.com/Infrastacks/OpenShell.git",
     "commit": "70328542941838612a75b62c3cc365e01594c0c3"

@@ -1,21 +1,9 @@
-# Release pipeline — NeuronEdge Enclave runtime + SDKs.
+# Release pipeline — one immutable, signed NeuronEdge Enclave candidate bundle.
 #
-# Triggered by a `v*` tag push (e.g. `git tag v0.1.1 && git push origin v0.1.1`).
-# Produces, from one tag:
-#   1. A GitHub Release carrying the signed static musl `nee` binary + SHA256SUMS
-#      (what `deploy/install.sh` downloads + verifies).
-#   2. `@neuronedge/enclave` published to npm.
-#   3. `neuronedge-enclave` published to PyPI.
-#
-# Prerequisites (operator-owned, one-time):
-#   - GitHub secrets: NPM_TOKEN, PYPI_TOKEN.
-#   - The version sources bumped to match the tag BEFORE tagging
-#     (Cargo.toml workspace version, sdk/typescript/package.json,
-#     sdk/python/pyproject.toml + src/ne/__init__.py). version-check enforces this.
-#
-# Design: gauntlet gates everything; the GitHub Release (binary) is the
-# always-ships artifact; npm + PyPI are independent jobs so one registry
-# outage cannot block the other or the binary release.
+# The candidate job builds every publishable component once, resolves the
+# component manifest, generates checksums/SBOM/provenance, signs the bundle,
+# verifies it, and uploads the complete staging directory. Publication and
+# environment gates may only consume that artifact; they never rebuild it.
 name: Release
 
 on:
@@ -24,14 +12,13 @@ on:
       - 'v*'
 
 permissions:
-  contents: write # softprops/action-gh-release creates the Release + assets.
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # ---- Gate: never release a red tree. Mirrors ci.yml's lint + test ----
   gauntlet:
     name: pre-release gauntlet
     runs-on: ubuntu-24.04
@@ -39,6 +26,10 @@ jobs:
       - uses: actions/checkout@v6
       - name: release component contract
         run: sh deploy/test-release-contract.sh
+      - name: Check advisory exception ownership and expiry
+        run: sh scripts/check-advisory-exceptions.sh deny.toml
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
@@ -50,7 +41,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace --lib (excludes ne-e2e; needs KVM host)
         run: cargo test --workspace --lib
-      # TypeScript SDK gate.
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -69,7 +59,6 @@ jobs:
         working-directory: sdk/typescript
         run: npm run test
 
-  # ---- Version consistency: tag must match all three manifest sources ----
   version-check:
     name: version consistency
     runs-on: ubuntu-24.04
@@ -79,7 +68,6 @@ jobs:
       - uses: actions/checkout@v6
       - id: ver
         run: |
-          # Strip the leading `v` from the tag (v0.1.1 -> 0.1.1).
           v="${GITHUB_REF_NAME#v}"
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Release version: $v"
@@ -100,7 +88,8 @@ jobs:
             "__init__.py:$py_init_v" \
             "release-components.json:$contract_v"
           do
-            name="${src%%:*}"; val="${src##*:}"
+            name="${src%%:*}"
+            val="${src##*:}"
             if [ "$val" != "$VERSION" ]; then
               echo "::error::$name has version '$val' but tag is '$VERSION'. Bump all sources before tagging."
               exit 1
@@ -108,11 +97,15 @@ jobs:
             echo "$name -> $val (ok)"
           done
 
-  # ---- Build the static musl binary + checksums (release artifact) ----
-  binary:
-    name: build musl binary
+  candidate:
+    name: build and sign immutable candidate
     runs-on: ubuntu-24.04
     needs: [gauntlet, version-check]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -120,8 +113,19 @@ jobs:
           toolchain: "1.95.0"
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - name: Install musl tooling
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          python -m pip install --upgrade build
       - name: Build nee with all supported execution profiles
         run: >-
           cargo build --release
@@ -138,7 +142,7 @@ jobs:
             --release \
             --target x86_64-unknown-linux-musl \
             -p openshell-sandbox
-      - name: Stage release asset + checksums
+      - name: Stage runtime and install assets
         run: |
           set -euo pipefail
           mkdir -p staging
@@ -148,19 +152,22 @@ jobs:
             staging/openshell-sandbox-x86_64-unknown-linux-musl
           cp crates/ne/templates/openshell-policy.rego staging/openshell-policy.rego
           cp crates/ne/templates/openshell-policy.yaml staging/openshell-policy.yaml
-          # Stage install.sh as a release asset so the curl one-liner
-          # (curl .../releases/latest/download/install.sh) resolves.
           cp deploy/install.sh staging/install.sh
-          (
-            cd staging
-            sha256sum \
-              nee-x86_64-unknown-linux-musl \
-              openshell-sandbox-x86_64-unknown-linux-musl \
-              openshell-policy.rego \
-              openshell-policy.yaml \
-              > SHA256SUMS
-          )
-          cat staging/SHA256SUMS
+          cp deploy/release-components.json staging/release-components.json
+      - name: Build TypeScript candidate package
+        working-directory: sdk/typescript
+        run: |
+          npm ci
+          npm run build
+          npm pack --pack-destination ../../staging
+      - name: Build Python candidate packages
+        working-directory: sdk/python
+        run: python -m build --outdir ../../staging
+      - name: Assert candidate SDK filenames
+        run: |
+          test -f staging/neuronedge-enclave-0.2.0.tgz
+          test -f staging/neuronedge_enclave-0.2.0-py3-none-any.whl
+          test -f staging/neuronedge_enclave-0.2.0.tar.gz
       - name: Verify static linkage
         run: |
           set -euo pipefail
@@ -178,91 +185,153 @@ jobs:
                 ;;
             esac
           done
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: staging
+          format: spdx-json
+          output-file: staging/ne-enclave.spdx.json
+          artifact-name: ne-enclave.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Resolve release manifest and checksums
+        run: |
+          set -euo pipefail
+          for key in $(jq -r '
+            .assets
+            | keys[]
+            | select(. != "checksums" and . != "provenance")
+          ' staging/release-components.json); do
+            file="$(jq -r --arg key "$key" \
+              '.assets[$key]' staging/release-components.json)"
+            test -f "staging/$file"
+            digest="$(sha256sum "staging/$file" | awk '{print $1}')"
+            tmp="$(mktemp)"
+            jq --arg key "$key" --arg digest "$digest" \
+              '.resolved_sha256[$key] = $digest' \
+              staging/release-components.json > "$tmp"
+            mv "$tmp" staging/release-components.json
+          done
+          for file in staging/*; do
+            case "$file" in
+              */SHA256SUMS|*.sigstore.json) continue ;;
+            esac
+            sha256sum "$file"
+          done | sed 's#staging/##' | sort -k2 > staging/SHA256SUMS
+          cat staging/SHA256SUMS
+      - name: Generate build provenance
+        id: provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: staging/SHA256SUMS
+      - name: Stage provenance bundle
+        run: >-
+          cp '${{ steps.provenance.outputs.bundle-path }}'
+          staging/ne-enclave.provenance.sigstore.json
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+      - name: Sign every ordinary candidate component
+        run: |
+          set -euo pipefail
+          for file in staging/*; do
+            case "$file" in
+              *.sigstore.json) continue ;;
+            esac
+            cosign sign-blob --yes --bundle "${file}.sigstore.json" "$file"
+          done
+      - name: Verify candidate signatures and provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          identity='https://github\.com/Infrastacks/ne-enclave/\.github/workflows/release\.yml@refs/tags/'
+          issuer='https://token.actions.githubusercontent.com'
+          for file in staging/*; do
+            case "$file" in
+              *.sigstore.json) continue ;;
+            esac
+            cosign verify-blob "$file" \
+              --bundle "${file}.sigstore.json" \
+              --certificate-identity-regexp "^${identity}v[0-9].*$" \
+              --certificate-oidc-issuer "$issuer"
+          done
+          while read -r _digest file; do
+            gh attestation verify "staging/$file" \
+              --repo Infrastacks/ne-enclave \
+              --bundle staging/ne-enclave.provenance.sigstore.json \
+              --signer-workflow Infrastacks/ne-enclave/.github/workflows/release.yml \
+              --source-ref "$GITHUB_REF"
+          done < staging/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: ne-release-assets
-          path: |
-            staging/nee-x86_64-unknown-linux-musl
-            staging/openshell-sandbox-x86_64-unknown-linux-musl
-            staging/openshell-policy.rego
-            staging/openshell-policy.yaml
-            staging/SHA256SUMS
-            staging/install.sh
+          path: staging/
+          if-no-files-found: error
 
-  # ---- Create the GitHub Release + attach the binary + checksums ----
   github-release:
     name: GitHub Release
     runs-on: ubuntu-24.04
-    needs: [binary, version-check]
+    needs: [candidate, version-check]
+    permissions:
+      actions: read
+      contents: write
     steps:
-      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v5
         with:
           name: ne-release-assets
           path: staging
-      - name: Publish Release
+      - name: Publish verified candidate
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: |
-            staging/nee-x86_64-unknown-linux-musl
-            staging/openshell-sandbox-x86_64-unknown-linux-musl
-            staging/openshell-policy.rego
-            staging/openshell-policy.yaml
-            staging/SHA256SUMS
-            staging/install.sh
+          files: staging/*
 
-  # ---- Publish @neuronedge/enclave to npm ----
-  # Skipped until NPM_TOKEN is set on the repo. Set the secret and the next
-  # tag will publish; until then the binary + GitHub Release still ship.
   npm:
     name: npm publish
     runs-on: ubuntu-24.04
-    needs: [gauntlet, version-check]
+    needs: [candidate, version-check]
     if: vars.ENABLE_SDK_PUBLISH == 'true'
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: ne-release-assets
+          path: staging
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
           registry-url: https://registry.npmjs.org
-          cache: 'npm'
-          cache-dependency-path: sdk/typescript/package-lock.json
-      - name: npm ci
-        working-directory: sdk/typescript
-        run: npm ci
-      - name: npm run build
-        working-directory: sdk/typescript
-        run: npm run build
-      - name: npm publish
-        working-directory: sdk/typescript
+      - name: Publish verified TypeScript package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: |
+          npm publish staging/neuronedge-enclave-0.2.0.tgz --access public
 
-  # ---- Publish neuronedge-enclave to PyPI ----
-  # Skipped until PYPI_TOKEN is set on the repo (gated by the same var as npm).
   pypi:
     name: PyPI publish
     runs-on: ubuntu-24.04
-    needs: [gauntlet, version-check]
+    needs: [candidate, version-check]
     if: vars.ENABLE_SDK_PUBLISH == 'true'
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: ne-release-assets
+          path: staging
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install build backend
-        working-directory: sdk/python
-        run: pip install --upgrade build twine
-      - name: Build sdist + wheel
-        working-directory: sdk/python
-        run: rm -rf dist && python -m build
-      - name: Publish to PyPI
-        working-directory: sdk/python
+      - name: Install upload client
+        run: python -m pip install --upgrade twine
+      - name: Publish verified Python packages
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: twine upload dist/*
+        run: |
+          twine upload staging/neuronedge_enclave-0.2.0-py3-none-any.whl staging/neuronedge_enclave-0.2.0.tar.gz

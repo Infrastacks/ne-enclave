@@ -34,6 +34,8 @@ jobs:
         # needed — passing `check` there would make it `cargo deny check check`.
         # cargo-deny reads Cargo.lock metadata only (no compilation), so the
         # pinned toolchain is moot for this job.
+      - name: Check advisory exception ownership and expiry
+        run: sh scripts/check-advisory-exceptions.sh deny.toml
 
   lint:
     name: fmt + clippy
