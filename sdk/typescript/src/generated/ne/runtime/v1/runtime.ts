@@ -21,6 +21,279 @@ import {
 
 export const protobufPackage = "ne.runtime.v1";
 
+export enum ExecutionProfile {
+  EXECUTION_PROFILE_UNSPECIFIED = 0,
+  EXECUTION_PROFILE_STANDARD = 1,
+  EXECUTION_PROFILE_CONFIDENTIAL_AZURE = 2,
+  UNRECOGNIZED = -1,
+}
+
+export function executionProfileFromJSON(object: any): ExecutionProfile {
+  switch (object) {
+    case 0:
+    case "EXECUTION_PROFILE_UNSPECIFIED":
+      return ExecutionProfile.EXECUTION_PROFILE_UNSPECIFIED;
+    case 1:
+    case "EXECUTION_PROFILE_STANDARD":
+      return ExecutionProfile.EXECUTION_PROFILE_STANDARD;
+    case 2:
+    case "EXECUTION_PROFILE_CONFIDENTIAL_AZURE":
+      return ExecutionProfile.EXECUTION_PROFILE_CONFIDENTIAL_AZURE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return ExecutionProfile.UNRECOGNIZED;
+  }
+}
+
+export function executionProfileToJSON(object: ExecutionProfile): string {
+  switch (object) {
+    case ExecutionProfile.EXECUTION_PROFILE_UNSPECIFIED:
+      return "EXECUTION_PROFILE_UNSPECIFIED";
+    case ExecutionProfile.EXECUTION_PROFILE_STANDARD:
+      return "EXECUTION_PROFILE_STANDARD";
+    case ExecutionProfile.EXECUTION_PROFILE_CONFIDENTIAL_AZURE:
+      return "EXECUTION_PROFILE_CONFIDENTIAL_AZURE";
+    case ExecutionProfile.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum ExecutionBackend {
+  EXECUTION_BACKEND_UNSPECIFIED = 0,
+  EXECUTION_BACKEND_FIRECRACKER = 1,
+  EXECUTION_BACKEND_OPEN_SHELL = 2,
+  UNRECOGNIZED = -1,
+}
+
+export function executionBackendFromJSON(object: any): ExecutionBackend {
+  switch (object) {
+    case 0:
+    case "EXECUTION_BACKEND_UNSPECIFIED":
+      return ExecutionBackend.EXECUTION_BACKEND_UNSPECIFIED;
+    case 1:
+    case "EXECUTION_BACKEND_FIRECRACKER":
+      return ExecutionBackend.EXECUTION_BACKEND_FIRECRACKER;
+    case 2:
+    case "EXECUTION_BACKEND_OPEN_SHELL":
+      return ExecutionBackend.EXECUTION_BACKEND_OPEN_SHELL;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return ExecutionBackend.UNRECOGNIZED;
+  }
+}
+
+export function executionBackendToJSON(object: ExecutionBackend): string {
+  switch (object) {
+    case ExecutionBackend.EXECUTION_BACKEND_UNSPECIFIED:
+      return "EXECUTION_BACKEND_UNSPECIFIED";
+    case ExecutionBackend.EXECUTION_BACKEND_FIRECRACKER:
+      return "EXECUTION_BACKEND_FIRECRACKER";
+    case ExecutionBackend.EXECUTION_BACKEND_OPEN_SHELL:
+      return "EXECUTION_BACKEND_OPEN_SHELL";
+    case ExecutionBackend.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum AttestationBackend {
+  ATTESTATION_BACKEND_UNSPECIFIED = 0,
+  ATTESTATION_BACKEND_SOFTWARE = 1,
+  ATTESTATION_BACKEND_SEV_SNP_DIRECT = 2,
+  ATTESTATION_BACKEND_SEV_SNP_AZURE = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function attestationBackendFromJSON(object: any): AttestationBackend {
+  switch (object) {
+    case 0:
+    case "ATTESTATION_BACKEND_UNSPECIFIED":
+      return AttestationBackend.ATTESTATION_BACKEND_UNSPECIFIED;
+    case 1:
+    case "ATTESTATION_BACKEND_SOFTWARE":
+      return AttestationBackend.ATTESTATION_BACKEND_SOFTWARE;
+    case 2:
+    case "ATTESTATION_BACKEND_SEV_SNP_DIRECT":
+      return AttestationBackend.ATTESTATION_BACKEND_SEV_SNP_DIRECT;
+    case 3:
+    case "ATTESTATION_BACKEND_SEV_SNP_AZURE":
+      return AttestationBackend.ATTESTATION_BACKEND_SEV_SNP_AZURE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return AttestationBackend.UNRECOGNIZED;
+  }
+}
+
+export function attestationBackendToJSON(object: AttestationBackend): string {
+  switch (object) {
+    case AttestationBackend.ATTESTATION_BACKEND_UNSPECIFIED:
+      return "ATTESTATION_BACKEND_UNSPECIFIED";
+    case AttestationBackend.ATTESTATION_BACKEND_SOFTWARE:
+      return "ATTESTATION_BACKEND_SOFTWARE";
+    case AttestationBackend.ATTESTATION_BACKEND_SEV_SNP_DIRECT:
+      return "ATTESTATION_BACKEND_SEV_SNP_DIRECT";
+    case AttestationBackend.ATTESTATION_BACKEND_SEV_SNP_AZURE:
+      return "ATTESTATION_BACKEND_SEV_SNP_AZURE";
+    case AttestationBackend.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum WorkspaceOperation {
+  WORKSPACE_OPERATION_UNSPECIFIED = 0,
+  WORKSPACE_OPERATION_CREATE = 1,
+  WORKSPACE_OPERATION_DESTROY = 2,
+  WORKSPACE_OPERATION_EXECUTE = 3,
+  WORKSPACE_OPERATION_WRITE_FILE = 4,
+  WORKSPACE_OPERATION_READ_FILE = 5,
+  WORKSPACE_OPERATION_PAUSE = 6,
+  WORKSPACE_OPERATION_RESUME = 7,
+  WORKSPACE_OPERATION_SNAPSHOT = 8,
+  WORKSPACE_OPERATION_RESTORE = 9,
+  WORKSPACE_OPERATION_FORK = 10,
+  WORKSPACE_OPERATION_WARM_POOL = 11,
+  WORKSPACE_OPERATION_INGRESS = 12,
+  WORKSPACE_OPERATION_ATTEST = 13,
+  UNRECOGNIZED = -1,
+}
+
+export function workspaceOperationFromJSON(object: any): WorkspaceOperation {
+  switch (object) {
+    case 0:
+    case "WORKSPACE_OPERATION_UNSPECIFIED":
+      return WorkspaceOperation.WORKSPACE_OPERATION_UNSPECIFIED;
+    case 1:
+    case "WORKSPACE_OPERATION_CREATE":
+      return WorkspaceOperation.WORKSPACE_OPERATION_CREATE;
+    case 2:
+    case "WORKSPACE_OPERATION_DESTROY":
+      return WorkspaceOperation.WORKSPACE_OPERATION_DESTROY;
+    case 3:
+    case "WORKSPACE_OPERATION_EXECUTE":
+      return WorkspaceOperation.WORKSPACE_OPERATION_EXECUTE;
+    case 4:
+    case "WORKSPACE_OPERATION_WRITE_FILE":
+      return WorkspaceOperation.WORKSPACE_OPERATION_WRITE_FILE;
+    case 5:
+    case "WORKSPACE_OPERATION_READ_FILE":
+      return WorkspaceOperation.WORKSPACE_OPERATION_READ_FILE;
+    case 6:
+    case "WORKSPACE_OPERATION_PAUSE":
+      return WorkspaceOperation.WORKSPACE_OPERATION_PAUSE;
+    case 7:
+    case "WORKSPACE_OPERATION_RESUME":
+      return WorkspaceOperation.WORKSPACE_OPERATION_RESUME;
+    case 8:
+    case "WORKSPACE_OPERATION_SNAPSHOT":
+      return WorkspaceOperation.WORKSPACE_OPERATION_SNAPSHOT;
+    case 9:
+    case "WORKSPACE_OPERATION_RESTORE":
+      return WorkspaceOperation.WORKSPACE_OPERATION_RESTORE;
+    case 10:
+    case "WORKSPACE_OPERATION_FORK":
+      return WorkspaceOperation.WORKSPACE_OPERATION_FORK;
+    case 11:
+    case "WORKSPACE_OPERATION_WARM_POOL":
+      return WorkspaceOperation.WORKSPACE_OPERATION_WARM_POOL;
+    case 12:
+    case "WORKSPACE_OPERATION_INGRESS":
+      return WorkspaceOperation.WORKSPACE_OPERATION_INGRESS;
+    case 13:
+    case "WORKSPACE_OPERATION_ATTEST":
+      return WorkspaceOperation.WORKSPACE_OPERATION_ATTEST;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return WorkspaceOperation.UNRECOGNIZED;
+  }
+}
+
+export function workspaceOperationToJSON(object: WorkspaceOperation): string {
+  switch (object) {
+    case WorkspaceOperation.WORKSPACE_OPERATION_UNSPECIFIED:
+      return "WORKSPACE_OPERATION_UNSPECIFIED";
+    case WorkspaceOperation.WORKSPACE_OPERATION_CREATE:
+      return "WORKSPACE_OPERATION_CREATE";
+    case WorkspaceOperation.WORKSPACE_OPERATION_DESTROY:
+      return "WORKSPACE_OPERATION_DESTROY";
+    case WorkspaceOperation.WORKSPACE_OPERATION_EXECUTE:
+      return "WORKSPACE_OPERATION_EXECUTE";
+    case WorkspaceOperation.WORKSPACE_OPERATION_WRITE_FILE:
+      return "WORKSPACE_OPERATION_WRITE_FILE";
+    case WorkspaceOperation.WORKSPACE_OPERATION_READ_FILE:
+      return "WORKSPACE_OPERATION_READ_FILE";
+    case WorkspaceOperation.WORKSPACE_OPERATION_PAUSE:
+      return "WORKSPACE_OPERATION_PAUSE";
+    case WorkspaceOperation.WORKSPACE_OPERATION_RESUME:
+      return "WORKSPACE_OPERATION_RESUME";
+    case WorkspaceOperation.WORKSPACE_OPERATION_SNAPSHOT:
+      return "WORKSPACE_OPERATION_SNAPSHOT";
+    case WorkspaceOperation.WORKSPACE_OPERATION_RESTORE:
+      return "WORKSPACE_OPERATION_RESTORE";
+    case WorkspaceOperation.WORKSPACE_OPERATION_FORK:
+      return "WORKSPACE_OPERATION_FORK";
+    case WorkspaceOperation.WORKSPACE_OPERATION_WARM_POOL:
+      return "WORKSPACE_OPERATION_WARM_POOL";
+    case WorkspaceOperation.WORKSPACE_OPERATION_INGRESS:
+      return "WORKSPACE_OPERATION_INGRESS";
+    case WorkspaceOperation.WORKSPACE_OPERATION_ATTEST:
+      return "WORKSPACE_OPERATION_ATTEST";
+    case WorkspaceOperation.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum AttestationProvider {
+  ATTESTATION_PROVIDER_UNSPECIFIED = 0,
+  ATTESTATION_PROVIDER_SOFTWARE = 1,
+  ATTESTATION_PROVIDER_SEV_SNP_DIRECT = 2,
+  ATTESTATION_PROVIDER_SEV_SNP_AZURE = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function attestationProviderFromJSON(object: any): AttestationProvider {
+  switch (object) {
+    case 0:
+    case "ATTESTATION_PROVIDER_UNSPECIFIED":
+      return AttestationProvider.ATTESTATION_PROVIDER_UNSPECIFIED;
+    case 1:
+    case "ATTESTATION_PROVIDER_SOFTWARE":
+      return AttestationProvider.ATTESTATION_PROVIDER_SOFTWARE;
+    case 2:
+    case "ATTESTATION_PROVIDER_SEV_SNP_DIRECT":
+      return AttestationProvider.ATTESTATION_PROVIDER_SEV_SNP_DIRECT;
+    case 3:
+    case "ATTESTATION_PROVIDER_SEV_SNP_AZURE":
+      return AttestationProvider.ATTESTATION_PROVIDER_SEV_SNP_AZURE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return AttestationProvider.UNRECOGNIZED;
+  }
+}
+
+export function attestationProviderToJSON(object: AttestationProvider): string {
+  switch (object) {
+    case AttestationProvider.ATTESTATION_PROVIDER_UNSPECIFIED:
+      return "ATTESTATION_PROVIDER_UNSPECIFIED";
+    case AttestationProvider.ATTESTATION_PROVIDER_SOFTWARE:
+      return "ATTESTATION_PROVIDER_SOFTWARE";
+    case AttestationProvider.ATTESTATION_PROVIDER_SEV_SNP_DIRECT:
+      return "ATTESTATION_PROVIDER_SEV_SNP_DIRECT";
+    case AttestationProvider.ATTESTATION_PROVIDER_SEV_SNP_AZURE:
+      return "ATTESTATION_PROVIDER_SEV_SNP_AZURE";
+    case AttestationProvider.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 export interface PingRequest {
 }
 
@@ -33,6 +306,20 @@ export interface PingResponse {
   supervisorVersion: string;
   /** Milliseconds since the supervisor began accepting connections. */
   supervisorUptimeMs: number;
+}
+
+export interface GetRuntimeCapabilitiesRequest {
+}
+
+export interface GetRuntimeCapabilitiesResponse {
+  runtimeVersion: string;
+  executionProfile: ExecutionProfile;
+  executionBackend: ExecutionBackend;
+  attestationBackend: AttestationBackend;
+  supportedOperations: WorkspaceOperation[];
+  hardWorkspaceCapacity?: number | undefined;
+  confidentialSnapshotSupported: boolean;
+  evidenceSchemaVersion: number;
 }
 
 export interface CreateWorkspaceRequest {
@@ -48,7 +335,10 @@ export interface CreateWorkspaceRequest {
   rootfsSha256: string;
   /** Whether the rootfs should be mounted read-only inside the guest. */
   rootfsReadOnly: boolean;
-  /** Guest vCPU count. Protobuf has no u8 — runtime validates 1..=255. */
+  /**
+   * Guest vCPU count. Standard validates 1..=255; confidential-azure
+   * requires 0 because capacity belongs to the enclosing CVM.
+   */
   vcpuCount: number;
   /** Guest memory in MiB. */
   memSizeMib: number;
@@ -163,14 +453,14 @@ export interface HeaderInjection {
 
 export interface CreateWorkspaceResponse {
   workspaceId: string;
-  /** PID of the jailer (effectively Firecracker's PID). */
+  /** PID of the jailer (effectively Firecracker's PID); 0 for OpenShell. */
   firecrackerPid: number;
   /**
    * Host-side absolute path to the vsock UDS the guest agent reaches
-   * through. See Firecracker's host→guest CONNECT handshake.
+   * through. Empty for the OpenShell profile.
    */
   vsockHostSocket: string;
-  /** Host-side absolute path to the jailer chroot for this workspace. */
+  /** Host-side absolute path to the jailer chroot; empty for OpenShell. */
   jailerChroot: string;
   /**
    * Network resources the supervisor provisioned, when the request
@@ -460,14 +750,21 @@ export interface GetAttestationEvidenceRequest {
 }
 
 export interface GetAttestationEvidenceResponse {
+  /**
+   * Legacy v0.1.x envelope retained at tag 1 for wire compatibility.
+   * Azure vTPM evidence cannot be represented losslessly here; use
+   * public_evidence for all new integrations.
+   *
+   * @deprecated
+   */
   evidence?: AttestationEvidence | undefined;
+  publicEvidence?: PublicAttestationEvidence | undefined;
 }
 
+/** Legacy v0.1.x attestation envelope. Do not reuse or renumber these fields. */
 export interface AttestationEvidence {
-  /** "software" (sev_snp / tdx reserved) */
   providerType: string;
   workspaceId: string;
-  /** 32 bytes */
   measurement: Uint8Array;
   nonce: Uint8Array;
   issuedAt: number;
@@ -475,15 +772,50 @@ export interface AttestationEvidence {
   proof?: AttestationProof | undefined;
 }
 
+/**
+ * Legacy v0.1.x provider proof. New proof shapes belong in
+ * PublicAttestationEvidence below.
+ */
 export interface AttestationProof {
-  /** Software proof. Hardware proof fields are reserved for later. */
   signature: Uint8Array;
-  /** 32 bytes (software) */
   signerPubkey: Uint8Array;
-  /** SEV-SNP firmware Attestation Report (provider_type "sev_snp"). */
   sevSnpReport: Uint8Array;
-  /** VCEK cert chain, DER leaf-first (sev_snp) */
   sevSnpVcekChain: Uint8Array;
+}
+
+export interface SoftwareProof {
+  signature: Uint8Array;
+  signerPubkey: Uint8Array;
+}
+
+export interface SevSnpDirectProof {
+  report: Uint8Array;
+  vcekCertChain: Uint8Array;
+}
+
+export interface SevSnpAzureProof {
+  report: Uint8Array;
+  vcekCertChain: Uint8Array;
+  varData: Uint8Array;
+  akPubTpm2b: Uint8Array;
+  quoteMsg: Uint8Array;
+  quoteSig: Uint8Array;
+}
+
+/** Versioned, typed public evidence envelope for new SDK integrations. */
+export interface PublicAttestationEvidence {
+  schemaVersion: number;
+  provider: AttestationProvider;
+  workspaceId: string;
+  workspaceMeasurement: Uint8Array;
+  nonce: Uint8Array;
+  issuedAt: number;
+  reportData: Uint8Array;
+  proof?:
+    | { $case: "software"; software: SoftwareProof }
+    | { $case: "sevSnpDirect"; sevSnpDirect: SevSnpDirectProof }
+    | { $case: "sevSnpAzure"; sevSnpAzure: SevSnpAzureProof }
+    | undefined;
 }
 
 function createBasePingRequest(): PingRequest {
@@ -649,6 +981,276 @@ export const PingResponse: MessageFns<PingResponse> = {
     message.apiUptimeMs = object.apiUptimeMs ?? 0;
     message.supervisorVersion = object.supervisorVersion ?? "";
     message.supervisorUptimeMs = object.supervisorUptimeMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseGetRuntimeCapabilitiesRequest(): GetRuntimeCapabilitiesRequest {
+  return {};
+}
+
+export const GetRuntimeCapabilitiesRequest: MessageFns<GetRuntimeCapabilitiesRequest> = {
+  encode(_: GetRuntimeCapabilitiesRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetRuntimeCapabilitiesRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetRuntimeCapabilitiesRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): GetRuntimeCapabilitiesRequest {
+    return {};
+  },
+
+  toJSON(_: GetRuntimeCapabilitiesRequest): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<GetRuntimeCapabilitiesRequest>, I>>(base?: I): GetRuntimeCapabilitiesRequest {
+    return GetRuntimeCapabilitiesRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<GetRuntimeCapabilitiesRequest>, I>>(_: I): GetRuntimeCapabilitiesRequest {
+    const message = createBaseGetRuntimeCapabilitiesRequest();
+    return message;
+  },
+};
+
+function createBaseGetRuntimeCapabilitiesResponse(): GetRuntimeCapabilitiesResponse {
+  return {
+    runtimeVersion: "",
+    executionProfile: 0,
+    executionBackend: 0,
+    attestationBackend: 0,
+    supportedOperations: [],
+    hardWorkspaceCapacity: undefined,
+    confidentialSnapshotSupported: false,
+    evidenceSchemaVersion: 0,
+  };
+}
+
+export const GetRuntimeCapabilitiesResponse: MessageFns<GetRuntimeCapabilitiesResponse> = {
+  encode(message: GetRuntimeCapabilitiesResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.runtimeVersion !== "") {
+      writer.uint32(10).string(message.runtimeVersion);
+    }
+    if (message.executionProfile !== 0) {
+      writer.uint32(16).int32(message.executionProfile);
+    }
+    if (message.executionBackend !== 0) {
+      writer.uint32(24).int32(message.executionBackend);
+    }
+    if (message.attestationBackend !== 0) {
+      writer.uint32(32).int32(message.attestationBackend);
+    }
+    writer.uint32(42).fork();
+    for (const v of message.supportedOperations) {
+      writer.int32(v);
+    }
+    writer.join();
+    if (message.hardWorkspaceCapacity !== undefined) {
+      writer.uint32(48).uint32(message.hardWorkspaceCapacity);
+    }
+    if (message.confidentialSnapshotSupported !== false) {
+      writer.uint32(56).bool(message.confidentialSnapshotSupported);
+    }
+    if (message.evidenceSchemaVersion !== 0) {
+      writer.uint32(64).uint32(message.evidenceSchemaVersion);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetRuntimeCapabilitiesResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetRuntimeCapabilitiesResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.runtimeVersion = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.executionProfile = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.executionBackend = reader.int32() as any;
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.attestationBackend = reader.int32() as any;
+          continue;
+        }
+        case 5: {
+          if (tag === 40) {
+            message.supportedOperations.push(reader.int32() as any);
+
+            continue;
+          }
+
+          if (tag === 42) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.supportedOperations.push(reader.int32() as any);
+            }
+
+            continue;
+          }
+
+          break;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.hardWorkspaceCapacity = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.confidentialSnapshotSupported = reader.bool();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.evidenceSchemaVersion = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetRuntimeCapabilitiesResponse {
+    return {
+      runtimeVersion: isSet(object.runtimeVersion)
+        ? globalThis.String(object.runtimeVersion)
+        : isSet(object.runtime_version)
+        ? globalThis.String(object.runtime_version)
+        : "",
+      executionProfile: isSet(object.executionProfile)
+        ? executionProfileFromJSON(object.executionProfile)
+        : isSet(object.execution_profile)
+        ? executionProfileFromJSON(object.execution_profile)
+        : 0,
+      executionBackend: isSet(object.executionBackend)
+        ? executionBackendFromJSON(object.executionBackend)
+        : isSet(object.execution_backend)
+        ? executionBackendFromJSON(object.execution_backend)
+        : 0,
+      attestationBackend: isSet(object.attestationBackend)
+        ? attestationBackendFromJSON(object.attestationBackend)
+        : isSet(object.attestation_backend)
+        ? attestationBackendFromJSON(object.attestation_backend)
+        : 0,
+      supportedOperations: globalThis.Array.isArray(object?.supportedOperations)
+        ? object.supportedOperations.map((e: any) => workspaceOperationFromJSON(e))
+        : globalThis.Array.isArray(object?.supported_operations)
+        ? object.supported_operations.map((e: any) => workspaceOperationFromJSON(e))
+        : [],
+      hardWorkspaceCapacity: isSet(object.hardWorkspaceCapacity)
+        ? globalThis.Number(object.hardWorkspaceCapacity)
+        : isSet(object.hard_workspace_capacity)
+        ? globalThis.Number(object.hard_workspace_capacity)
+        : undefined,
+      confidentialSnapshotSupported: isSet(object.confidentialSnapshotSupported)
+        ? globalThis.Boolean(object.confidentialSnapshotSupported)
+        : isSet(object.confidential_snapshot_supported)
+        ? globalThis.Boolean(object.confidential_snapshot_supported)
+        : false,
+      evidenceSchemaVersion: isSet(object.evidenceSchemaVersion)
+        ? globalThis.Number(object.evidenceSchemaVersion)
+        : isSet(object.evidence_schema_version)
+        ? globalThis.Number(object.evidence_schema_version)
+        : 0,
+    };
+  },
+
+  toJSON(message: GetRuntimeCapabilitiesResponse): unknown {
+    const obj: any = {};
+    if (message.runtimeVersion !== "") {
+      obj.runtimeVersion = message.runtimeVersion;
+    }
+    if (message.executionProfile !== 0) {
+      obj.executionProfile = executionProfileToJSON(message.executionProfile);
+    }
+    if (message.executionBackend !== 0) {
+      obj.executionBackend = executionBackendToJSON(message.executionBackend);
+    }
+    if (message.attestationBackend !== 0) {
+      obj.attestationBackend = attestationBackendToJSON(message.attestationBackend);
+    }
+    if (message.supportedOperations?.length) {
+      obj.supportedOperations = message.supportedOperations.map((e) => workspaceOperationToJSON(e));
+    }
+    if (message.hardWorkspaceCapacity !== undefined) {
+      obj.hardWorkspaceCapacity = Math.round(message.hardWorkspaceCapacity);
+    }
+    if (message.confidentialSnapshotSupported !== false) {
+      obj.confidentialSnapshotSupported = message.confidentialSnapshotSupported;
+    }
+    if (message.evidenceSchemaVersion !== 0) {
+      obj.evidenceSchemaVersion = Math.round(message.evidenceSchemaVersion);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<GetRuntimeCapabilitiesResponse>, I>>(base?: I): GetRuntimeCapabilitiesResponse {
+    return GetRuntimeCapabilitiesResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<GetRuntimeCapabilitiesResponse>, I>>(
+    object: I,
+  ): GetRuntimeCapabilitiesResponse {
+    const message = createBaseGetRuntimeCapabilitiesResponse();
+    message.runtimeVersion = object.runtimeVersion ?? "";
+    message.executionProfile = object.executionProfile ?? 0;
+    message.executionBackend = object.executionBackend ?? 0;
+    message.attestationBackend = object.attestationBackend ?? 0;
+    message.supportedOperations = object.supportedOperations?.map((e) => e) || [];
+    message.hardWorkspaceCapacity = object.hardWorkspaceCapacity ?? undefined;
+    message.confidentialSnapshotSupported = object.confidentialSnapshotSupported ?? false;
+    message.evidenceSchemaVersion = object.evidenceSchemaVersion ?? 0;
     return message;
   },
 };
@@ -4419,13 +5021,16 @@ export const GetAttestationEvidenceRequest: MessageFns<GetAttestationEvidenceReq
 };
 
 function createBaseGetAttestationEvidenceResponse(): GetAttestationEvidenceResponse {
-  return { evidence: undefined };
+  return { evidence: undefined, publicEvidence: undefined };
 }
 
 export const GetAttestationEvidenceResponse: MessageFns<GetAttestationEvidenceResponse> = {
   encode(message: GetAttestationEvidenceResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.evidence !== undefined) {
       AttestationEvidence.encode(message.evidence, writer.uint32(10).fork()).join();
+    }
+    if (message.publicEvidence !== undefined) {
+      PublicAttestationEvidence.encode(message.publicEvidence, writer.uint32(18).fork()).join();
     }
     return writer;
   },
@@ -4445,6 +5050,14 @@ export const GetAttestationEvidenceResponse: MessageFns<GetAttestationEvidenceRe
           message.evidence = AttestationEvidence.decode(reader, reader.uint32());
           continue;
         }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.publicEvidence = PublicAttestationEvidence.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4455,13 +5068,23 @@ export const GetAttestationEvidenceResponse: MessageFns<GetAttestationEvidenceRe
   },
 
   fromJSON(object: any): GetAttestationEvidenceResponse {
-    return { evidence: isSet(object.evidence) ? AttestationEvidence.fromJSON(object.evidence) : undefined };
+    return {
+      evidence: isSet(object.evidence) ? AttestationEvidence.fromJSON(object.evidence) : undefined,
+      publicEvidence: isSet(object.publicEvidence)
+        ? PublicAttestationEvidence.fromJSON(object.publicEvidence)
+        : isSet(object.public_evidence)
+        ? PublicAttestationEvidence.fromJSON(object.public_evidence)
+        : undefined,
+    };
   },
 
   toJSON(message: GetAttestationEvidenceResponse): unknown {
     const obj: any = {};
     if (message.evidence !== undefined) {
       obj.evidence = AttestationEvidence.toJSON(message.evidence);
+    }
+    if (message.publicEvidence !== undefined) {
+      obj.publicEvidence = PublicAttestationEvidence.toJSON(message.publicEvidence);
     }
     return obj;
   },
@@ -4475,6 +5098,9 @@ export const GetAttestationEvidenceResponse: MessageFns<GetAttestationEvidenceRe
     const message = createBaseGetAttestationEvidenceResponse();
     message.evidence = (object.evidence !== undefined && object.evidence !== null)
       ? AttestationEvidence.fromPartial(object.evidence)
+      : undefined;
+    message.publicEvidence = (object.publicEvidence !== undefined && object.publicEvidence !== null)
+      ? PublicAttestationEvidence.fromPartial(object.publicEvidence)
       : undefined;
     return message;
   },
@@ -4787,6 +5413,594 @@ export const AttestationProof: MessageFns<AttestationProof> = {
   },
 };
 
+function createBaseSoftwareProof(): SoftwareProof {
+  return { signature: new Uint8Array(0), signerPubkey: new Uint8Array(0) };
+}
+
+export const SoftwareProof: MessageFns<SoftwareProof> = {
+  encode(message: SoftwareProof, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.signature.length !== 0) {
+      writer.uint32(10).bytes(message.signature);
+    }
+    if (message.signerPubkey.length !== 0) {
+      writer.uint32(18).bytes(message.signerPubkey);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SoftwareProof {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSoftwareProof();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.signature = reader.bytes();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.signerPubkey = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SoftwareProof {
+    return {
+      signature: isSet(object.signature) ? bytesFromBase64(object.signature) : new Uint8Array(0),
+      signerPubkey: isSet(object.signerPubkey)
+        ? bytesFromBase64(object.signerPubkey)
+        : isSet(object.signer_pubkey)
+        ? bytesFromBase64(object.signer_pubkey)
+        : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: SoftwareProof): unknown {
+    const obj: any = {};
+    if (message.signature.length !== 0) {
+      obj.signature = base64FromBytes(message.signature);
+    }
+    if (message.signerPubkey.length !== 0) {
+      obj.signerPubkey = base64FromBytes(message.signerPubkey);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SoftwareProof>, I>>(base?: I): SoftwareProof {
+    return SoftwareProof.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SoftwareProof>, I>>(object: I): SoftwareProof {
+    const message = createBaseSoftwareProof();
+    message.signature = object.signature ?? new Uint8Array(0);
+    message.signerPubkey = object.signerPubkey ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseSevSnpDirectProof(): SevSnpDirectProof {
+  return { report: new Uint8Array(0), vcekCertChain: new Uint8Array(0) };
+}
+
+export const SevSnpDirectProof: MessageFns<SevSnpDirectProof> = {
+  encode(message: SevSnpDirectProof, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.report.length !== 0) {
+      writer.uint32(10).bytes(message.report);
+    }
+    if (message.vcekCertChain.length !== 0) {
+      writer.uint32(18).bytes(message.vcekCertChain);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SevSnpDirectProof {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSevSnpDirectProof();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.report = reader.bytes();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.vcekCertChain = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SevSnpDirectProof {
+    return {
+      report: isSet(object.report) ? bytesFromBase64(object.report) : new Uint8Array(0),
+      vcekCertChain: isSet(object.vcekCertChain)
+        ? bytesFromBase64(object.vcekCertChain)
+        : isSet(object.vcek_cert_chain)
+        ? bytesFromBase64(object.vcek_cert_chain)
+        : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: SevSnpDirectProof): unknown {
+    const obj: any = {};
+    if (message.report.length !== 0) {
+      obj.report = base64FromBytes(message.report);
+    }
+    if (message.vcekCertChain.length !== 0) {
+      obj.vcekCertChain = base64FromBytes(message.vcekCertChain);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SevSnpDirectProof>, I>>(base?: I): SevSnpDirectProof {
+    return SevSnpDirectProof.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SevSnpDirectProof>, I>>(object: I): SevSnpDirectProof {
+    const message = createBaseSevSnpDirectProof();
+    message.report = object.report ?? new Uint8Array(0);
+    message.vcekCertChain = object.vcekCertChain ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseSevSnpAzureProof(): SevSnpAzureProof {
+  return {
+    report: new Uint8Array(0),
+    vcekCertChain: new Uint8Array(0),
+    varData: new Uint8Array(0),
+    akPubTpm2b: new Uint8Array(0),
+    quoteMsg: new Uint8Array(0),
+    quoteSig: new Uint8Array(0),
+  };
+}
+
+export const SevSnpAzureProof: MessageFns<SevSnpAzureProof> = {
+  encode(message: SevSnpAzureProof, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.report.length !== 0) {
+      writer.uint32(10).bytes(message.report);
+    }
+    if (message.vcekCertChain.length !== 0) {
+      writer.uint32(18).bytes(message.vcekCertChain);
+    }
+    if (message.varData.length !== 0) {
+      writer.uint32(26).bytes(message.varData);
+    }
+    if (message.akPubTpm2b.length !== 0) {
+      writer.uint32(34).bytes(message.akPubTpm2b);
+    }
+    if (message.quoteMsg.length !== 0) {
+      writer.uint32(42).bytes(message.quoteMsg);
+    }
+    if (message.quoteSig.length !== 0) {
+      writer.uint32(50).bytes(message.quoteSig);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SevSnpAzureProof {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSevSnpAzureProof();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.report = reader.bytes();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.vcekCertChain = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.varData = reader.bytes();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.akPubTpm2b = reader.bytes();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.quoteMsg = reader.bytes();
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.quoteSig = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SevSnpAzureProof {
+    return {
+      report: isSet(object.report) ? bytesFromBase64(object.report) : new Uint8Array(0),
+      vcekCertChain: isSet(object.vcekCertChain)
+        ? bytesFromBase64(object.vcekCertChain)
+        : isSet(object.vcek_cert_chain)
+        ? bytesFromBase64(object.vcek_cert_chain)
+        : new Uint8Array(0),
+      varData: isSet(object.varData)
+        ? bytesFromBase64(object.varData)
+        : isSet(object.var_data)
+        ? bytesFromBase64(object.var_data)
+        : new Uint8Array(0),
+      akPubTpm2b: isSet(object.akPubTpm2b)
+        ? bytesFromBase64(object.akPubTpm2b)
+        : isSet(object.ak_pub_tpm2b)
+        ? bytesFromBase64(object.ak_pub_tpm2b)
+        : new Uint8Array(0),
+      quoteMsg: isSet(object.quoteMsg)
+        ? bytesFromBase64(object.quoteMsg)
+        : isSet(object.quote_msg)
+        ? bytesFromBase64(object.quote_msg)
+        : new Uint8Array(0),
+      quoteSig: isSet(object.quoteSig)
+        ? bytesFromBase64(object.quoteSig)
+        : isSet(object.quote_sig)
+        ? bytesFromBase64(object.quote_sig)
+        : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: SevSnpAzureProof): unknown {
+    const obj: any = {};
+    if (message.report.length !== 0) {
+      obj.report = base64FromBytes(message.report);
+    }
+    if (message.vcekCertChain.length !== 0) {
+      obj.vcekCertChain = base64FromBytes(message.vcekCertChain);
+    }
+    if (message.varData.length !== 0) {
+      obj.varData = base64FromBytes(message.varData);
+    }
+    if (message.akPubTpm2b.length !== 0) {
+      obj.akPubTpm2b = base64FromBytes(message.akPubTpm2b);
+    }
+    if (message.quoteMsg.length !== 0) {
+      obj.quoteMsg = base64FromBytes(message.quoteMsg);
+    }
+    if (message.quoteSig.length !== 0) {
+      obj.quoteSig = base64FromBytes(message.quoteSig);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SevSnpAzureProof>, I>>(base?: I): SevSnpAzureProof {
+    return SevSnpAzureProof.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SevSnpAzureProof>, I>>(object: I): SevSnpAzureProof {
+    const message = createBaseSevSnpAzureProof();
+    message.report = object.report ?? new Uint8Array(0);
+    message.vcekCertChain = object.vcekCertChain ?? new Uint8Array(0);
+    message.varData = object.varData ?? new Uint8Array(0);
+    message.akPubTpm2b = object.akPubTpm2b ?? new Uint8Array(0);
+    message.quoteMsg = object.quoteMsg ?? new Uint8Array(0);
+    message.quoteSig = object.quoteSig ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBasePublicAttestationEvidence(): PublicAttestationEvidence {
+  return {
+    schemaVersion: 0,
+    provider: 0,
+    workspaceId: "",
+    workspaceMeasurement: new Uint8Array(0),
+    nonce: new Uint8Array(0),
+    issuedAt: 0,
+    reportData: new Uint8Array(0),
+    proof: undefined,
+  };
+}
+
+export const PublicAttestationEvidence: MessageFns<PublicAttestationEvidence> = {
+  encode(message: PublicAttestationEvidence, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.schemaVersion !== 0) {
+      writer.uint32(8).uint32(message.schemaVersion);
+    }
+    if (message.provider !== 0) {
+      writer.uint32(16).int32(message.provider);
+    }
+    if (message.workspaceId !== "") {
+      writer.uint32(26).string(message.workspaceId);
+    }
+    if (message.workspaceMeasurement.length !== 0) {
+      writer.uint32(34).bytes(message.workspaceMeasurement);
+    }
+    if (message.nonce.length !== 0) {
+      writer.uint32(42).bytes(message.nonce);
+    }
+    if (message.issuedAt !== 0) {
+      writer.uint32(48).int64(message.issuedAt);
+    }
+    if (message.reportData.length !== 0) {
+      writer.uint32(58).bytes(message.reportData);
+    }
+    switch (message.proof?.$case) {
+      case "software":
+        SoftwareProof.encode(message.proof.software, writer.uint32(82).fork()).join();
+        break;
+      case "sevSnpDirect":
+        SevSnpDirectProof.encode(message.proof.sevSnpDirect, writer.uint32(90).fork()).join();
+        break;
+      case "sevSnpAzure":
+        SevSnpAzureProof.encode(message.proof.sevSnpAzure, writer.uint32(98).fork()).join();
+        break;
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PublicAttestationEvidence {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePublicAttestationEvidence();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.schemaVersion = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.provider = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.workspaceId = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.workspaceMeasurement = reader.bytes();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.nonce = reader.bytes();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.issuedAt = longToNumber(reader.int64());
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.reportData = reader.bytes();
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.proof = { $case: "software", software: SoftwareProof.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.proof = { $case: "sevSnpDirect", sevSnpDirect: SevSnpDirectProof.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.proof = { $case: "sevSnpAzure", sevSnpAzure: SevSnpAzureProof.decode(reader, reader.uint32()) };
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PublicAttestationEvidence {
+    return {
+      schemaVersion: isSet(object.schemaVersion)
+        ? globalThis.Number(object.schemaVersion)
+        : isSet(object.schema_version)
+        ? globalThis.Number(object.schema_version)
+        : 0,
+      provider: isSet(object.provider) ? attestationProviderFromJSON(object.provider) : 0,
+      workspaceId: isSet(object.workspaceId)
+        ? globalThis.String(object.workspaceId)
+        : isSet(object.workspace_id)
+        ? globalThis.String(object.workspace_id)
+        : "",
+      workspaceMeasurement: isSet(object.workspaceMeasurement)
+        ? bytesFromBase64(object.workspaceMeasurement)
+        : isSet(object.workspace_measurement)
+        ? bytesFromBase64(object.workspace_measurement)
+        : new Uint8Array(0),
+      nonce: isSet(object.nonce) ? bytesFromBase64(object.nonce) : new Uint8Array(0),
+      issuedAt: isSet(object.issuedAt)
+        ? globalThis.Number(object.issuedAt)
+        : isSet(object.issued_at)
+        ? globalThis.Number(object.issued_at)
+        : 0,
+      reportData: isSet(object.reportData)
+        ? bytesFromBase64(object.reportData)
+        : isSet(object.report_data)
+        ? bytesFromBase64(object.report_data)
+        : new Uint8Array(0),
+      proof: isSet(object.software)
+        ? { $case: "software", software: SoftwareProof.fromJSON(object.software) }
+        : isSet(object.sevSnpDirect)
+        ? { $case: "sevSnpDirect", sevSnpDirect: SevSnpDirectProof.fromJSON(object.sevSnpDirect) }
+        : isSet(object.sev_snp_direct)
+        ? { $case: "sevSnpDirect", sevSnpDirect: SevSnpDirectProof.fromJSON(object.sev_snp_direct) }
+        : isSet(object.sevSnpAzure)
+        ? { $case: "sevSnpAzure", sevSnpAzure: SevSnpAzureProof.fromJSON(object.sevSnpAzure) }
+        : isSet(object.sev_snp_azure)
+        ? { $case: "sevSnpAzure", sevSnpAzure: SevSnpAzureProof.fromJSON(object.sev_snp_azure) }
+        : undefined,
+    };
+  },
+
+  toJSON(message: PublicAttestationEvidence): unknown {
+    const obj: any = {};
+    if (message.schemaVersion !== 0) {
+      obj.schemaVersion = Math.round(message.schemaVersion);
+    }
+    if (message.provider !== 0) {
+      obj.provider = attestationProviderToJSON(message.provider);
+    }
+    if (message.workspaceId !== "") {
+      obj.workspaceId = message.workspaceId;
+    }
+    if (message.workspaceMeasurement.length !== 0) {
+      obj.workspaceMeasurement = base64FromBytes(message.workspaceMeasurement);
+    }
+    if (message.nonce.length !== 0) {
+      obj.nonce = base64FromBytes(message.nonce);
+    }
+    if (message.issuedAt !== 0) {
+      obj.issuedAt = Math.round(message.issuedAt);
+    }
+    if (message.reportData.length !== 0) {
+      obj.reportData = base64FromBytes(message.reportData);
+    }
+    if (message.proof?.$case === "software") {
+      obj.software = SoftwareProof.toJSON(message.proof.software);
+    } else if (message.proof?.$case === "sevSnpDirect") {
+      obj.sevSnpDirect = SevSnpDirectProof.toJSON(message.proof.sevSnpDirect);
+    } else if (message.proof?.$case === "sevSnpAzure") {
+      obj.sevSnpAzure = SevSnpAzureProof.toJSON(message.proof.sevSnpAzure);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<PublicAttestationEvidence>, I>>(base?: I): PublicAttestationEvidence {
+    return PublicAttestationEvidence.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PublicAttestationEvidence>, I>>(object: I): PublicAttestationEvidence {
+    const message = createBasePublicAttestationEvidence();
+    message.schemaVersion = object.schemaVersion ?? 0;
+    message.provider = object.provider ?? 0;
+    message.workspaceId = object.workspaceId ?? "";
+    message.workspaceMeasurement = object.workspaceMeasurement ?? new Uint8Array(0);
+    message.nonce = object.nonce ?? new Uint8Array(0);
+    message.issuedAt = object.issuedAt ?? 0;
+    message.reportData = object.reportData ?? new Uint8Array(0);
+    switch (object.proof?.$case) {
+      case "software": {
+        if (object.proof?.software !== undefined && object.proof?.software !== null) {
+          message.proof = { $case: "software", software: SoftwareProof.fromPartial(object.proof.software) };
+        }
+        break;
+      }
+      case "sevSnpDirect": {
+        if (object.proof?.sevSnpDirect !== undefined && object.proof?.sevSnpDirect !== null) {
+          message.proof = {
+            $case: "sevSnpDirect",
+            sevSnpDirect: SevSnpDirectProof.fromPartial(object.proof.sevSnpDirect),
+          };
+        }
+        break;
+      }
+      case "sevSnpAzure": {
+        if (object.proof?.sevSnpAzure !== undefined && object.proof?.sevSnpAzure !== null) {
+          message.proof = { $case: "sevSnpAzure", sevSnpAzure: SevSnpAzureProof.fromPartial(object.proof.sevSnpAzure) };
+        }
+        break;
+      }
+    }
+    return message;
+  },
+};
+
 /** The runtime API SDKs and (eventually) the control plane talk to. */
 export type RuntimeService = typeof RuntimeService;
 export const RuntimeService = {
@@ -4804,9 +6018,25 @@ export const RuntimeService = {
     responseDeserialize: (value: Buffer): PingResponse => PingResponse.decode(value),
   },
   /**
-   * Launch one Firecracker microVM workspace. The supervisor stages
-   * kernel + rootfs into a per-workspace jailer chroot, starts
-   * Firecracker, configures it via its HTTP API socket, and boots.
+   * Return the runtime's resolved execution, attestation, operation,
+   * capacity, and public evidence-schema capabilities.
+   */
+  getRuntimeCapabilities: {
+    path: "/ne.runtime.v1.Runtime/GetRuntimeCapabilities" as const,
+    requestStream: false as const,
+    responseStream: false as const,
+    requestSerialize: (value: GetRuntimeCapabilitiesRequest): Buffer =>
+      Buffer.from(GetRuntimeCapabilitiesRequest.encode(value).finish()),
+    requestDeserialize: (value: Buffer): GetRuntimeCapabilitiesRequest => GetRuntimeCapabilitiesRequest.decode(value),
+    responseSerialize: (value: GetRuntimeCapabilitiesResponse): Buffer =>
+      Buffer.from(GetRuntimeCapabilitiesResponse.encode(value).finish()),
+    responseDeserialize: (value: Buffer): GetRuntimeCapabilitiesResponse =>
+      GetRuntimeCapabilitiesResponse.decode(value),
+  },
+  /**
+   * Launch one workspace using the runtime's selected execution profile.
+   * The standard profile consumes the Firecracker fields below;
+   * confidential-azure accepts the workspace id with zeroed runtime fields.
    */
   createWorkspace: {
     path: "/ne.runtime.v1.Runtime/CreateWorkspace" as const,
@@ -5020,9 +6250,14 @@ export interface RuntimeServer extends UntypedServiceImplementation {
    */
   ping: handleUnaryCall<PingRequest, PingResponse>;
   /**
-   * Launch one Firecracker microVM workspace. The supervisor stages
-   * kernel + rootfs into a per-workspace jailer chroot, starts
-   * Firecracker, configures it via its HTTP API socket, and boots.
+   * Return the runtime's resolved execution, attestation, operation,
+   * capacity, and public evidence-schema capabilities.
+   */
+  getRuntimeCapabilities: handleUnaryCall<GetRuntimeCapabilitiesRequest, GetRuntimeCapabilitiesResponse>;
+  /**
+   * Launch one workspace using the runtime's selected execution profile.
+   * The standard profile consumes the Firecracker fields below;
+   * confidential-azure accepts the workspace id with zeroed runtime fields.
    */
   createWorkspace: handleUnaryCall<CreateWorkspaceRequest, CreateWorkspaceResponse>;
   /**
@@ -5107,9 +6342,28 @@ export interface RuntimeClient extends Client {
     callback: (error: ServiceError | null, response: PingResponse) => void,
   ): ClientUnaryCall;
   /**
-   * Launch one Firecracker microVM workspace. The supervisor stages
-   * kernel + rootfs into a per-workspace jailer chroot, starts
-   * Firecracker, configures it via its HTTP API socket, and boots.
+   * Return the runtime's resolved execution, attestation, operation,
+   * capacity, and public evidence-schema capabilities.
+   */
+  getRuntimeCapabilities(
+    request: GetRuntimeCapabilitiesRequest,
+    callback: (error: ServiceError | null, response: GetRuntimeCapabilitiesResponse) => void,
+  ): ClientUnaryCall;
+  getRuntimeCapabilities(
+    request: GetRuntimeCapabilitiesRequest,
+    metadata: Metadata,
+    callback: (error: ServiceError | null, response: GetRuntimeCapabilitiesResponse) => void,
+  ): ClientUnaryCall;
+  getRuntimeCapabilities(
+    request: GetRuntimeCapabilitiesRequest,
+    metadata: Metadata,
+    options: Partial<CallOptions>,
+    callback: (error: ServiceError | null, response: GetRuntimeCapabilitiesResponse) => void,
+  ): ClientUnaryCall;
+  /**
+   * Launch one workspace using the runtime's selected execution profile.
+   * The standard profile consumes the Firecracker fields below;
+   * confidential-azure accepts the workspace id with zeroed runtime fields.
    */
   createWorkspace(
     request: CreateWorkspaceRequest,

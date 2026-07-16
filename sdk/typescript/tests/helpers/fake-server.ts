@@ -21,6 +21,8 @@ import {
   type GetAttestationEvidenceResponse,
   type GetPoolStatusRequest,
   type GetPoolStatusResponse,
+  type GetRuntimeCapabilitiesRequest,
+  type GetRuntimeCapabilitiesResponse,
   type ListEventsRequest,
   type ListEventsResponse,
   type PauseWorkspaceRequest,
@@ -46,6 +48,9 @@ type HandlerResult<Resp> = Resp | Error | Promise<Resp | Error>;
 
 export type RuntimeHandlers = Partial<{
   ping: (req: PingRequest) => HandlerResult<PingResponse>;
+  getRuntimeCapabilities: (
+    req: GetRuntimeCapabilitiesRequest,
+  ) => HandlerResult<GetRuntimeCapabilitiesResponse>;
   createWorkspace: (req: CreateWorkspaceRequest) => HandlerResult<CreateWorkspaceResponse>;
   destroyWorkspace: (req: DestroyWorkspaceRequest) => HandlerResult<DestroyWorkspaceResponse>;
   executeCommand: (req: ExecuteCommandRequest) => HandlerResult<ExecuteCommandResponse>;
@@ -118,6 +123,7 @@ export async function startFakeServer(handlers: RuntimeHandlers): Promise<FakeSe
   const server = new Server();
   server.addService(RuntimeService, {
     ping: wrapUnary("Ping", handlers.ping),
+    getRuntimeCapabilities: wrapUnary("GetRuntimeCapabilities", handlers.getRuntimeCapabilities),
     createWorkspace: wrapUnary("CreateWorkspace", handlers.createWorkspace),
     destroyWorkspace: wrapUnary("DestroyWorkspace", handlers.destroyWorkspace),
     executeCommand: wrapUnary("ExecuteCommand", handlers.executeCommand),
