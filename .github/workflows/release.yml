@@ -37,6 +37,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+      - name: release component contract
+        run: sh deploy/test-release-contract.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
@@ -90,7 +92,14 @@ jobs:
           ts_v=$(jq -r .version sdk/typescript/package.json)
           py_v=$(grep -m1 '^version' sdk/python/pyproject.toml | sed -E 's/version = "(.*)"/\1/')
           py_init_v=$(grep -E '^__version__' sdk/python/src/ne/__init__.py | sed -E 's/.*"(.*)".*/\1/')
-          for src in "Cargo.toml:$cargo_v" "package.json:$ts_v" "pyproject.toml:$py_v" "__init__.py:$py_init_v"; do
+          contract_v=$(jq -r .release_version deploy/release-components.json)
+          for src in \
+            "Cargo.toml:$cargo_v" \
+            "package.json:$ts_v" \
+            "pyproject.toml:$py_v" \
+            "__init__.py:$py_init_v" \
+            "release-components.json:$contract_v"
+          do
             name="${src%%:*}"; val="${src##*:}"
             if [ "$val" != "$VERSION" ]; then
               echo "::error::$name has version '$val' but tag is '$VERSION'. Bump all sources before tagging."
@@ -113,27 +122,70 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install musl tooling
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build nee (static musl)
-        run: cargo build --release --target x86_64-unknown-linux-musl -p ne-enclave
+      - name: Build nee with all supported execution profiles
+        run: >-
+          cargo build --release
+          --target x86_64-unknown-linux-musl
+          -p ne-enclave
+          --features confidential-cvm
+      - name: Build pinned OpenShell sandbox (static musl)
+        run: |
+          set -euo pipefail
+          git clone https://github.com/Infrastacks/OpenShell.git "$RUNNER_TEMP/OpenShell"
+          git -C "$RUNNER_TEMP/OpenShell" checkout --detach 70328542941838612a75b62c3cc365e01594c0c3
+          cargo build \
+            --manifest-path "$RUNNER_TEMP/OpenShell/Cargo.toml" \
+            --release \
+            --target x86_64-unknown-linux-musl \
+            -p openshell-sandbox
       - name: Stage release asset + checksums
         run: |
           set -euo pipefail
           mkdir -p staging
-          cp target/x86_64-unknown-linux-musl/release/nee staging/ne-x86_64-unknown-linux-musl
-          sha256sum staging/ne-x86_64-unknown-linux-musl > staging/SHA256SUMS
+          cp target/x86_64-unknown-linux-musl/release/nee \
+            staging/nee-x86_64-unknown-linux-musl
+          cp "$RUNNER_TEMP/OpenShell/target/x86_64-unknown-linux-musl/release/openshell-sandbox" \
+            staging/openshell-sandbox-x86_64-unknown-linux-musl
+          cp crates/ne/templates/openshell-policy.rego staging/openshell-policy.rego
+          cp crates/ne/templates/openshell-policy.yaml staging/openshell-policy.yaml
           # Stage install.sh as a release asset so the curl one-liner
           # (curl .../releases/latest/download/install.sh) resolves.
           cp deploy/install.sh staging/install.sh
+          (
+            cd staging
+            sha256sum \
+              nee-x86_64-unknown-linux-musl \
+              openshell-sandbox-x86_64-unknown-linux-musl \
+              openshell-policy.rego \
+              openshell-policy.yaml \
+              > SHA256SUMS
+          )
           cat staging/SHA256SUMS
       - name: Verify static linkage
         run: |
-          file target/x86_64-unknown-linux-musl/release/nee
-          ldd target/x86_64-unknown-linux-musl/release/nee || true
+          set -euo pipefail
+          for binary in \
+            target/x86_64-unknown-linux-musl/release/nee \
+            "$RUNNER_TEMP/OpenShell/target/x86_64-unknown-linux-musl/release/openshell-sandbox"
+          do
+            description="$(file "$binary")"
+            echo "$description"
+            case "$description" in
+              *"statically linked"* | *"static-pie linked"*) ;;
+              *)
+                echo "::error::$binary is not statically linked"
+                exit 1
+                ;;
+            esac
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: ne-release-assets
           path: |
-            staging/ne-x86_64-unknown-linux-musl
+            staging/nee-x86_64-unknown-linux-musl
+            staging/openshell-sandbox-x86_64-unknown-linux-musl
+            staging/openshell-policy.rego
+            staging/openshell-policy.yaml
             staging/SHA256SUMS
             staging/install.sh
 
@@ -155,7 +207,10 @@ jobs:
           name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            staging/ne-x86_64-unknown-linux-musl
+            staging/nee-x86_64-unknown-linux-musl
+            staging/openshell-sandbox-x86_64-unknown-linux-musl
+            staging/openshell-policy.rego
+            staging/openshell-policy.yaml
             staging/SHA256SUMS
             staging/install.sh
 

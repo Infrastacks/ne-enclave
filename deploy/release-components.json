@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "release_version": "0.2.0",
+  "assets": {
+    "nee": "nee-x86_64-unknown-linux-musl",
+    "openshell_sandbox": "openshell-sandbox-x86_64-unknown-linux-musl",
+    "policy_rules": "openshell-policy.rego",
+    "policy_data": "openshell-policy.yaml",
+    "typescript_sdk": "neuronedge-enclave-0.2.0.tgz",
+    "python_wheel": "neuronedge_enclave-0.2.0-py3-none-any.whl",
+    "python_sdist": "neuronedge_enclave-0.2.0.tar.gz",
+    "sbom": "ne-enclave.spdx.json",
+    "provenance": "ne-enclave.provenance.sigstore.json",
+    "checksums": "SHA256SUMS",
+    "installer": "install.sh"
+  },
+  "openshell": {
+    "repository": "https://github.com/Infrastacks/OpenShell.git",
+    "commit": "70328542941838612a75b62c3cc365e01594c0c3"
+  }
+}
