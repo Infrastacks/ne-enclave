@@ -41,18 +41,19 @@ pub const MAX_INLINE_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub enum SupervisorRequest {
     /// Liveness probe. Always replies with [`SupervisorResponse::Pong`].
     Ping,
-    /// Launch a Firecracker microVM under jailer. Linux-only; macOS
-    /// builds reply with [`SupervisorErrorKind::Unsupported`].
+    /// Launch a workspace using the selected execution profile. Linux-only;
+    /// macOS builds reply with [`SupervisorErrorKind::Unsupported`].
     CreateWorkspace(CreateWorkspaceRequest),
     /// Terminate a running workspace and reclaim host resources.
     Terminate(TerminateRequest),
-    /// Run one command inside a workspace by relaying to the
-    /// `ne-guest-agent` over vsock. Linux-only.
+    /// Run one command inside a workspace using the profile's control channel.
+    /// Linux-only.
     RunCommand(RunCommandRequest),
-    /// Atomically write a file inside a workspace via the guest agent
-    /// over vsock. Linux-only.
+    /// Write a file inside a workspace using the profile's control channel.
+    /// Linux-only.
     WriteFile(WriteFileRequest),
-    /// Read a file from inside a workspace via the guest agent. Linux-only.
+    /// Read a file inside a workspace using the profile's control channel.
+    /// Linux-only.
     ReadFile(ReadFileRequest),
     /// Read entries from the supervisor's signed audit event log.
     /// Cross-platform — useful in dev for inspecting emitted events
@@ -82,6 +83,32 @@ pub enum SupervisorRequest {
     /// Generate attestation evidence for a workspace, binding the
     /// caller-supplied nonce. Challenge–response: a fresh nonce per call.
     GetAttestationEvidence(GetAttestationEvidenceRequest),
+}
+
+impl SupervisorRequest {
+    /// Return the profile-gated workspace operation represented by this
+    /// request. Host liveness and audit-log reads are profile-independent.
+    #[must_use]
+    pub fn workspace_operation(&self) -> Option<crate::profile::WorkspaceOperation> {
+        use crate::profile::WorkspaceOperation as Op;
+
+        match self {
+            Self::CreateWorkspace(_) => Some(Op::Create),
+            Self::Terminate(_) => Some(Op::Destroy),
+            Self::RunCommand(_) => Some(Op::Execute),
+            Self::WriteFile(_) => Some(Op::WriteFile),
+            Self::ReadFile(_) => Some(Op::ReadFile),
+            Self::PauseWorkspace(_) => Some(Op::Pause),
+            Self::ResumeWorkspace(_) => Some(Op::Resume),
+            Self::SnapshotWorkspace(_) => Some(Op::Snapshot),
+            Self::RestoreWorkspace(_) => Some(Op::Restore),
+            Self::ForkWorkspace(_) => Some(Op::Fork),
+            Self::PoolStatus(_) => Some(Op::WarmPool),
+            Self::ExposePort(_) | Self::UnexposePort(_) => Some(Op::Ingress),
+            Self::GetAttestationEvidence(_) => Some(Op::Attest),
+            Self::Ping | Self::ListEvents(_) => None,
+        }
+    }
 }
 
 /// Workspace launch specification.
@@ -645,6 +672,8 @@ pub enum SupervisorErrorKind {
     ImageStageFailed,
     /// Operation is not implemented on this platform or build.
     Unsupported,
+    /// Operation is implemented, but not by the selected execution profile.
+    UnsupportedForProfile,
     /// A workspace with this `workspace_id` already exists.
     WorkspaceAlreadyExists,
     /// No workspace with this `workspace_id` is registered with the
@@ -691,6 +720,9 @@ pub enum SupervisorErrorKind {
     /// The supervisor is at its configured workspace-count ceiling and cannot
     /// admit another workspace (host-exhaustion backstop; audit O3).
     CapacityExceeded,
+    /// The confidential profile already has its single active or creating
+    /// workspace slot held.
+    ConfidentialCapacityExceeded,
     /// The target workspace has no network configuration and therefore
     /// cannot participate in ingress routing.
     WorkspaceNotNetworked,
@@ -981,6 +1013,14 @@ mod tests {
                 "image_digest_mismatch",
             ),
             (SupervisorErrorKind::ImageStageFailed, "image_stage_failed"),
+            (
+                SupervisorErrorKind::UnsupportedForProfile,
+                "unsupported_for_profile",
+            ),
+            (
+                SupervisorErrorKind::ConfidentialCapacityExceeded,
+                "confidential_capacity_exceeded",
+            ),
             (SupervisorErrorKind::PathRejected, "path_rejected"),
             (SupervisorErrorKind::FileTooLarge, "file_too_large"),
             (SupervisorErrorKind::FileNotFound, "file_not_found"),
@@ -1011,6 +1051,18 @@ mod tests {
         });
         let line = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<SupervisorRequest>(&line).unwrap(), r);
+    }
+
+    #[test]
+    fn snapshot_maps_to_snapshot_operation() {
+        let req = SupervisorRequest::SnapshotWorkspace(SnapshotRequest {
+            workspace_id: "w".into(),
+            live: false,
+        });
+        assert_eq!(
+            req.workspace_operation(),
+            Some(crate::profile::WorkspaceOperation::Snapshot)
+        );
     }
 
     #[test]

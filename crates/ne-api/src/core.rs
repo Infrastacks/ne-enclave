@@ -86,9 +86,11 @@ pub fn supervisor_kind_code(kind: SupervisorErrorKind) -> &'static str {
         K::ImageDigestMismatch => "IMAGE_DIGEST_MISMATCH",
         K::ImageStageFailed => "IMAGE_STAGE_FAILED",
         K::Unsupported => "UNSUPPORTED",
+        K::UnsupportedForProfile => "UNSUPPORTED_FOR_PROFILE",
         K::WorkspaceAlreadyExists => "WORKSPACE_ALREADY_EXISTS",
         K::WorkspaceNotFound => "WORKSPACE_NOT_FOUND",
         K::TierNotFound => "TIER_NOT_FOUND",
+        K::ConfidentialCapacityExceeded => "CONFIDENTIAL_CAPACITY_EXCEEDED",
         K::GuestUnreachable => "GUEST_UNREACHABLE",
         K::Timeout => "TIMEOUT",
         K::PathRejected => "PATH_REJECTED",
@@ -286,10 +288,6 @@ impl RuntimeCore {
                 input.vcpu_count
             ))
         })?;
-        if vcpu_count == 0 {
-            return Err(CoreError::Validation("vcpu_count must be >= 1".into()));
-        }
-
         let req = SupervisorRequest::CreateWorkspace(sup::CreateWorkspaceRequest {
             workspace_id: input.workspace_id,
             kernel_sha256: input.kernel_sha256,
@@ -690,6 +688,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn profile_error_codes_are_stable() {
+        assert_eq!(
+            supervisor_kind_code(SupervisorErrorKind::UnsupportedForProfile),
+            "UNSUPPORTED_FOR_PROFILE"
+        );
+        assert_eq!(
+            supervisor_kind_code(SupervisorErrorKind::ConfidentialCapacityExceeded),
+            "CONFIDENTIAL_CAPACITY_EXCEEDED"
+        );
+    }
+
     #[tokio::test]
     async fn create_workspace_relays_and_maps_network() {
         use ne_protocol::supervisor as sup;
@@ -739,10 +749,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_workspace_rejects_zero_and_oversized_vcpu() {
-        let (core, _tmp) = make_core(|_| SupervisorResponse::Pong {
-            version: "x".into(),
-            uptime_ms: 0,
+    async fn create_workspace_relays_zero_and_rejects_oversized_vcpu() {
+        use ne_protocol::supervisor as sup;
+
+        let (core, _tmp) = make_core(|req| match req {
+            SupervisorRequest::CreateWorkspace(c) => {
+                assert_eq!(c.vcpu_count, 0);
+                SupervisorResponse::WorkspaceCreated(sup::WorkspaceCreated {
+                    workspace_id: c.workspace_id,
+                    firecracker_pid: 0,
+                    vsock_host_socket: String::new(),
+                    jailer_chroot: String::new(),
+                    network: None,
+                    exec_backend: Some("openshell".into()),
+                    control_socket: Some("127.0.0.1:2222".into()),
+                })
+            }
+            other => SupervisorResponse::Error {
+                kind: SupervisorErrorKind::Internal,
+                message: format!("unexpected: {other:?}"),
+            },
         });
         let base = || CreateWorkspaceInput {
             workspace_id: "w".into(),
@@ -756,8 +782,9 @@ mod tests {
             network: None,
             tier: None,
         };
-        let zero = core.create_workspace(base()).await.expect_err("zero vcpu");
-        assert_eq!(zero.code(), "VALIDATION");
+        core.create_workspace(base())
+            .await
+            .expect("zero vcpu must reach profile-aware supervisor");
         let mut big = base();
         big.vcpu_count = 300;
         let over = core.create_workspace(big).await.expect_err("vcpu > 255");

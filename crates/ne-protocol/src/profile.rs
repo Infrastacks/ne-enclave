@@ -8,20 +8,15 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 /// Customer-visible runtime execution profile.
 pub enum ExecutionProfile {
     /// Firecracker workspace execution with software attestation.
+    #[default]
     Standard,
     /// OpenShell execution inside an Azure confidential VM with vTPM evidence.
     ConfidentialAzure,
-}
-
-impl Default for ExecutionProfile {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 impl fmt::Display for ExecutionProfile {
@@ -65,7 +60,7 @@ pub enum AttestationBackend {
     Software,
     /// Direct AMD SEV-SNP evidence from `/dev/sev-guest`.
     SevSnpDirect,
-    /// Azure OpenHCL SEV-SNP evidence bound through a vTPM quote.
+    /// Azure `OpenHCL` SEV-SNP evidence bound through a vTPM quote.
     SevSnpAzure,
 }
 

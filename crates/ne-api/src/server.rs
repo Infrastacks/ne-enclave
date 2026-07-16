@@ -464,7 +464,9 @@ fn kind_to_status(kind: ne_protocol::supervisor::SupervisorErrorKind, message: S
         | K::WorkspaceNotPaused
         | K::WorkspaceAlreadyPaused
         | K::WorkspaceNotNetworked
-        | K::AttestationReplay => Status::failed_precondition(message),
+        | K::AttestationReplay
+        | K::UnsupportedForProfile
+        | K::ConfidentialCapacityExceeded => Status::failed_precondition(message),
         // SnapshotFailed / RestoreFailed / LaunchFailed / GuestProtocolError /
         // IoError / Internal / any future variant → internal.
         _ => Status::internal(message),
@@ -486,6 +488,16 @@ mod image_error_mapping_tests {
             (K::ImageStageFailed, tonic::Code::Internal),
         ] {
             assert_eq!(kind_to_status(kind, "image error".into()).code(), code);
+        }
+    }
+
+    #[test]
+    fn profile_errors_map_to_failed_precondition() {
+        for kind in [K::UnsupportedForProfile, K::ConfidentialCapacityExceeded] {
+            assert_eq!(
+                kind_to_status(kind, "profile error".into()).code(),
+                tonic::Code::FailedPrecondition
+            );
         }
     }
 }

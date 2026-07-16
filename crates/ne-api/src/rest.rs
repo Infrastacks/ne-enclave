@@ -164,7 +164,9 @@ fn core_error_to_status(e: &CoreError) -> StatusCode {
         | K::WorkspaceNotPaused
         | K::WorkspaceAlreadyPaused
         | K::WorkspaceNotNetworked
-        | K::AttestationReplay => StatusCode::CONFLICT,
+        | K::AttestationReplay
+        | K::UnsupportedForProfile
+        | K::ConfidentialCapacityExceeded => StatusCode::CONFLICT,
         K::WorkspaceNotFound
         | K::FileNotFound
         | K::ImageNotFound
@@ -195,6 +197,17 @@ mod image_error_mapping_tests {
                 message: "image error".into(),
             };
             assert_eq!(core_error_to_status(&error), status);
+        }
+    }
+
+    #[test]
+    fn profile_errors_map_to_conflict() {
+        for kind in [K::UnsupportedForProfile, K::ConfidentialCapacityExceeded] {
+            let error = CoreError::Supervisor {
+                kind,
+                message: "profile error".into(),
+            };
+            assert_eq!(core_error_to_status(&error), StatusCode::CONFLICT);
         }
     }
 }

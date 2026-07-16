@@ -18,14 +18,15 @@ pub enum ProviderSource {
     Software,
     /// Direct AMD SEV-SNP ioctl device.
     SevGuestIoctl,
-    /// Azure OpenHCL vTPM report and quote path.
+    /// Azure `OpenHCL` vTPM report and quote path.
     AzureVtpm,
 }
 
 /// Portable snapshot of startup requirements used by the selected profile.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StartupRequirements {
-    /// Host is Linux x86_64.
+    /// Host is Linux `x86_64`.
     pub linux_x86_64: bool,
     /// `/dev/kvm` is available.
     pub kvm: bool,

@@ -105,7 +105,79 @@ pub enum WorkspaceExec {
     /// Confidential tier (B): an OpenShell sandbox spawned in-process in the
     /// attested CVM. Only present under `feature = "confidential-cvm"`.
     #[cfg(feature = "confidential-cvm")]
-    OpenShell(Box<crate::openshell::Sandbox>),
+    OpenShell(Box<ConfidentialWorkspace>),
+}
+
+#[cfg(target_os = "linux")]
+enum WorkspaceControl {
+    Firecracker(PathBuf),
+    #[cfg(feature = "confidential-cvm")]
+    OpenShell {
+        ssh_addr: std::net::SocketAddr,
+        handshake_secret: String,
+    },
+}
+
+/// OpenShell workspace plus the hard confidential-capacity lease it owns.
+#[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
+#[derive(Debug)]
+pub struct ConfidentialWorkspace {
+    /// Running OpenShell sandbox.
+    pub sandbox: Box<crate::openshell::Sandbox>,
+    /// Held for the entire creating-or-active workspace lifetime.
+    _capacity_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(feature = "confidential-cvm")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn try_acquire_confidential_capacity(
+    capacity: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, SupervisorErrorKind> {
+    Arc::clone(capacity)
+        .try_acquire_owned()
+        .map_err(|_| SupervisorErrorKind::ConfidentialCapacityExceeded)
+}
+
+#[cfg(feature = "confidential-cvm")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_confidential_create(req: &CreateWorkspaceRequest) -> Result<(), &'static str> {
+    if !req.kernel_sha256.is_empty()
+        || !req.rootfs_sha256.is_empty()
+        || req.network.is_some()
+        || req.tier.is_some()
+        || req.vcpu_count != 0
+        || req.mem_size_mib != 0
+        || req.guest_vsock_cid != 0
+    {
+        Err("confidential-azure create accepts workspace_id only")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "confidential-cvm")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn confidential_workspace_path(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("path is empty".into());
+    }
+    if raw.starts_with('/') {
+        return Err(format!("absolute path not allowed: {raw:?}"));
+    }
+    let mut normalized = Vec::new();
+    for component in raw.split('/') {
+        if component.is_empty() {
+            return Err(format!("empty component in {raw:?}"));
+        }
+        if component == "." || component == ".." {
+            return Err(format!("{component:?} segment in {raw:?}"));
+        }
+        if component.contains('\0') {
+            return Err(format!("null byte in component of {raw:?}"));
+        }
+        normalized.push(component);
+    }
+    Ok(format!("/workspace/{}", normalized.join("/")))
 }
 
 /// How `snapshot()`'s finalize step should resolve the source's lifecycle
@@ -244,6 +316,18 @@ pub struct WorkspaceManager {
     /// concurrent terminate removes the registry entry.
     #[cfg(target_os = "linux")]
     lifecycle_claims: LifecycleClaims,
+    /// Hard one-slot ceiling for the confidential profile. The owned permit
+    /// lives inside the registered OpenShell workspace.
+    #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
+    confidential_capacity: Arc<tokio::sync::Semaphore>,
+}
+
+impl WorkspaceManager {
+    /// Execution profile selected once at supervisor startup.
+    #[must_use]
+    pub fn execution_profile(&self) -> ne_protocol::profile::ExecutionProfile {
+        self.cfg.execution_profile
+    }
 }
 
 /// Shared atomic set behind per-workspace lifecycle leases.
@@ -671,6 +755,8 @@ impl WorkspaceManager {
             attestation,
             attestation_nonces: Mutex::new(HashMap::new()),
             lifecycle_claims: LifecycleClaims::default(),
+            #[cfg(feature = "confidential-cvm")]
+            confidential_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -680,6 +766,27 @@ impl WorkspaceManager {
     #[must_use]
     pub fn ingress_registry(&self) -> Arc<ne_ingress::IngressRegistry> {
         Arc::clone(&self.ingress)
+    }
+
+    async fn workspace_control(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkspaceControl, SupervisorResponse> {
+        let instances = self.instances.lock().await;
+        match instances.get(workspace_id) {
+            Some(WorkspaceExec::Firecracker(instance)) => Ok(WorkspaceControl::Firecracker(
+                instance.vsock_host_socket.clone(),
+            )),
+            #[cfg(feature = "confidential-cvm")]
+            Some(WorkspaceExec::OpenShell(workspace)) => Ok(WorkspaceControl::OpenShell {
+                ssh_addr: workspace.sandbox.ssh_addr,
+                handshake_secret: workspace.sandbox.handshake_secret.clone(),
+            }),
+            None => Err(SupervisorResponse::Error {
+                kind: SupervisorErrorKind::WorkspaceNotFound,
+                message: format!("workspace {workspace_id} not found"),
+            }),
+        }
     }
 
     /// Total live Firecracker VMs this manager is responsible for: registered
@@ -705,13 +812,17 @@ impl WorkspaceManager {
         registered + pooled
     }
 
-    /// Launch a new Firecracker microVM and register it under the
-    /// caller-supplied `workspace_id`.
+    /// Launch a new workspace under the selected execution profile and
+    /// register it under the caller-supplied `workspace_id`.
     pub async fn create(&self, req: CreateWorkspaceRequest) -> SupervisorResponse {
+        let confidential = matches!(
+            self.cfg.execution_profile,
+            ne_protocol::profile::ExecutionProfile::ConfidentialAzure
+        );
         // Admission control (audit O3): reject before reserving anything —
         // ahead of even the tier dispatch below, so both the cold-boot and
         // warm-pool paths are covered (both flow through `create`).
-        if req.mem_size_mib > self.max_workspace_mem_mib {
+        if !confidential && req.mem_size_mib > self.max_workspace_mem_mib {
             return SupervisorResponse::Error {
                 kind: SupervisorErrorKind::InvalidRequest,
                 message: format!(
@@ -722,13 +833,14 @@ impl WorkspaceManager {
         }
         let both_empty = req.kernel_sha256.is_empty() && req.rootfs_sha256.is_empty();
         let both_present = !req.kernel_sha256.is_empty() && !req.rootfs_sha256.is_empty();
-        if !both_empty && !both_present {
+        if !confidential && !both_empty && !both_present {
             return SupervisorResponse::Error {
                 kind: SupervisorErrorKind::InvalidImageDigest,
                 message: "kernel and rootfs image digests must be supplied together".into(),
             };
         }
-        if both_present
+        if !confidential
+            && both_present
             && (ImageDigest::parse(ImageKind::Kernel, &req.kernel_sha256).is_err()
                 || ImageDigest::parse(ImageKind::Rootfs, &req.rootfs_sha256).is_err())
         {
@@ -743,6 +855,25 @@ impl WorkspaceManager {
             Ok(claim) => claim,
             Err(resp) => return resp,
         };
+        // The confidential profile has its own hard one-slot admission and
+        // accepts no Firecracker or warm-pool launch settings.
+        #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
+        if confidential {
+            return self.create_confidential(req).await;
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "confidential-cvm")))]
+        if confidential {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::Unsupported,
+                message: format!(
+                    "confidential-azure requires Linux + the confidential-cvm feature; \
+                     workspace {} cannot be created on this build",
+                    req.workspace_id
+                ),
+            };
+        }
+
         // Warm-pool dispatch runs BEFORE the net-new count ceiling below,
         // deliberately: a pool HIT is count-neutral — the VM moves from the
         // pool tally into `instances`, leaving `live_vm_count` unchanged — so
@@ -756,50 +887,29 @@ impl WorkspaceManager {
 
         // Soft ceiling on the COMBINED live-VM count (registered instances +
         // warm-pool members, see `live_vm_count`), gating only NET-NEW boots:
-        // the confidential-tier spawn and the Firecracker cold boot that follow
-        // (count-neutral warm-pool adoption is handled above / inside
-        // `create_from_pool`). This check-then-act races the eventual insert
-        // into `instances` (done later, under separate lock acquisitions, by
-        // `register_or_teardown`), so a burst of concurrent creates can admit a
-        // few requests over the line. Acceptable for an exhaustion backstop —
-        // not a hard quota.
+        // the Firecracker cold boot that follows (count-neutral warm-pool
+        // adoption is handled above / inside `create_from_pool`). This
+        // check-then-act races the eventual insert into `instances` (done
+        // later, under separate lock acquisitions, by
+        // `register_or_teardown`), so a burst of concurrent creates can admit
+        // a few requests over the line. Acceptable for an exhaustion
+        // backstop — not a hard quota.
         if self.live_vm_count().await >= self.max_workspaces {
             return SupervisorResponse::Error {
                 kind: SupervisorErrorKind::CapacityExceeded,
                 message: format!("at workspace capacity ({})", self.max_workspaces),
             };
         }
-        // Two-tier dispatch (R1): the confidential profile routes to
-        // the OpenShell-in-CVM substrate (single-CVM-direct, B); the software
-        // profile routes to the Firecracker microVM path below. The OpenShell
-        // path is Linux + `confidential-cvm` only.
-        #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
-        if matches!(
-            self.cfg.execution_profile,
-            ne_protocol::profile::ExecutionProfile::ConfidentialAzure
-        ) {
-            return self.create_confidential(req).await;
-        }
-
-        #[cfg(not(all(target_os = "linux", feature = "confidential-cvm")))]
-        if matches!(
-            self.cfg.execution_profile,
-            ne_protocol::profile::ExecutionProfile::ConfidentialAzure
-        ) {
-            return SupervisorResponse::Error {
-                kind: SupervisorErrorKind::Unsupported,
-                message: format!(
-                    "confidential-azure requires Linux + the confidential-cvm feature; \
-                     workspace {} cannot be created on this build",
-                    req.workspace_id
-                ),
-            };
-        }
-
         if both_empty {
             return SupervisorResponse::Error {
                 kind: SupervisorErrorKind::InvalidImageDigest,
                 message: "standard cold creates require kernel and rootfs image digests".into(),
+            };
+        }
+        if req.vcpu_count == 0 {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidRequest,
+                message: "standard creates require vcpu_count >= 1".into(),
             };
         }
 
@@ -1005,7 +1115,7 @@ impl WorkspaceManager {
 
     /// Confidential-tier (B) create: spawn an OpenShell sandbox directly in the
     /// attested CVM (single-CVM-direct). Linux + `confidential-cvm` only — the
-    /// `SevSnp` profile routes here instead of the Firecracker microVM path.
+    /// `confidential-azure` routes here instead of the Firecracker path.
     ///
     /// OpenShell provides its own isolation (Landlock/seccomp/netns) + governance
     /// (L7 OPA + PII/supply-chain); the CVM is the outer hardware boundary. The
@@ -1015,8 +1125,22 @@ impl WorkspaceManager {
         use crate::openshell::{OpenShellError, OpenShellLaunchConfig, Sandbox};
         use std::net::{Ipv4Addr, SocketAddr};
 
-        // The OpenShell path does not consume the Firecracker-specific request
-        // fields (kernel/rootfs/vcpu/mem/vsock cid); the sandbox is configured
+        if let Err(message) = validate_confidential_create(&req) {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::InvalidRequest,
+                message: message.into(),
+            };
+        }
+        let permit = match try_acquire_confidential_capacity(&self.confidential_capacity) {
+            Ok(permit) => permit,
+            Err(kind) => {
+                return SupervisorResponse::Error {
+                    kind,
+                    message: "confidential-azure permits one active or creating workspace".into(),
+                };
+            }
+        };
+
         // The OpenShell path does not consume the Firecracker-specific request
         // fields (kernel/rootfs/vcpu/mem/vsock cid); the sandbox is configured
         // by the operator-supplied policy files + the agent command. The
@@ -1082,7 +1206,10 @@ impl WorkspaceManager {
                 if let Err(resp) = self
                     .register_or_teardown(
                         &req.workspace_id,
-                        WorkspaceExec::OpenShell(Box::new(sandbox)),
+                        WorkspaceExec::OpenShell(Box::new(ConfidentialWorkspace {
+                            sandbox: Box::new(sandbox),
+                            _capacity_permit: permit,
+                        })),
                     )
                     .await
                 {
@@ -1275,96 +1402,114 @@ impl WorkspaceManager {
         SupervisorResponse::WorkspaceCreated(resp)
     }
 
-    /// Relay one [`RunCommandRequest`] to the workspace's guest agent
-    /// over vsock and return the result.
+    /// Relay one [`RunCommandRequest`] over the profile's control channel.
     pub async fn run_command(&self, req: RunCommandRequest) -> SupervisorResponse {
-        let vsock_uds = {
-            let instances = self.instances.lock().await;
-            match instances.get(&req.workspace_id) {
-                Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
-                #[cfg(feature = "confidential-cvm")]
-                Some(_) => {
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::Unsupported,
-                        message: format!(
-                            "workspace {} runs on the confidential tier; use the OpenShell control path",
-                            req.workspace_id
-                        ),
-                    };
-                }
-                None => {
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::WorkspaceNotFound,
-                        message: format!("workspace {} not found", req.workspace_id),
-                    };
-                }
-            }
+        let control = match self.workspace_control(&req.workspace_id).await {
+            Ok(control) => control,
+            Err(response) => return response,
         };
 
-        let guest_resp = match crate::firecracker::run_command_via_vsock(
-            &vsock_uds,
-            req.guest_port,
-            &req.command,
-            &req.args,
-            req.timeout_ms,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(crate::firecracker::GuestRpcError::ConnectRejected(line)) => {
-                warn!(workspace_id = %req.workspace_id, %line, "vsock CONNECT rejected");
-                self.audit_emit(
-                    EventType::CommandExecuted,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "command": req.command,
-                        "args": req.args,
-                        "error_kind": "guest_unreachable",
-                        "error": format!("vsock CONNECT rejected: {line}"),
-                    }),
+        let guest_resp = match control {
+            WorkspaceControl::Firecracker(vsock_uds) => {
+                match crate::firecracker::run_command_via_vsock(
+                    &vsock_uds,
+                    req.guest_port,
+                    &req.command,
+                    &req.args,
+                    req.timeout_ms,
                 )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::GuestUnreachable,
-                    message: format!("vsock CONNECT rejected: {line}"),
-                };
+                .await
+                {
+                    Ok(r) => r,
+                    Err(crate::firecracker::GuestRpcError::ConnectRejected(line)) => {
+                        warn!(workspace_id = %req.workspace_id, %line, "vsock CONNECT rejected");
+                        self.audit_emit(
+                            EventType::CommandExecuted,
+                            Some(req.workspace_id.clone()),
+                            serde_json::json!({
+                                "command": req.command,
+                                "args": req.args,
+                                "error_kind": "guest_unreachable",
+                                "error": format!("vsock CONNECT rejected: {line}"),
+                            }),
+                        )
+                        .await;
+                        return SupervisorResponse::Error {
+                            kind: SupervisorErrorKind::GuestUnreachable,
+                            message: format!("vsock CONNECT rejected: {line}"),
+                        };
+                    }
+                    Err(crate::firecracker::GuestRpcError::Timeout(ms)) => {
+                        warn!(workspace_id = %req.workspace_id, timeout_ms = ms, "vsock RPC timed out (run_command)");
+                        self.audit_emit(
+                            EventType::CommandExecuted,
+                            Some(req.workspace_id.clone()),
+                            serde_json::json!({
+                                "command": req.command,
+                                "args": req.args,
+                                "error_kind": "timeout",
+                                "timeout_ms": ms,
+                                "timeout_origin": "host",
+                            }),
+                        )
+                        .await;
+                        return SupervisorResponse::Error {
+                            kind: SupervisorErrorKind::Timeout,
+                            message: format!("vsock RPC exceeded {ms}ms"),
+                        };
+                    }
+                    Err(e) => {
+                        warn!(workspace_id = %req.workspace_id, error = %e, "vsock RPC failed");
+                        self.audit_emit(
+                            EventType::CommandExecuted,
+                            Some(req.workspace_id.clone()),
+                            serde_json::json!({
+                                "command": req.command,
+                                "args": req.args,
+                                "error_kind": "guest_unreachable",
+                                "error": e.to_string(),
+                            }),
+                        )
+                        .await;
+                        return SupervisorResponse::Error {
+                            kind: SupervisorErrorKind::GuestUnreachable,
+                            message: e.to_string(),
+                        };
+                    }
+                }
             }
-            Err(crate::firecracker::GuestRpcError::Timeout(ms)) => {
-                warn!(workspace_id = %req.workspace_id, timeout_ms = ms, "vsock RPC timed out (run_command)");
-                self.audit_emit(
-                    EventType::CommandExecuted,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "command": req.command,
-                        "args": req.args,
-                        "error_kind": "timeout",
-                        "timeout_ms": ms,
-                        "timeout_origin": "host",
-                    }),
+            #[cfg(feature = "confidential-cvm")]
+            WorkspaceControl::OpenShell {
+                ssh_addr,
+                handshake_secret,
+            } => {
+                match crate::openshell::run_command_via_ssh_endpoint(
+                    ssh_addr,
+                    &handshake_secret,
+                    &req.command,
+                    &req.args,
+                    req.timeout_ms,
                 )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::Timeout,
-                    message: format!("vsock RPC exceeded {ms}ms"),
-                };
-            }
-            Err(e) => {
-                warn!(workspace_id = %req.workspace_id, error = %e, "vsock RPC failed");
-                self.audit_emit(
-                    EventType::CommandExecuted,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "command": req.command,
-                        "args": req.args,
-                        "error_kind": "guest_unreachable",
-                        "error": e.to_string(),
-                    }),
-                )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::GuestUnreachable,
-                    message: e.to_string(),
-                };
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let (kind, message) = openshell_control_error(&error);
+                        warn!(workspace_id = %req.workspace_id, error = %error, "OpenShell command failed");
+                        self.audit_emit(
+                            EventType::CommandExecuted,
+                            Some(req.workspace_id.clone()),
+                            serde_json::json!({
+                                "command": req.command,
+                                "args": req.args,
+                                "error_kind": control_error_code(kind),
+                                "error": message,
+                            }),
+                        )
+                        .await;
+                        return SupervisorResponse::Error { kind, message };
+                    }
+                }
             }
         };
 
@@ -1441,8 +1586,8 @@ impl WorkspaceManager {
         }
     }
 
-    /// Relay a [`WriteFileRequest`] to the workspace's guest agent
-    /// and emit the matching audit event.
+    /// Relay a [`WriteFileRequest`] over the profile's control channel and
+    /// emit the matching audit event.
     pub async fn write_file(&self, req: WriteFileRequest) -> SupervisorResponse {
         // Defense in depth: the API daemon already enforces this cap,
         // but the supervisor is a separate trust boundary (direct
@@ -1474,27 +1619,9 @@ impl WorkspaceManager {
             };
         }
 
-        let vsock_uds = {
-            let instances = self.instances.lock().await;
-            match instances.get(&req.workspace_id) {
-                Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
-                #[cfg(feature = "confidential-cvm")]
-                Some(_) => {
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::Unsupported,
-                        message: format!(
-                            "workspace {} runs on the confidential tier; use the OpenShell control path",
-                            req.workspace_id
-                        ),
-                    };
-                }
-                None => {
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::WorkspaceNotFound,
-                        message: format!("workspace {} not found", req.workspace_id),
-                    };
-                }
-            }
+        let control = match self.workspace_control(&req.workspace_id).await {
+            Ok(control) => control,
+            Err(response) => return response,
         };
 
         let guest_port = if req.guest_port == 0 {
@@ -1504,71 +1631,26 @@ impl WorkspaceManager {
         };
         let timeout_ms = FILE_RPC_TIMEOUT_MS;
 
-        let guest_resp = match crate::firecracker::write_file_via_vsock(
-            &vsock_uds,
-            guest_port,
-            &req.path,
-            req.content,
-            timeout_ms,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(crate::firecracker::GuestRpcError::ConnectRejected(line)) => {
-                warn!(workspace_id = %req.workspace_id, %line, "vsock CONNECT rejected (write_file)");
-                self.audit_emit(
-                    EventType::FileOpFailed,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "op": "write_file",
-                        "path": req.path,
-                        "error_kind": "guest_unreachable",
-                        "error": format!("vsock CONNECT rejected: {line}"),
-                    }),
-                )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::GuestUnreachable,
-                    message: format!("vsock CONNECT rejected: {line}"),
-                };
-            }
-            Err(crate::firecracker::GuestRpcError::Timeout(ms)) => {
-                warn!(workspace_id = %req.workspace_id, timeout_ms = ms, "vsock RPC timed out (write_file)");
-                self.audit_emit(
-                    EventType::FileOpFailed,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "op": "write_file",
-                        "path": req.path,
-                        "error_kind": "timeout",
-                        "timeout_ms": ms,
-                        "timeout_origin": "host",
-                    }),
-                )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::Timeout,
-                    message: format!("vsock RPC exceeded {ms}ms"),
-                };
-            }
-            Err(e) => {
-                self.audit_emit(
-                    EventType::FileOpFailed,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "op": "write_file",
-                        "path": req.path,
-                        "error_kind": "guest_unreachable",
-                        "error": e.to_string(),
-                    }),
-                )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::GuestUnreachable,
-                    message: e.to_string(),
-                };
-            }
-        };
+        let guest_resp =
+            match write_file_over_control(control, guest_port, &req.path, req.content, timeout_ms)
+                .await
+            {
+                Ok(response) => response,
+                Err((kind, message)) => {
+                    self.audit_emit(
+                        EventType::FileOpFailed,
+                        Some(req.workspace_id.clone()),
+                        serde_json::json!({
+                            "op": "write_file",
+                            "path": req.path,
+                            "error_kind": control_error_code(kind),
+                            "error": message,
+                        }),
+                    )
+                    .await;
+                    return SupervisorResponse::Error { kind, message };
+                }
+            };
 
         match guest_resp {
             GuestResponse::FileWritten(written) => {
@@ -1631,29 +1713,11 @@ impl WorkspaceManager {
         }
     }
 
-    /// Relay a [`ReadFileRequest`] to the workspace's guest agent.
+    /// Relay a [`ReadFileRequest`] over the profile's control channel.
     pub async fn read_file(&self, req: ReadFileRequest) -> SupervisorResponse {
-        let vsock_uds = {
-            let instances = self.instances.lock().await;
-            match instances.get(&req.workspace_id) {
-                Some(WorkspaceExec::Firecracker(inst)) => inst.vsock_host_socket.clone(),
-                #[cfg(feature = "confidential-cvm")]
-                Some(_) => {
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::Unsupported,
-                        message: format!(
-                            "workspace {} runs on the confidential tier; use the OpenShell control path",
-                            req.workspace_id
-                        ),
-                    };
-                }
-                None => {
-                    return SupervisorResponse::Error {
-                        kind: SupervisorErrorKind::WorkspaceNotFound,
-                        message: format!("workspace {} not found", req.workspace_id),
-                    };
-                }
-            }
+        let control = match self.workspace_control(&req.workspace_id).await {
+            Ok(control) => control,
+            Err(response) => return response,
         };
 
         let guest_port = if req.guest_port == 0 {
@@ -1663,71 +1727,26 @@ impl WorkspaceManager {
         };
         let timeout_ms = FILE_RPC_TIMEOUT_MS;
 
-        let guest_resp = match crate::firecracker::read_file_via_vsock(
-            &vsock_uds,
-            guest_port,
-            &req.path,
-            req.max_bytes,
-            timeout_ms,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(crate::firecracker::GuestRpcError::ConnectRejected(line)) => {
-                warn!(workspace_id = %req.workspace_id, %line, "vsock CONNECT rejected (read_file)");
-                self.audit_emit(
-                    EventType::FileOpFailed,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "op": "read_file",
-                        "path": req.path,
-                        "error_kind": "guest_unreachable",
-                        "error": format!("vsock CONNECT rejected: {line}"),
-                    }),
-                )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::GuestUnreachable,
-                    message: format!("vsock CONNECT rejected: {line}"),
-                };
-            }
-            Err(crate::firecracker::GuestRpcError::Timeout(ms)) => {
-                warn!(workspace_id = %req.workspace_id, timeout_ms = ms, "vsock RPC timed out (read_file)");
-                self.audit_emit(
-                    EventType::FileOpFailed,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "op": "read_file",
-                        "path": req.path,
-                        "error_kind": "timeout",
-                        "timeout_ms": ms,
-                        "timeout_origin": "host",
-                    }),
-                )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::Timeout,
-                    message: format!("vsock RPC exceeded {ms}ms"),
-                };
-            }
-            Err(e) => {
-                self.audit_emit(
-                    EventType::FileOpFailed,
-                    Some(req.workspace_id.clone()),
-                    serde_json::json!({
-                        "op": "read_file",
-                        "path": req.path,
-                        "error_kind": "guest_unreachable",
-                        "error": e.to_string(),
-                    }),
-                )
-                .await;
-                return SupervisorResponse::Error {
-                    kind: SupervisorErrorKind::GuestUnreachable,
-                    message: e.to_string(),
-                };
-            }
-        };
+        let guest_resp =
+            match read_file_over_control(control, guest_port, &req.path, req.max_bytes, timeout_ms)
+                .await
+            {
+                Ok(response) => response,
+                Err((kind, message)) => {
+                    self.audit_emit(
+                        EventType::FileOpFailed,
+                        Some(req.workspace_id.clone()),
+                        serde_json::json!({
+                            "op": "read_file",
+                            "path": req.path,
+                            "error_kind": control_error_code(kind),
+                            "error": message,
+                        }),
+                    )
+                    .await;
+                    return SupervisorResponse::Error { kind, message };
+                }
+            };
 
         match guest_resp {
             GuestResponse::FileRead(read) => {
@@ -1808,8 +1827,8 @@ impl WorkspaceManager {
         let grace = Duration::from_millis(u64::from(req.grace_period_ms));
         #[cfg(feature = "confidential-cvm")]
         let (network_slot, firecracker_result) = match exec {
-            WorkspaceExec::OpenShell(sandbox) => {
-                sandbox.terminate(grace).await;
+            WorkspaceExec::OpenShell(workspace) => {
+                workspace.sandbox.terminate(grace).await;
                 // OpenShell sandboxes don't carry a NetworkSlot today (the
                 // sandbox's own netns is managed by the spawned binary).
                 (None, Ok(()))
@@ -2602,8 +2621,8 @@ impl WorkspaceManager {
                     }
                 }
                 #[cfg(feature = "confidential-cvm")]
-                WorkspaceExec::OpenShell(sandbox) => {
-                    sandbox.terminate(Duration::from_secs(5)).await;
+                WorkspaceExec::OpenShell(workspace) => {
+                    workspace.sandbox.terminate(Duration::from_secs(5)).await;
                 }
             }
             return Err(SupervisorResponse::Error {
@@ -3404,6 +3423,91 @@ fn compose_boot_args(base: &str, layout: Option<&crate::network::SlotIpLayout>) 
     )
 }
 
+#[cfg(target_os = "linux")]
+async fn write_file_over_control(
+    control: WorkspaceControl,
+    guest_port: u32,
+    path: &str,
+    content: Vec<u8>,
+    timeout_ms: u32,
+) -> Result<GuestResponse, (SupervisorErrorKind, String)> {
+    match control {
+        WorkspaceControl::Firecracker(vsock_uds) => crate::firecracker::write_file_via_vsock(
+            &vsock_uds, guest_port, path, content, timeout_ms,
+        )
+        .await
+        .map_err(firecracker_control_error),
+        #[cfg(feature = "confidential-cvm")]
+        WorkspaceControl::OpenShell {
+            ssh_addr,
+            handshake_secret,
+        } => {
+            let path = confidential_workspace_path(path)
+                .map_err(|message| (SupervisorErrorKind::PathRejected, message))?;
+            crate::openshell::write_file_via_sftp_endpoint(
+                ssh_addr,
+                &handshake_secret,
+                &path,
+                content,
+                timeout_ms,
+            )
+            .await
+            .map_err(|error| openshell_control_error(&error))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn read_file_over_control(
+    control: WorkspaceControl,
+    guest_port: u32,
+    path: &str,
+    max_bytes: u64,
+    timeout_ms: u32,
+) -> Result<GuestResponse, (SupervisorErrorKind, String)> {
+    match control {
+        WorkspaceControl::Firecracker(vsock_uds) => crate::firecracker::read_file_via_vsock(
+            &vsock_uds, guest_port, path, max_bytes, timeout_ms,
+        )
+        .await
+        .map_err(firecracker_control_error),
+        #[cfg(feature = "confidential-cvm")]
+        WorkspaceControl::OpenShell {
+            ssh_addr,
+            handshake_secret,
+        } => {
+            let path = confidential_workspace_path(path)
+                .map_err(|message| (SupervisorErrorKind::PathRejected, message))?;
+            crate::openshell::read_file_via_sftp_endpoint(
+                ssh_addr,
+                &handshake_secret,
+                &path,
+                max_bytes,
+                timeout_ms,
+            )
+            .await
+            .map_err(|error| openshell_control_error(&error))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn firecracker_control_error(
+    error: crate::firecracker::GuestRpcError,
+) -> (SupervisorErrorKind, String) {
+    match error {
+        crate::firecracker::GuestRpcError::Timeout(ms) => (
+            SupervisorErrorKind::Timeout,
+            format!("vsock RPC exceeded {ms}ms"),
+        ),
+        crate::firecracker::GuestRpcError::ConnectRejected(message) => (
+            SupervisorErrorKind::GuestUnreachable,
+            format!("vsock CONNECT rejected: {message}"),
+        ),
+        other => (SupervisorErrorKind::GuestUnreachable, other.to_string()),
+    }
+}
+
 /// Map a [`ne_protocol::guest::GuestErrorKind`] to the
 /// corresponding [`SupervisorErrorKind`] for relay back to the API
 /// caller. One-to-one where the semantics align; everything else
@@ -3423,6 +3527,99 @@ fn guest_kind_to_supervisor_kind(kind: GuestErrorKind) -> SupervisorErrorKind {
         // future variants collapse to Internal until the supervisor
         // adds a specific arm.
         _ => SupervisorErrorKind::Internal,
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
+fn openshell_control_error(
+    error: &crate::openshell::OpenShellError,
+) -> (SupervisorErrorKind, String) {
+    match error {
+        crate::openshell::OpenShellError::Timeout(ms) => (
+            SupervisorErrorKind::Timeout,
+            format!("OpenShell control operation exceeded {ms}ms"),
+        ),
+        crate::openshell::OpenShellError::ConnectRejected(message) => (
+            SupervisorErrorKind::GuestUnreachable,
+            format!("OpenShell control connection rejected: {message}"),
+        ),
+        _ => (SupervisorErrorKind::GuestUnreachable, error.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn control_error_code(kind: SupervisorErrorKind) -> &'static str {
+    match kind {
+        SupervisorErrorKind::Timeout => "timeout",
+        SupervisorErrorKind::PathRejected => "path_rejected",
+        _ => "guest_unreachable",
+    }
+}
+
+#[cfg(all(test, feature = "confidential-cvm"))]
+mod confidential_capacity_tests {
+    use std::sync::Arc;
+
+    use ne_protocol::supervisor::SupervisorErrorKind;
+
+    use super::{
+        confidential_workspace_path, try_acquire_confidential_capacity,
+        validate_confidential_create,
+    };
+
+    #[tokio::test]
+    async fn confidential_capacity_rejects_a_second_holder() {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let first = try_acquire_confidential_capacity(&capacity).expect("first permit");
+        assert_eq!(
+            try_acquire_confidential_capacity(&capacity).expect_err("second fails"),
+            SupervisorErrorKind::ConfidentialCapacityExceeded
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn confidential_capacity_releases_after_holder_drops() {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let first = try_acquire_confidential_capacity(&capacity).expect("first permit");
+        drop(first);
+        let second = try_acquire_confidential_capacity(&capacity).expect("permit released");
+        drop(second);
+    }
+
+    #[test]
+    fn confidential_create_accepts_only_zeroed_runtime_fields() {
+        let request = ne_protocol::supervisor::CreateWorkspaceRequest {
+            workspace_id: "w".into(),
+            kernel_sha256: String::new(),
+            rootfs_sha256: String::new(),
+            rootfs_read_only: false,
+            vcpu_count: 0,
+            mem_size_mib: 0,
+            guest_vsock_cid: 0,
+            kernel_boot_args: None,
+            network: None,
+            tier: None,
+        };
+        validate_confidential_create(&request).expect("workspace-only request");
+
+        let mut firecracker_request = request;
+        firecracker_request.vcpu_count = 1;
+        assert!(validate_confidential_create(&firecracker_request).is_err());
+    }
+
+    #[test]
+    fn confidential_file_paths_are_jailed_under_workspace() {
+        assert_eq!(
+            confidential_workspace_path("a/b.txt").expect("valid path"),
+            "/workspace/a/b.txt"
+        );
+        for invalid in ["", "/etc/passwd", "../escape", "a/./b", "a//b"] {
+            assert!(
+                confidential_workspace_path(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
     }
 }
 

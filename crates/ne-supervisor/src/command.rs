@@ -43,6 +43,18 @@ impl Dispatcher {
     /// surface as [`SupervisorResponse::Error`] rather than panicking,
     /// because the IPC loop must remain alive after a bad call.
     pub async fn dispatch(&self, req: SupervisorRequest) -> SupervisorResponse {
+        if let Some(operation) = req.workspace_operation()
+            && !self.workspaces.execution_profile().supports(operation)
+        {
+            return SupervisorResponse::Error {
+                kind: SupervisorErrorKind::UnsupportedForProfile,
+                message: format!(
+                    "operation {operation:?} is not supported by execution profile {}",
+                    self.workspaces.execution_profile()
+                ),
+            };
+        }
+
         match req {
             SupervisorRequest::Ping => SupervisorResponse::Pong {
                 version: self.version.to_string(),
@@ -90,7 +102,9 @@ mod tests {
     use super::*;
     use crate::workspace::WorkspaceManagerConfig;
 
-    async fn test_dispatcher() -> Dispatcher {
+    async fn test_dispatcher_for(
+        execution_profile: ne_protocol::profile::ExecutionProfile,
+    ) -> Dispatcher {
         let tmp = tempfile::tempdir().expect("tmpdir");
         // Leak the tempdir so the audit log file stays alive for
         // the test's duration; tests don't share the dispatcher so
@@ -104,15 +118,15 @@ mod tests {
         .expect("software provider");
         // Generous test ceilings: these dispatcher tests aren't exercising
         // admission control and must not spuriously hit it.
-        let mgr = WorkspaceManager::new(
-            WorkspaceManagerConfig::dev_defaults(),
-            audit.clone(),
-            attestation,
-            1024,
-            32768,
-        )
-        .expect("workspace manager");
+        let mut cfg = WorkspaceManagerConfig::dev_defaults();
+        cfg.execution_profile = execution_profile;
+        let mgr = WorkspaceManager::new(cfg, audit.clone(), attestation, 1024, 32768)
+            .expect("workspace manager");
         Dispatcher::new(Arc::new(mgr), audit)
+    }
+
+    async fn test_dispatcher() -> Dispatcher {
+        test_dispatcher_for(ne_protocol::profile::ExecutionProfile::Standard).await
     }
 
     #[tokio::test]
@@ -140,6 +154,24 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         };
         assert!(second >= first, "uptime must not move backwards");
+    }
+
+    #[tokio::test]
+    async fn confidential_profile_rejects_snapshot_before_dispatch() {
+        use ne_protocol::supervisor::SnapshotRequest;
+
+        let d =
+            test_dispatcher_for(ne_protocol::profile::ExecutionProfile::ConfidentialAzure).await;
+        let req = SupervisorRequest::SnapshotWorkspace(SnapshotRequest {
+            workspace_id: "w".into(),
+            live: false,
+        });
+        match d.dispatch(req).await {
+            SupervisorResponse::Error { kind, .. } => {
+                assert_eq!(kind, SupervisorErrorKind::UnsupportedForProfile);
+            }
+            other => panic!("expected UnsupportedForProfile, got {other:?}"),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
