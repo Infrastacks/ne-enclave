@@ -17,5 +17,10 @@ pub mod profile;
 pub mod snapshot;
 pub mod supervisor;
 
+pub use attestation::{
+    PUBLIC_EVIDENCE_SCHEMA_VERSION, PublicAttestationError, PublicAttestationEvidence,
+    PublicAttestationProof, PublicAttestationProvider,
+};
+
 #[cfg(feature = "grpc")]
 pub mod grpc;

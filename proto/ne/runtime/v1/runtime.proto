@@ -521,22 +521,71 @@ message GetAttestationEvidenceRequest {
   bytes nonce = 2;            // 16..=64 bytes; runtime validates
 }
 message GetAttestationEvidenceResponse {
-  AttestationEvidence evidence = 1;
+  // Legacy v0.1.x envelope retained at tag 1 for wire compatibility.
+  // Azure vTPM evidence cannot be represented losslessly here; use
+  // public_evidence for all new integrations.
+  AttestationEvidence evidence = 1 [deprecated = true];
+  PublicAttestationEvidence public_evidence = 2;
 }
+
+// Legacy v0.1.x attestation envelope. Do not reuse or renumber these fields.
 message AttestationEvidence {
-  string provider_type = 1;  // "software" (sev_snp / tdx reserved)
+  string provider_type = 1;
   string workspace_id = 2;
-  bytes measurement = 3;     // 32 bytes
+  bytes measurement = 3;
   bytes nonce = 4;
   int64 issued_at = 5;
   bytes report_data = 6;
   AttestationProof proof = 7;
 }
+
+// Legacy v0.1.x provider proof. New proof shapes belong in
+// PublicAttestationEvidence below.
 message AttestationProof {
-  // Software proof. Hardware proof fields are reserved for later.
-  bytes signature = 1;       // 64 bytes (software)
-  bytes signer_pubkey = 2;   // 32 bytes (software)
-  // SEV-SNP firmware Attestation Report (provider_type "sev_snp").
-  bytes sev_snp_report = 3;     // firmware Attestation Report (sev_snp)
-  bytes sev_snp_vcek_chain = 4; // VCEK cert chain, DER leaf-first (sev_snp)
+  bytes signature = 1;
+  bytes signer_pubkey = 2;
+  bytes sev_snp_report = 3;
+  bytes sev_snp_vcek_chain = 4;
+}
+
+enum AttestationProvider {
+  ATTESTATION_PROVIDER_UNSPECIFIED = 0;
+  ATTESTATION_PROVIDER_SOFTWARE = 1;
+  ATTESTATION_PROVIDER_SEV_SNP_DIRECT = 2;
+  ATTESTATION_PROVIDER_SEV_SNP_AZURE = 3;
+}
+
+message SoftwareProof {
+  bytes signature = 1;
+  bytes signer_pubkey = 2;
+}
+
+message SevSnpDirectProof {
+  bytes report = 1;
+  bytes vcek_cert_chain = 2;
+}
+
+message SevSnpAzureProof {
+  bytes report = 1;
+  bytes vcek_cert_chain = 2;
+  bytes var_data = 3;
+  bytes ak_pub_tpm2b = 4;
+  bytes quote_msg = 5;
+  bytes quote_sig = 6;
+}
+
+// Versioned, typed public evidence envelope for new SDK integrations.
+message PublicAttestationEvidence {
+  uint32 schema_version = 1;
+  AttestationProvider provider = 2;
+  string workspace_id = 3;
+  bytes workspace_measurement = 4;
+  bytes nonce = 5;
+  int64 issued_at = 6;
+  bytes report_data = 7;
+  oneof proof {
+    SoftwareProof software = 10;
+    SevSnpDirectProof sev_snp_direct = 11;
+    SevSnpAzureProof sev_snp_azure = 12;
+  }
 }

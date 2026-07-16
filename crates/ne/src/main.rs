@@ -328,7 +328,10 @@ async fn main() -> Result<()> {
                     .await
                     .context("GetAttestationEvidence RPC failed")?
                     .into_inner();
-                print_attestation_evidence(resp.evidence.as_ref());
+                print_attestation_evidence(
+                    resp.public_evidence.as_ref(),
+                    legacy_attestation_evidence(&resp),
+                )?;
                 Ok(())
             }
         },
@@ -409,17 +412,56 @@ fn print_unexpose_port_result(workspace_id: &str, port: u32) {
 ///
 /// Output goes to stdout so operators and scripts can capture it directly.
 #[allow(clippy::print_stdout)]
-fn print_attestation_evidence(ev: Option<&ne_protocol::grpc::runtime::v1::AttestationEvidence>) {
-    match ev {
-        Some(ev) => {
-            println!("provider:    {}", ev.provider_type);
-            println!("workspace:   {}", ev.workspace_id);
-            println!("measurement: {}", hex::encode(&ev.measurement));
-            println!("nonce:       {}", hex::encode(&ev.nonce));
-            println!("issued_at:   {}", ev.issued_at);
-        }
-        None => println!("(no evidence returned)"),
+fn print_attestation_evidence(
+    public: Option<&ne_protocol::grpc::runtime::v1::PublicAttestationEvidence>,
+    legacy: Option<&ne_protocol::grpc::runtime::v1::AttestationEvidence>,
+) -> Result<()> {
+    for line in attestation_evidence_lines(public, legacy)? {
+        println!("{line}");
     }
+    Ok(())
+}
+
+fn attestation_evidence_lines(
+    public: Option<&ne_protocol::grpc::runtime::v1::PublicAttestationEvidence>,
+    legacy: Option<&ne_protocol::grpc::runtime::v1::AttestationEvidence>,
+) -> Result<Vec<String>> {
+    if let Some(evidence) = public {
+        let evidence = ne_protocol::PublicAttestationEvidence::try_from(evidence.clone())
+            .context("invalid public attestation evidence returned by runtime")?;
+        let provider = match evidence.provider {
+            ne_protocol::PublicAttestationProvider::Software => "software",
+            ne_protocol::PublicAttestationProvider::SevSnpDirect => "sev_snp_direct",
+            ne_protocol::PublicAttestationProvider::SevSnpAzure => "sev_snp_azure",
+        };
+        return Ok(vec![
+            format!("provider:    {provider}"),
+            format!("workspace:   {}", evidence.workspace_id),
+            format!(
+                "measurement: {}",
+                hex::encode(evidence.workspace_measurement)
+            ),
+            format!("nonce:       {}", hex::encode(evidence.nonce)),
+            format!("issued_at:   {}", evidence.issued_at),
+        ]);
+    }
+    if let Some(evidence) = legacy {
+        return Ok(vec![
+            format!("provider:    {}", evidence.provider_type),
+            format!("workspace:   {}", evidence.workspace_id),
+            format!("measurement: {}", hex::encode(&evidence.measurement)),
+            format!("nonce:       {}", hex::encode(&evidence.nonce)),
+            format!("issued_at:   {}", evidence.issued_at),
+        ]);
+    }
+    Ok(vec!["(no evidence returned)".to_string()])
+}
+
+#[allow(deprecated)]
+fn legacy_attestation_evidence(
+    response: &ne_protocol::grpc::runtime::v1::GetAttestationEvidenceResponse,
+) -> Option<&ne_protocol::grpc::runtime::v1::AttestationEvidence> {
+    response.evidence.as_ref()
 }
 
 /// Resolve the uid of the `ne` service account for the Install dispatch.
@@ -473,4 +515,75 @@ fn init_tracing_stderr() -> Result<()> {
         .json()
         .try_init()
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod attestation_output_tests {
+    use super::*;
+    use ne_protocol::grpc::runtime::v1 as pb;
+
+    fn public_software_evidence() -> pb::PublicAttestationEvidence {
+        pb::PublicAttestationEvidence {
+            schema_version: 1,
+            provider: pb::AttestationProvider::Software as i32,
+            workspace_id: "ws-public".into(),
+            workspace_measurement: vec![0x11; 32],
+            nonce: vec![0x22; 16],
+            issued_at: 1_700_000_011,
+            report_data: vec![0x33],
+            proof: Some(pb::public_attestation_evidence::Proof::Software(
+                pb::SoftwareProof {
+                    signature: vec![0x44; 64],
+                    signer_pubkey: vec![0x55; 32],
+                },
+            )),
+        }
+    }
+
+    fn legacy_evidence() -> pb::AttestationEvidence {
+        pb::AttestationEvidence {
+            provider_type: "software".into(),
+            workspace_id: "ws-legacy".into(),
+            measurement: vec![0x66; 32],
+            nonce: vec![0x77; 16],
+            issued_at: 1_700_000_012,
+            report_data: vec![0x88],
+            proof: Some(pb::AttestationProof {
+                signature: vec![0x99; 64],
+                signer_pubkey: vec![0xaa; 32],
+                sev_snp_report: Vec::new(),
+                sev_snp_vcek_chain: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn attestation_output_prefers_public_evidence() {
+        let public = public_software_evidence();
+        let legacy = legacy_evidence();
+
+        let lines =
+            attestation_evidence_lines(Some(&public), Some(&legacy)).expect("valid evidence");
+
+        assert_eq!(lines[0], "provider:    software");
+        assert_eq!(lines[1], "workspace:   ws-public");
+        assert_eq!(
+            lines[2],
+            format!("measurement: {}", hex::encode([0x11; 32]))
+        );
+    }
+
+    #[test]
+    fn attestation_output_falls_back_to_legacy_evidence() {
+        let legacy = legacy_evidence();
+
+        let lines = attestation_evidence_lines(None, Some(&legacy)).expect("legacy evidence");
+
+        assert_eq!(lines[0], "provider:    software");
+        assert_eq!(lines[1], "workspace:   ws-legacy");
+        assert_eq!(
+            lines[2],
+            format!("measurement: {}", hex::encode([0x66; 32]))
+        );
+    }
 }
