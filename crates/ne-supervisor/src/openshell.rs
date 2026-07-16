@@ -375,9 +375,29 @@ mod imp {
         args: &[String],
         timeout_ms: u32,
     ) -> Result<GuestResponse, OpenShellError> {
+        run_command_via_ssh_endpoint(
+            sandbox.ssh_addr,
+            &sandbox.handshake_secret,
+            command,
+            args,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// Relay one command through an owned snapshot of a sandbox's control
+    /// endpoint. This lets the workspace registry release its mutex before
+    /// awaiting SSH I/O.
+    pub async fn run_command_via_ssh_endpoint(
+        ssh_addr: SocketAddr,
+        handshake_secret: &str,
+        command: &str,
+        args: &[String],
+        timeout_ms: u32,
+    ) -> Result<GuestResponse, OpenShellError> {
         let timeout_ms =
             crate::util::clamp_timeout_ms(timeout_ms, *crate::util::MAX_EXEC_TIMEOUT_MS);
-        let handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
+        let handle = connect_with_preface(ssh_addr, handshake_secret).await?;
         // Open a session channel + issue exec (the binary + args joined as the
         // server's exec_request expects).
         let mut exec_line = command.to_string();
@@ -450,9 +470,27 @@ mod imp {
         content: Vec<u8>,
         timeout_ms: u32,
     ) -> Result<GuestResponse, OpenShellError> {
+        write_file_via_sftp_endpoint(
+            sandbox.ssh_addr,
+            &sandbox.handshake_secret,
+            path,
+            content,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// Write through an owned snapshot of a sandbox's control endpoint.
+    pub async fn write_file_via_sftp_endpoint(
+        ssh_addr: SocketAddr,
+        handshake_secret: &str,
+        path: &str,
+        content: Vec<u8>,
+        timeout_ms: u32,
+    ) -> Result<GuestResponse, OpenShellError> {
         let bytes_written = u64::try_from(content.len()).unwrap_or(u64::MAX);
         let work = async {
-            let handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
+            let handle = connect_with_preface(ssh_addr, handshake_secret).await?;
             let channel = handle
                 .channel_open_session()
                 .await
@@ -508,8 +546,26 @@ mod imp {
         max_bytes: u64,
         timeout_ms: u32,
     ) -> Result<GuestResponse, OpenShellError> {
+        read_file_via_sftp_endpoint(
+            sandbox.ssh_addr,
+            &sandbox.handshake_secret,
+            path,
+            max_bytes,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// Read through an owned snapshot of a sandbox's control endpoint.
+    pub async fn read_file_via_sftp_endpoint(
+        ssh_addr: SocketAddr,
+        handshake_secret: &str,
+        path: &str,
+        max_bytes: u64,
+        timeout_ms: u32,
+    ) -> Result<GuestResponse, OpenShellError> {
         let work = async {
-            let handle = connect_with_preface(sandbox.ssh_addr, &sandbox.handshake_secret).await?;
+            let handle = connect_with_preface(ssh_addr, handshake_secret).await?;
             let channel = handle
                 .channel_open_session()
                 .await
@@ -757,5 +813,6 @@ pub mod preface {
 #[cfg(all(target_os = "linux", feature = "confidential-cvm"))]
 pub use imp::{
     LaunchError, OpenShellError, OpenShellLaunchConfig, OpenShellSandbox as Sandbox,
-    read_file_via_sftp, run_command_via_ssh, write_file_via_sftp,
+    read_file_via_sftp, read_file_via_sftp_endpoint, run_command_via_ssh,
+    run_command_via_ssh_endpoint, write_file_via_sftp, write_file_via_sftp_endpoint,
 };

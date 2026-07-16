@@ -45,6 +45,10 @@ pub enum Command {
     ApiKey(ApiKeyArgs),
     /// Export and verify the signed audit chain.
     Audit(AuditArgs),
+    /// Verify exported attestation evidence offline.
+    Attestation(AttestationArgs),
+    /// Inspect runtime capabilities.
+    Runtime(RuntimeArgs),
     /// Generate a self-signed TLS cert for dev/test (NOT for production).
     Tls(TlsArgs),
     /// Inspect and verify snapshot artifacts.
@@ -94,6 +98,15 @@ pub struct ServeApiArgs {
 
 #[derive(Debug, Parser)]
 pub struct ServeSupervisorArgs {
+    /// Execution and attestation profile for this supervisor.
+    #[arg(
+        long,
+        env = "NE_EXECUTION_PROFILE",
+        default_value = "standard",
+        value_parser = parse_execution_profile
+    )]
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
+
     /// Path to the unix domain socket the API daemon connects on.
     #[arg(
         long,
@@ -148,10 +161,9 @@ pub struct ServeSupervisorArgs {
 
     /// Path to the `openshell-sandbox` binary on the host.
     ///
-    /// Only used on the **confidential tier** (single-CVM-direct, B;
-    /// `NE_CONFIDENTIAL_MODE=1`). The supervisor spawns this binary as a
-    /// subprocess per workspace and controls it over SSH. Unused on the
-    /// standard (Firecracker) tier.
+    /// Only used by the `confidential-azure` execution profile. The supervisor
+    /// spawns this binary as a subprocess per workspace and controls it over
+    /// SSH. Unused by the standard (Firecracker) profile.
     #[arg(
         long,
         env = "NE_OPENSHELL_SANDBOX_BIN",
@@ -281,6 +293,25 @@ pub struct PrivacyRouterArgs {
 
 #[derive(Debug, Parser)]
 pub struct InstallArgs {
+    /// Execution profile to provision.
+    #[arg(
+        long,
+        env = "NE_EXECUTION_PROFILE",
+        default_value = "standard",
+        value_parser = parse_execution_profile
+    )]
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
+
+    /// Source `openshell-sandbox` executable for confidential Azure installs.
+    #[arg(long)]
+    pub openshell_sandbox_source: Option<PathBuf>,
+    /// Optional source OpenShell Rego policy.
+    #[arg(long)]
+    pub openshell_policy_rules_source: Option<PathBuf>,
+    /// Optional source OpenShell YAML policy data.
+    #[arg(long)]
+    pub openshell_policy_data_source: Option<PathBuf>,
+
     /// Redirect all paths under this root (fakeroot testing). Skips
     /// user/group creation and systemctl when set.
     #[arg(long)]
@@ -308,6 +339,15 @@ pub struct UninstallArgs {
 
 #[derive(Debug, Parser)]
 pub struct DoctorArgs {
+    /// Execution profile whose host requirements should be checked.
+    #[arg(
+        long,
+        env = "NE_EXECUTION_PROFILE",
+        default_value = "standard",
+        value_parser = parse_execution_profile
+    )]
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
+
     #[arg(long)]
     pub prefix: Option<PathBuf>,
 }
@@ -379,6 +419,45 @@ pub enum AuditCommand {
 }
 
 #[derive(Debug, Parser)]
+pub struct AttestationArgs {
+    #[command(subcommand)]
+    pub command: AttestationCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AttestationCommand {
+    /// Verify public evidence JSON against an explicit offline policy.
+    Verify {
+        /// Path to the public evidence JSON file.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// Path to the verification policy JSON file.
+        #[arg(long)]
+        policy: PathBuf,
+    },
+}
+
+#[derive(Debug, Parser)]
+pub struct RuntimeArgs {
+    #[command(subcommand)]
+    pub command: RuntimeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuntimeCommand {
+    /// Print the running runtime's resolved capability contract as JSON.
+    Capabilities {
+        /// gRPC API endpoint.
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
+        endpoint: String,
+    },
+}
+
+#[derive(Debug, Parser)]
 pub struct TlsArgs {
     #[command(subcommand)]
     pub command: TlsCommand,
@@ -425,7 +504,11 @@ pub enum PoolCommand {
     /// convenience command does not perform API-key/TLS auth.
     Status {
         /// API gRPC endpoint URL.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
 }
@@ -434,6 +517,14 @@ pub enum PoolCommand {
 pub struct WorkspaceArgs {
     #[command(subcommand)]
     pub command: WorkspaceCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EvidenceOutput {
+    /// Human-readable provider and binding summary.
+    Summary,
+    /// Complete versioned public evidence envelope as JSON.
+    Json,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -449,7 +540,11 @@ pub enum WorkspaceCommand {
         #[arg(long = "header", value_parser = parse_header_kv)]
         headers: Vec<(String, String)>,
         /// gRPC API endpoint.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
     /// Stop routing ingress to a previously exposed guest port.
@@ -460,7 +555,11 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         port: u16,
         /// gRPC API endpoint.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
     /// Generate attestation evidence for a workspace (challenge-response).
@@ -471,8 +570,18 @@ pub enum WorkspaceCommand {
         /// 32-byte nonce is generated.
         #[arg(long)]
         nonce: Option<String>,
+        /// Evidence output format.
+        #[arg(long, value_enum, default_value_t = EvidenceOutput::Summary)]
+        output: EvidenceOutput,
+        /// Write output to this file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// gRPC API endpoint.
-        #[arg(long, env = "NE_API_ENDPOINT", default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            long,
+            env = "NE_API_ENDPOINT",
+            default_value = "http://127.0.0.1:50051"
+        )]
         endpoint: String,
     },
 }
@@ -481,6 +590,10 @@ fn parse_header_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .ok_or_else(|| format!("expected NAME=VALUE, got {s:?}"))
+}
+
+fn parse_execution_profile(value: &str) -> Result<ne_protocol::profile::ExecutionProfile, String> {
+    value.parse()
 }
 
 #[cfg(test)]
@@ -500,5 +613,124 @@ mod tests {
                 "expected serve-supervisor"
             ),
         }
+    }
+
+    #[test]
+    fn execution_profile_defaults_to_standard() {
+        let cli = Cli::try_parse_from(["nee", "serve-supervisor", "--dev-mode"]).expect("parse");
+        let Command::ServeSupervisor(args) = cli.command else {
+            panic!("expected supervisor command");
+        };
+        assert_eq!(
+            args.execution_profile,
+            ne_protocol::profile::ExecutionProfile::Standard
+        );
+    }
+
+    #[test]
+    fn execution_profile_accepts_confidential_azure() {
+        let cli =
+            Cli::try_parse_from(["nee", "doctor", "--execution-profile", "confidential-azure"])
+                .expect("parse");
+        let Command::Doctor(args) = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert_eq!(
+            args.execution_profile,
+            ne_protocol::profile::ExecutionProfile::ConfidentialAzure
+        );
+    }
+
+    #[test]
+    fn confidential_install_accepts_component_sources() {
+        let cli = Cli::try_parse_from([
+            "nee",
+            "install",
+            "--execution-profile",
+            "confidential-azure",
+            "--openshell-sandbox-source",
+            "/tmp/openshell-sandbox",
+            "--openshell-policy-rules-source",
+            "/tmp/policy.rego",
+            "--openshell-policy-data-source",
+            "/tmp/policy.yaml",
+        ])
+        .expect("parse");
+        let Command::Install(args) = cli.command else {
+            panic!("expected install command");
+        };
+        assert_eq!(
+            args.openshell_sandbox_source,
+            Some(PathBuf::from("/tmp/openshell-sandbox"))
+        );
+        assert_eq!(
+            args.openshell_policy_rules_source,
+            Some(PathBuf::from("/tmp/policy.rego"))
+        );
+        assert_eq!(
+            args.openshell_policy_data_source,
+            Some(PathBuf::from("/tmp/policy.yaml"))
+        );
+    }
+
+    #[test]
+    fn attestation_verify_accepts_evidence_and_policy_paths() {
+        let cli = Cli::try_parse_from([
+            "nee",
+            "attestation",
+            "verify",
+            "--evidence",
+            "evidence.json",
+            "--policy",
+            "policy.json",
+        ])
+        .expect("parse attestation verify");
+        let Command::Attestation(args) = cli.command else {
+            panic!("expected attestation command");
+        };
+        let AttestationCommand::Verify { evidence, policy } = args.command;
+        assert_eq!(evidence, PathBuf::from("evidence.json"));
+        assert_eq!(policy, PathBuf::from("policy.json"));
+    }
+
+    #[test]
+    fn workspace_attest_accepts_json_output_file() {
+        let cli = Cli::try_parse_from([
+            "nee",
+            "workspace",
+            "attest",
+            "secret-1",
+            "--output",
+            "json",
+            "--out",
+            "evidence.json",
+        ])
+        .expect("parse workspace attest output");
+        let Command::Workspace(args) = cli.command else {
+            panic!("expected workspace command");
+        };
+        let WorkspaceCommand::Attest {
+            output,
+            out,
+            endpoint,
+            ..
+        } = args.command
+        else {
+            panic!("expected attest command");
+        };
+        assert_eq!(output, EvidenceOutput::Json);
+        assert_eq!(out, Some(PathBuf::from("evidence.json")));
+        assert_eq!(endpoint, "http://127.0.0.1:50051");
+    }
+
+    #[test]
+    fn runtime_capabilities_defaults_to_grpc_endpoint() {
+        let cli =
+            Cli::try_parse_from(["nee", "runtime", "capabilities"]).expect("parse capabilities");
+        let Command::Runtime(args) = cli.command else {
+            panic!("expected runtime command");
+        };
+        let RuntimeCommand::Capabilities { endpoint } = args.command;
+        assert_eq!(endpoint, "http://127.0.0.1:50051");
     }
 }

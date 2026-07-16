@@ -13,7 +13,15 @@ import type {
   UnexposePortRequest,
   WriteFileRequest,
 } from "../src/generated/ne/runtime/v1/runtime.js";
-import { Client, isServiceError } from "../src/index.js";
+import {
+  AttestationBackend,
+  AttestationProvider,
+  Client,
+  ExecutionBackend,
+  ExecutionProfile,
+  WorkspaceOperation,
+  isServiceError,
+} from "../src/index.js";
 import { type FakeServerHandle, startFakeServer, statusError } from "./helpers/fake-server.js";
 
 describe("Client", () => {
@@ -111,6 +119,66 @@ describe("Client", () => {
       expect(seen?.network).toBeUndefined();
       expect(resp.workspaceId).toBe("wks-ts-1");
       expect(resp.firecrackerPid).toBe(99);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("createConfidentialWorkspace sends profile-neutral zero fields", async () => {
+    let seen: CreateWorkspaceRequest | undefined;
+    server = await startFakeServer({
+      createWorkspace: (req) => {
+        seen = req;
+        return {
+          workspaceId: req.workspaceId,
+          firecrackerPid: 0,
+          vsockHostSocket: "",
+          jailerChroot: "",
+          network: undefined,
+        };
+      },
+    });
+    const client = new Client({ target: server.target });
+    try {
+      await client.createConfidentialWorkspace({ workspaceId: "secret-1" });
+      expect(seen).toMatchObject({
+        workspaceId: "secret-1",
+        kernelSha256: "",
+        rootfsSha256: "",
+        rootfsReadOnly: true,
+        vcpuCount: 0,
+        memSizeMib: 0,
+        guestVsockCid: 0,
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  test("getRuntimeCapabilities returns the resolved execution profile", async () => {
+    server = await startFakeServer({
+      getRuntimeCapabilities: () => ({
+        runtimeVersion: "0.2.0",
+        executionProfile: ExecutionProfile.EXECUTION_PROFILE_CONFIDENTIAL_AZURE,
+        executionBackend: ExecutionBackend.EXECUTION_BACKEND_OPEN_SHELL,
+        attestationBackend: AttestationBackend.ATTESTATION_BACKEND_SEV_SNP_AZURE,
+        supportedOperations: [
+          WorkspaceOperation.WORKSPACE_OPERATION_CREATE,
+          WorkspaceOperation.WORKSPACE_OPERATION_ATTEST,
+        ],
+        hardWorkspaceCapacity: 1,
+        confidentialSnapshotSupported: false,
+        evidenceSchemaVersion: 1,
+      }),
+    });
+    const client = new Client({ target: server.target });
+    try {
+      const capabilities = await client.getRuntimeCapabilities();
+      expect(capabilities.executionProfile).toBe(
+        ExecutionProfile.EXECUTION_PROFILE_CONFIDENTIAL_AZURE,
+      );
+      expect(capabilities.hardWorkspaceCapacity).toBe(1);
+      expect(capabilities.evidenceSchemaVersion).toBe(1);
     } finally {
       client.close();
     }
@@ -735,6 +803,56 @@ describe("Client", () => {
       expect(seen?.workspaceId).toBe("ws-att");
       expect(resp.evidence?.providerType).toBe("software");
       expect(resp.evidence?.workspaceId).toBe("ws-att");
+    } finally {
+      client.close();
+    }
+  });
+
+  test("getAttestationEvidence preserves all Azure typed proof fields", async () => {
+    server = await startFakeServer({
+      getAttestationEvidence: (req) => ({
+        evidence: undefined,
+        publicEvidence: {
+          schemaVersion: 1,
+          provider: AttestationProvider.ATTESTATION_PROVIDER_SEV_SNP_AZURE,
+          workspaceId: req.workspaceId,
+          workspaceMeasurement: new Uint8Array(32).fill(1),
+          nonce: req.nonce,
+          issuedAt: 1,
+          reportData: new Uint8Array([2]),
+          proof: {
+            $case: "sevSnpAzure",
+            sevSnpAzure: {
+              report: new Uint8Array([3]),
+              vcekCertChain: new Uint8Array([4]),
+              varData: new Uint8Array([5]),
+              akPubTpm2b: new Uint8Array([6]),
+              quoteMsg: new Uint8Array([7]),
+              quoteSig: new Uint8Array([8]),
+            },
+          },
+        },
+      }),
+    });
+    const client = new Client({ target: server.target });
+    try {
+      const resp = await client.getAttestationEvidence({
+        workspaceId: "ws-azure",
+        nonce: new Uint8Array(16).fill(9),
+      });
+      expect(resp.publicEvidence?.provider).toBe(
+        AttestationProvider.ATTESTATION_PROVIDER_SEV_SNP_AZURE,
+      );
+      expect(resp.publicEvidence?.proof?.$case).toBe("sevSnpAzure");
+      if (resp.publicEvidence?.proof?.$case !== "sevSnpAzure") {
+        throw new Error("expected Azure proof");
+      }
+      expect(Array.from(resp.publicEvidence.proof.sevSnpAzure.report)).toEqual([3]);
+      expect(Array.from(resp.publicEvidence.proof.sevSnpAzure.vcekCertChain)).toEqual([4]);
+      expect(Array.from(resp.publicEvidence.proof.sevSnpAzure.varData)).toEqual([5]);
+      expect(Array.from(resp.publicEvidence.proof.sevSnpAzure.akPubTpm2b)).toEqual([6]);
+      expect(Array.from(resp.publicEvidence.proof.sevSnpAzure.quoteMsg)).toEqual([7]);
+      expect(Array.from(resp.publicEvidence.proof.sevSnpAzure.quoteSig)).toEqual([8]);
     } finally {
       client.close();
     }

@@ -1,8 +1,8 @@
 # NeuronEdge Enclave — Public Threat Model
 
-**Status:** As-built security audit complete. First pass fixed 1 Critical (restore/fork ID path traversal) + 4 High (snapshot-manifest host-key pinning, audit front-truncation detection, fork CRNG reseed, dev-mode non-loopback refusal); follow-up passes added ingress and IPC hardening, output caps, audit event hygiene, and the breaking managed-image contract with snapshot manifest version 5 (clean pre-1.0 break — no migration).
-**Date:** June 2026
-**Scope:** The Apache-2.0 NeuronEdge Enclave **runtime** as shipped. The **control-plane key-release Worker** (`control-plane/`) is a separate surface referenced where it bears on the runtime's sealed-snapshot path; its authoritative gate + anti-replay are synthetic-tested, with live AWS KMS + real silicon unclaimed.
+**Status:** As-built security audit complete for the v0.2.0 candidate. The standard profile is Supported. The `confidential-azure` profile is Preview until the exact signed candidate passes the required KVM and Azure artifact gates without a rebuild.
+**Date:** July 2026
+**Scope:** The Apache-2.0 NeuronEdge Enclave **runtime** as built for the v0.2.0 candidate. The **control-plane key-release Worker** (`control-plane/`) is a separate surface referenced where it bears on the runtime's sealed-snapshot path; its authoritative gate + anti-replay are synthetic-tested, with live AWS KMS + real-silicon key release unclaimed.
 **Canonical:** This document is the canonical, as-built threat model. The architecture doc is design intent; this is ground truth.
 
 ---
@@ -18,9 +18,11 @@ this.
 It is written for a hostile reader: a security researcher who will diff every claim here
 against the source under `crates/`, and who rewards disclosed limits
 and punishes concealment. We share that incentive. NeuronEdge Enclave's wedge is an enforced execution
-boundary — though note that *independent, hardware-verifiable* attestation of that boundary
-is a later phase: today the boundary is enforced by the host but is not yet independently
-tenant-verifiable. An unfalsifiable security claim is worthless to a reviewer. So the rule below is non-negotiable, for
+boundary with independently verifiable audit and attestation artifacts. The standard profile
+uses software-rooted evidence and trusts the host operator. The Preview Azure profile exposes
+hardware-rooted evidence for the outer CVM, but does not attest guest code or create a
+per-workspace hardware boundary. An unfalsifiable security claim is worthless to a reviewer.
+So the rule below is non-negotiable, for
 us and for every future editor of this file.
 
 **Status legend (used throughout):**
@@ -46,7 +48,7 @@ is in §11.
 
 ---
 
-## 2. What ships today
+## 2. What the v0.2.0 candidate contains
 
 The NeuronEdge Enclave runtime runs untrusted agent code inside
 **standard (non-confidential) Firecracker microVMs** with a minimized device model and a
@@ -68,8 +70,20 @@ auth, separately). Additionally, **`nee audit export` / `nee audit verify`** (`c
 produce an independently-verifiable, externally-pinnable artifact from the signed
 Merkle chain — operators can ship the chain off-host and any party can confirm it is
 unedited. Immutable off-host *storage* (WORM) remains the operator's responsibility
-(see §7 T5, §9). **The attestation foundation is shipped**: the `ne-attestation` crate ships an `AttestationProvider` trait, a `SoftwareProvider` software-fallback (Ed25519, runtime-key-rooted, NOT firmware-rooted), and a pure `verify()`. The on-demand challenge–response evidence API is threaded end-to-end (proto → gRPC → REST → Python/TS SDK → `nee workspace attest` CLI). Three signed audit events flow through the Merkle chain: `AttestationEvidenceIssued` (evidence generated and signed by the host and issued to the caller — the supervisor cannot observe the caller's client-side `verify()`, so the event records issuance, **not** verification), `AttestationFailed` (provider error, or measurement/nonce validation failure), `AttestationReplayed` (nonce already seen; replay rejected). The production software-attestation gate is a startup `bail!` (refuses to serve before any audit sink exists) and so emits **no** audit event. Event payloads carry only hashes — `nonce_sha256`, `measurement_sha256`, `provider_type` — never the raw nonce, signing key, or proof bytes. See §4 / §9 for the honest software-evidence trust caveat. **There is still no live hardware-rooted attestation and no confidential
-mode** — the SEV-SNP verify tier is production code but synthetic-unit-tested and silicon-unvalidated for the `/dev/sev-guest` path (report-fetch ioctl + e2e gated on a DCasv5); the host operator sees guest memory in cleartext. Sealed snapshots ship runtime-side and the CP-mediated key-release service is synthetic-tested (live AWS KMS + real silicon unclaimed — see §4), but neither advances the hardware-rooted claim. **Managed image enforcement is shipped**: cold create accepts only lowercase kernel/rootfs SHA-256 digests, resolves their fixed locations beneath the supervisor-owned image store, hashes retained no-follow file handles, and copies verified bytes into independent per-workspace files before launch (`crates/ne-supervisor/src/image.rs`, `crates/ne-supervisor/src/workspace.rs`). Restore and fork use the same resolver for the digest pair signed into the manifest. This prevents callers from supplying arbitrary host paths and prevents writable rootfs aliasing between the store or workspaces. It does not defend against a hostile host root, which remains trusted. **Paused-VM snapshot/restore
+(see §7 T5, §9). **The attestation foundation is shipped**: the `ne-attestation` crate ships an `AttestationProvider` trait, a `SoftwareProvider` software-fallback (Ed25519, runtime-key-rooted, NOT firmware-rooted), and a pure `verify()`. The on-demand challenge–response evidence API is threaded end-to-end (proto → gRPC → REST → Python/TS SDK → `nee workspace attest` CLI). Three signed audit events flow through the Merkle chain: `AttestationEvidenceIssued` (evidence generated and signed by the host and issued to the caller — the supervisor cannot observe the caller's client-side `verify()`, so the event records issuance, **not** verification), `AttestationFailed` (provider error, or measurement/nonce validation failure), `AttestationReplayed` (nonce already seen; replay rejected). The production software-attestation gate is a startup `bail!` (refuses to serve before any audit sink exists) and so emits **no** audit event. Event payloads carry only hashes — `nonce_sha256`, `measurement_sha256`, `provider_type` — never the raw nonce, signing key, or proof bytes. See §4 / §9 for the honest software-evidence trust caveat.
+
+The separate `confidential-azure` profile is **Preview**. It runs one OpenShell
+workspace directly inside an Azure SEV-SNP CVM, selects the Azure vTPM provider
+explicitly, and exposes complete typed evidence through REST, gRPC, the CLI,
+and the Python/TypeScript SDKs. The Azure vTPM evidence primitive has been
+verified on DCasv5 silicon. Product promotion still requires the exact signed
+v0.2.0 candidate to pass the KVM and Azure artifact gates without a rebuild.
+The profile does not use nested Firecracker, does not support
+snapshot/restore/fork, and does not claim guest-code measurement,
+per-workspace hardware isolation, or hardware-rooted key release. No public
+v0.2.0 product profile selects the direct `/dev/sev-guest` provider.
+
+Sealed snapshots ship runtime-side and the CP-mediated key-release service is synthetic-tested (live AWS KMS + real-silicon key release unclaimed — see §4), but neither advances the hardware-rooted key-release claim. **Managed image enforcement is shipped**: cold create accepts only lowercase kernel/rootfs SHA-256 digests, resolves their fixed locations beneath the supervisor-owned image store, hashes retained no-follow file handles, and copies verified bytes into independent per-workspace files before launch (`crates/ne-supervisor/src/image.rs`, `crates/ne-supervisor/src/workspace.rs`). Restore and fork use the same resolver for the digest pair signed into the manifest. This prevents callers from supplying arbitrary host paths and prevents writable rootfs aliasing between the store or workspaces. It does not defend against a hostile host root, which remains trusted. **Paused-VM snapshot/restore
 with a signed version-5 manifest is shipped**: a read-only-rootfs PAUSED microVM can be snapshotted
 into a reusable artifact (`crates/ne-supervisor/src/firecracker.rs` `snapshot_create`,
 `crates/ne-supervisor/src/workspace.rs` `WorkspaceManager::snapshot`); the artifact's
@@ -98,14 +112,14 @@ What the runtime is trying to protect, as it exists today.
 
 | Asset | Sensitivity | Notes |
 |---|---|---|
-| Customer agent code and data (in-memory, in-transit) | High | In standard mode, in-memory data is visible to the host operator — there is no memory encryption without confidential mode (§9). |
+| Customer agent code and data (in-memory, in-transit) | High | In `standard`, in-memory data is visible to the trusted host operator. In `confidential-azure` Preview, the outer Azure CVM supplies SEV-SNP memory encryption; OpenShell isolation inside the CVM remains shared-kernel (§4/§9). |
 | Audit event chain | High (tamper-evidence required) | Protected by the signed Merkle chain, §5/§7 (T5). |
 | Runtime audit signing key | High | Ed25519 keypair generated on the host at first run, persisted private-key `0600` under the state dir, and loaded on subsequent runs; the public half is inlined in every event so verifiers need no out-of-band key — `crates/ne-supervisor/src/audit.rs`. **Not** embedded in deployment artifacts (it is generated locally). There is **no rotation today**: the protocol can accommodate a later rotation without invalidating prior entries, but none is performed (key rotation is a future capability). |
 | Operator credentials | High | Host-side operator access. |
 | Image artifacts (guest kernel, rootfs) | Medium | Imported into a supervisor-owned content-addressed store, then re-verified by digest on create and restore before independent staging (§4); may carry upstream CVEs. |
 | Telemetry / event metadata | Medium | Emitted for the security event surface. |
 
-> **Confidential-mode assets (not yet shipped as hardware-rooted).** The following are
+> **Key-release and sealed-snapshot assets (not hardware-rooted).** The following are
 > listed here so their current status is explicit:
 >
 > - **Sealed-snapshot contents** — paused-VM snapshot/restore with a signed manifest is
@@ -126,23 +140,26 @@ What the runtime is trying to protect, as it exists today.
 
 ## 4. Trust boundaries (as-built)
 
-The architecture defines four trust tiers. Three of them describe
-the shipped runtime. The fourth — **Attested** — is a later phase.
+The runtime exposes two product profiles with different trust boundaries:
+`standard` and Preview `confidential-azure`.
 
-**Trusted.** Host kernel and KVM; the `ne-api`, `ne-supervisor`, and forked
-Firecracker binaries **as installed by the operator**; host network policy (nftables); host
-storage metadata; and the audit signing key. Be precise about the host binaries: there is
-**no independent runtime signature or digest verification** of `ne-api` /
-`ne-supervisor` / Firecracker today — they are trusted because the operator installed
-them. Build-time artifact signing (cosign) + SBOM is a release-pipeline item
-and is **⏳ Planned**, not an as-built control. Guest kernels and rootfs images are checked
+**Trusted in `standard`.** Host kernel and KVM; the `ne-api`, `ne-supervisor`, and
+operator-provided Firecracker binaries; host network policy (nftables); host storage metadata;
+and the audit signing key. The v0.2.0 release candidate signs the shipped `nee` binary,
+OpenShell binary and policies, SDK packages, component manifest, and checksums; publishes an
+SPDX SBOM plus GitHub build provenance; and makes the bootstrap installer verify signatures,
+checksums, and resolved manifest digests before installation. Firecracker and jailer remain
+operator-provided and outside that signed bundle. These release controls do not make a hostile
+root trusted, do not verify binaries continuously after installation, and do not implement
+runtime package-policy enforcement. Guest kernels and rootfs images are checked
 against operator-supplied SHA-256 values during import (`crates/ne/src/install/image.rs`).
 Cold create, restore, and fork then resolve only fixed artifact names beneath the configured
 managed store, reject symlinks and non-regular files, verify bytes through retained no-follow
 handles, and copy them into independent chroot files (`crates/ne-supervisor/src/image.rs`,
 `crates/ne-supervisor/src/workspace.rs`).
-**The host operator is trusted today.** With no confidential mode, the operator can read
-guest memory; we do not pretend otherwise (§6, §9).
+**The host operator is trusted in `standard`.** The operator can read guest memory; we do
+not pretend otherwise (§6, §9). In `confidential-azure`, the Azure CVM boundary is intended
+to exclude the cloud host operator, while guest root inside that CVM remains trusted.
 
 **Partially trusted.** The guest agent — used for convenience and liveness, but the host
 **must assume it can lie or be compromised**; the host enforces policy, never the guest.
@@ -151,16 +168,35 @@ plane metadata — ⏳ context: today's localhost/dev-mode runtime has no contro
 plane, so there is no such metadata to validate yet; once a control plane exists it is
 validated against a versioned protocol and not blindly trusted.
 
-**Attested (confidential mode) — ⏳ Not shipped (hardware tier).** The architecture's attested tier (sealed-snapshot key release gated on attestation, CPU-encrypted VM memory, and CPU-firmware-rooted platform identity) does **not** exist in this runtime. Do not rely on any of it. It is documented in the architecture doc as design intent.
+**Azure confidential product profile — ◐ Preview.** The product routing,
+single-workspace capacity limit, OpenShell execution backend, Azure vTPM
+provider selection, public capability discovery, and typed evidence APIs are
+implemented. The low-level evidence primitive is silicon-verified; the product
+lane remains Preview until the exact signed v0.2.0 artifact passes both
+required environment gates. Hardware-rooted key release, confidential
+snapshot/restore/fork, guest-code measurement, and per-workspace hardware
+isolation are not part of this profile.
 
 **Software-fallback attestation foundation — ◐ Partial.** The `ne-attestation` crate and full evidence API are shipped. The software provider attests "this runtime instance, holding this key, asserts this workspace ran with this configuration." It is **NOT CPU-firmware-rooted**: it does not prove host-platform integrity, it does not exclude a compromised host operator, and it cannot substitute for hardware attestation where hardware is required. Honest caveats:
 
-- `provider_type: software` is inside the signed `report_data` so it cannot be forged to appear as hardware; an attestation policy can (and should) reject software evidence where hardware is required.
+- The public complete-evidence envelope exposes a typed provider enum. The
+  internal canonical `report_data` still signs `provider_type: software`, so a
+  proof cannot be relabeled as hardware; an attestation policy can and should
+  reject software evidence where hardware is required.
 - `verify()` pins to a **caller-supplied `expected_signer`** (the runtime identity public key, obtained out-of-band via control-plane enrollment or manual pinning). The key embedded in the evidence is only a consistency check — it cannot self-vouch. Without this out-of-band pin, the caller cannot establish the trust anchor.
 - The supervisor refuses to start with the software provider on a non-loopback bind unless `NE_ATTEST_ALLOW_SOFTWARE=1` is set (`crates/ne-supervisor/src/serve.rs`).
 - The per-workspace nonce ring is **bounded (256 entries) and in-memory only** — it is not a durable or cross-host anti-replay store. The ring prevents naive replay within a single supervisor session; callers requiring strong single-use nonce guarantees MUST enforce nonce uniqueness out-of-band (e.g., via a control-plane-managed nonce registry).
 
-**SEV-SNP host-CVM verify tier — ✅ Verified on Azure silicon.** The `ne-attestation` crate ships two SEV-SNP verify arms: `Proof::SevSnp` (the `/dev/sev-guest` ioctl path — for GCP/bare-metal/AWS, synthetic-unit-tested) and `Proof::SevSnpAzure` (the OpenHCL paravisor vTPM + TPM-Quote path — **verified end-to-end on an Azure DCasv5**). Both share `TrustAnchor::SevSnp` (AMD `AmdRootCert` / ARK), VCEK→ARK chain verification, and reference-value policy pins. The honest claim this tier now supports is **firmware-attested host CVM with hardware-anchored, per-request nonce binding** — *not* "each microVM is independently hardware-isolated." Specifically:
+**SEV-SNP host-CVM evidence primitive — ✅ Verified on Azure silicon; product
+profile ◐ Preview.** The `ne-attestation` crate ships two SEV-SNP verify arms:
+`Proof::SevSnp` (the `/dev/sev-guest` ioctl path — for GCP/bare-metal/AWS,
+synthetic-unit-tested) and `Proof::SevSnpAzure` (the OpenHCL paravisor vTPM +
+TPM-Quote path — **verified end-to-end on an Azure DCasv5**). Both share
+`TrustAnchor::SevSnp` (AMD `AmdRootCert` / ARK), VCEK→ARK chain verification,
+and reference-value policy pins. The honest claim this primitive supports is
+**firmware-attested host CVM with hardware-anchored, per-request nonce
+binding** — *not* "each microVM is independently hardware-isolated."
+Specifically:
 
 - The Azure path is a **two-layer binding**: (L1) the boot-fixed AMD report (read from vTPM NVRAM `0x01400001` via `tpm2_nvread`) with `SHA256(var_data) == report.REPORT_DATA[..32]` anchoring the vTPM Attestation Key (AK) into the hardware-signed report, validated VCEK→ASK→baked Milan ARK; (L2) a `tpm2_quote` under the AK (RSA-2048 RSASSA-PKCS1v1.5-SHA256) whose signature covers a `TPM2B_ATTEST` embedding `SHA256(canonical_report_data)` — genuine anti-replay (only the live, hardware-anchored AK can sign a fresh quote).
 - **Paravisor-in-TCB.** Azure relays the report through the OpenHCL paravisor, so the paravisor is inside the measured, attested set. This is honestly *larger* than a bare-metal/GCP report (no paravisor) but is **not weaker on report authenticity** — the VCEK→ARK signature chain is identical and the report is the genuine AMD artifact.
@@ -168,7 +204,7 @@ validated against a versioned protocol and not blindly trusted.
 - It is **not** per-microVM attestation. The confidential tier is **single-CVM-direct (B)** — the agent + OpenShell run directly inside the host CVM; there is no nested microVM. Workspace identity binds to *host-CVM* evidence. **Per-workspace hardware isolation (true per-microVM SNP) is deferred to a future bare-metal tier.**
 - It is **not KMS-hardware-bound.** The DEK is wrapped under the CP's `SoftwareKms` KEK (a Worker secret). The hardware-rooted gate is over *evidence*, not over the KEK's key material.
 - It is **not** guest-code measurement. The report's `MEASUREMENT` is the host-CVM/paravisor launch digest, not NeuronEdge runtime or workspace code.
-- **Nesting is architecturally impossible on managed cloud.** Nesting a Firecracker microVM inside a SEV-SNP CVM is impossible — AMD SEV-SNP strips the virtualization extensions from the leaf guest, and VMPLs are not an escape hatch. Verified: [Azure CVM FAQ](https://learn.microsoft.com/en-us/azure/confidential-computing/confidential-vm-faq), [AMDESE/AMDSEV #169](https://github.com/AMDESE/AMDSEV/issues/169). The runtime therefore consumes upstream Firecracker as a prebuilt binary on the confidential tier; per-microVM `KVM_SEV_SNP_*` launch is retained for the future bare-metal tier.
+- **Nesting is architecturally impossible on managed cloud.** Nesting a Firecracker microVM inside a SEV-SNP CVM is impossible — AMD SEV-SNP strips the virtualization extensions from the leaf guest, and VMPLs are not an escape hatch. Verified: [Azure CVM FAQ](https://learn.microsoft.com/en-us/azure/confidential-computing/confidential-vm-faq), [AMDESE/AMDSEV #169](https://github.com/AMDESE/AMDSEV/issues/169). The `confidential-azure` profile therefore runs OpenShell directly inside the outer CVM and does not install or invoke Firecracker. Per-microVM `KVM_SEV_SNP_*` launch is retained only for a future bare-metal profile.
 - **The confidential tier's isolation is shared-kernel, in-process.** On the confidential tier, OpenShell isolates the agent with Landlock/seccomp/network-namespaces/privilege-drop — strong, but **not a separate hardware-virtualized kernel**. The CVM boundary is the outer wall (operator-excluded, attested); OpenShell is defense-in-depth within it. A supervisor exploit yields the CVM guest's root, not a contained VM — the blast radius is bounded by the CVM. **One CVM per sensitive workspace** is mandated; multi-tenant-in-one-CVM is rejected (process-level isolation between workspaces in one CVM is too weak for the isolation guarantee).
 - TDX, mTLS, strong-global replay (beyond per-quote freshness), cross-host transfer, and the control-plane attestation policy engine remain **⏳ Planned**.
 
@@ -195,7 +231,7 @@ Per-surface, as shipped. Every ✅ cites a code path that exists at the current 
 
 | Surface | What is exposed | Current mitigation | Status |
 |---|---|---|---|
-| Firecracker microVM boundary | Virtio device model reachable from guest | Minimized device model; no unnecessary devices; the pinned Firecracker release (trusted as installed; build-time signing is a future release-pipeline item, §4); jailer applied — `crates/ne-supervisor/src/firecracker.rs` | ✅ |
+| Firecracker microVM boundary | Virtio device model reachable from guest | Minimized device model; no unnecessary devices; operator-provided Firecracker is trusted as installed and is outside the signed NeuronEdge bundle; jailer applied — `crates/ne-supervisor/src/firecracker.rs` | ✅ |
 | Jailer + host process hardening | Firecracker process privileges on the host | chroot / seccomp / cgroups v2 / namespaces via jailer, plus a hardened systemd capability set in the install templates — `crates/ne-supervisor/`, `crates/ne/templates/*.service.tmpl` | ✅ |
 | vsock guest↔supervisor IPC | Control channel between guest agent and supervisor | vsock transport with the supervisor as policy authority; the guest agent is partially trusted and cannot reconfigure host policy — `crates/ne-guest-agent/src/main.rs`, `crates/ne-supervisor/src/firecracker.rs` | ✅ |
 | NDJSON supervisor IPC socket | Local privileged control socket | NDJSON framing with `SO_PEERCRED` peer-UID authentication (`PeerAuth::RequireUid`) — only the expected local UID may issue commands — `crates/ne-supervisor/src/ipc.rs`. **Capacity bound:** single-threaded; drops under a boot-storm of concurrent creates (see §9). | ✅ |
@@ -218,9 +254,9 @@ in the shipped runtime.
 | **Compromised agent** | Arbitrary code execution in workspace; egress within policy | Escape workspace; exfiltrate; pivot | **Yes** — Firecracker + jailer workspace boundary and deny-by-default egress contain it (§5, §7 T1). |
 | **Malicious tenant** | Workspace-creation rights; worst-case workloads | Cross-tenant access; resource exhaustion | **Partially** — cgroups v2 resource caps apply. Cross-tenant snapshot leakage: snapshots are shipped; the manifest is signed by the host key and hashes all content — a tenant cannot substitute a foreign snapshot without breaking verification. **Fork with identity reset is shipped**: each fork boots in its own jailer chroot with a fresh vsock UDS path and a host-reset hostname/machine-id/RNG, fail-closed on reset failure. Per-fork memory copy cost means snapshot state (in-memory data at capture time) is present in each fork; usage contract is snapshot-a-warm-idle-base (see §7 T2, §9). CoW shared-backend (UFFD) deferred. |
 | **Network attacker** | Position between SDK and API | Eavesdrop; tamper; replay | **Partially** — callers are authenticated via API-key auth (`crates/ne-api/src/auth.rs`); an unauthenticated caller is rejected before it can issue commands. **Wire confidentiality is now defended on the encrypted channel when in-process TLS is deployed** — `crates/ne-api/src/tls.rs` encrypts gRPC and REST; `ApiConfig::guard` prevents a production daemon from silently serving tokens in clear on a non-loopback bind (`crates/ne-api/src/lib.rs`). An on-path attacker cannot eavesdrop a TLS-configured deployment. Loopback-only operator deployments without TLS remain a supported configuration (no external network exposure). **Client impersonation (mTLS) ⏳ Planned** — server-TLS authenticates the server, not the client; client identity is API-key only. |
-| **Insider host operator** | Full host access | Read agent memory; read disk; modify policy | **No — NOT defended.** With no confidential mode, the host operator is in the trusted set and can read guest memory in cleartext. This is a deliberate, disclosed gap, closed only by confidential mode (§4, §7 T3, §9). |
+| **Insider host operator** | Full host access | Read agent memory; read disk; modify policy | **Profile-specific.** Not defended in `standard`: the operator is trusted and can read guest memory. The Preview `confidential-azure` profile uses the outer SEV-SNP CVM to exclude the cloud host operator, but guest root inside the CVM remains trusted and the lane is not Supported until the exact signed artifact gate passes (§4, §7 T3, §9). |
 | **Insider control-plane operator** | Control-plane DB access | Tamper with audit; release keys to unattested host | **No** (later scope) — audit export to external WORM and attested key release are not yet shipped; the runtime's local Merkle chain is tamper-*evident* today but local-only (§7 T5, §9). |
-| **Supply-chain attacker** | Inject into build pipeline / upstream deps | Plant backdoor in a release | **No** (build-pipeline scope) — build-time SBOM / cosign signing is release-pipeline policy; runtime-supply-chain enforcement is not absorbed (§5, §9). |
+| **Supply-chain attacker** | Inject into build pipeline / upstream deps | Plant backdoor in a release | **Partially.** The v0.2.0 candidate has signed components, checksums, an SPDX SBOM, GitHub provenance, installer verification, and no-rebuild environment gates. Upstream dependencies, GitHub Actions, operator-provided Firecracker/jailer, post-install host mutation, and runtime package installs remain trusted or outside this control (§4, §5, §9). |
 
 ---
 
@@ -269,15 +305,18 @@ Shipped mitigations:
 Not yet shipped:
 - Copy-on-write shared backend (UFFD) on fork — each fork currently copies the full memory
   image; shared CoW is deferred (§9).
-- Sealed-snapshot key release gated on attestation — the **authoritative** server-side gate + anti-replay landed in the control-plane Worker (synthetic-tested); the runtime's local gate remains UX/latency-only. Live AWS KMS + real silicon still planned.
+- Sealed-snapshot key release gated on attestation — the **authoritative** server-side gate + anti-replay landed in the control-plane Worker (synthetic-tested); the runtime's local gate remains UX/latency-only. Live AWS KMS + real-silicon key release are still planned.
 - Tenant-scoped access policy on the snapshot/fork API — no multi-tenant control-plane in
   this runtime; the supervisor host key is the only signing authority.
 
-**T3 — Insider operator reads workspace state. ⏳ Not defended today.**
-The operator is trusted in the as-built runtime (§4, §6). The architecture's intended
-defenses — at-rest encryption with keys never in plaintext on disk, CPU-encrypted VM memory
-in confidential mode, and CPU-rooted attestation the operator cannot forge — are all
-**confidential mode** and are not present. Do not rely on operator-exclusion today.
+**T3 — Insider operator reads workspace state. Profile-specific.**
+In `standard`, the operator is trusted and this attack is not defended (§4,
+§6). In Preview `confidential-azure`, Azure SEV-SNP protects the outer CVM's
+memory from the cloud host operator and typed evidence lets a caller verify a
+fresh host-CVM quote. The boundary does not exclude guest root inside the CVM,
+does not measure the workspace code, and is not a hardware-rooted key-release
+claim. The product lane remains Preview until the exact signed artifact gate
+passes.
 
 **T4 — Replay attack on key release. ◐ Partial (CP-side); ⏳ runtime-side.**
 This document is scoped to the Apache-2.0 **runtime**; the runtime itself performs no
@@ -364,8 +403,8 @@ it.
 | **Boot-storm IPC capacity bound** | The single-threaded NDJSON supervisor IPC socket has a measured concurrency ceiling: under a burst of roughly 50 concurrent workspace-create requests, the socket can drop a request under contention (observed as a `serde: EOF` on the affected caller, which must retry). This is an availability/capacity limit under extreme concurrent load, not an isolation or authentication weakness; peer-UID auth (§5) is unaffected. Documented here as a known capacity bound. | Planned: concurrent IPC handling. |
 | **Audit chain is local-only (no off-host/WORM export) — RESOLVED with caveat** | **Shipped:** `nee audit export` writes a copy of the signed chain plus a manifest (with pinnable `root_hex`) to any operator-chosen destination; `nee audit verify` independently confirms every signature, chain link, and — against a previously-retained manifest — detects tail truncation. Shared verifier: `crates/ne-protocol/src/audit.rs` (`verify_chain`, `canonical_bytes`); CLI: `crates/ne/src/audit_cli.rs`. Any party holding an exported manifest can now detect edits, broken links, and tail truncation without trusting the host. **Remaining ⏳:** immutable off-host storage (WORM) is operator-provided — the tool ships the verifiable artifact, not the sink. A root operator who deletes the local log *before* any export, or who controls the export destination, can still destroy evidence. Automated periodic export and a WORM sink are the operator/control-plane's responsibility. | ◐ Verifiable export tool shipped. ⏳ WORM sink + control-plane aggregation: operator-provided / future. |
 | **Privacy router is partial** | PII redaction on LLM egress covers HTTP/1.1 cleartext only, uses tier-1 regex matching only, and inspects the request direction only. HTTPS interception and NER-based detection are not present, and response-direction leakage is not inspected. | Later: HTTPS interception, NER, response-direction coverage. |
-| **No confidential mode (standard tier)** | On the **standard tier** (Firecracker microVM), the host operator is trusted and can read guest memory in cleartext; there is no memory encryption. Standard Firecracker (separate-kernel) isolation only. **The confidential tier (B) addresses this** for workspaces that need it (one CVM per sensitive workspace). | **Confidential tier (single-CVM-direct, B):** SEV-SNP-encrypted, hardware-attested, operator-excluded. Hardware-rooted key release CLAIMED on Azure DCasv5; B's execution round-trip is the remaining work. |
-| **Attestation foundation + SEV-SNP verify — CLAIMED on Azure silicon** | **Shipped:** `ne-attestation` crate (`AttestationProvider` trait + `SoftwareProvider` + pure `verify()`); full `GetAttestationEvidence` challenge–response API (gRPC + REST + Python/TS SDK + CLI); signed audit events. **SEV-SNP verify tier:** `Proof::SevSnp` (the `/dev/sev-guest` ioctl path, for GCP/bare-metal/AWS) + `Proof::SevSnpAzure` (the OpenHCL vTPM + TPM-Quote 2-layer path) — both share `TrustAnchor::SevSnp` (VCEK→ARK). **The Azure path is CLAIMED on DCasv5 silicon:** the 2-layer binding (VCEK→ASK→baked Milan ARK + `SHA256(var_data)==REPORT_DATA[..32]` AK-anchoring + AK-signed TPM Quote nonce) verified end-to-end, key release gated. **Caveats (see §4):** TCB = OpenHCL paravisor + UEFI launch digest (not guest-code measurement); `SoftwareKms` (not KMS-hardware-bound); shared-kernel OpenShell isolation (B), not per-workspace HW isolation; not mTLS / strong-global replay. The `/dev/sev-guest` `Proof::SevSnp` path remains synthetic-tested and silicon-unvalidated on GCP/bare-metal/AWS (only the Azure path is silicon-verified). **Remaining ⏳:** TDX, control-plane attestation policy engine — future. | ◐ Software foundation + SEV-SNP verify shipped. ✅ Azure path silicon-verified. ⏳ GCP/bare-metal `/dev/sev-guest` path: silicon-unvalidated. ⏳ TDX / policy engine: future. |
+| **Standard profile has no operator-excluding memory encryption** | In `standard`, the host operator is trusted and can read Firecracker guest memory in cleartext. The separate `confidential-azure` profile runs one OpenShell workspace directly inside an SEV-SNP CVM, with shared-kernel isolation inside that CVM. | `standard`: accepted boundary. `confidential-azure`: ◐ Preview until the signed v0.2.0 KVM and Azure artifact gates pass without a rebuild. |
+| **Attestation foundation + Azure SEV-SNP evidence** | **Implemented:** `ne-attestation`; complete typed evidence over gRPC, REST, CLI, and Python/TypeScript SDKs; offline verification; signed audit events. The Azure vTPM + TPM-Quote two-layer primitive is verified on DCasv5 silicon. **Caveats:** the measurement covers the host-CVM/OpenHCL launch, not guest code; OpenShell is shared-kernel; no hardware-rooted key release; no mTLS/strong-global replay; direct `/dev/sev-guest` is not selected by a v0.2.0 product profile. | ✅ Azure evidence primitive verified. ◐ `confidential-azure` product lane Preview. ⏳ Direct `/dev/sev-guest` silicon validation, TDX, and policy engine. |
 | **Snapshot: single-live-instance identity boundary — RESOLVED with caveats** | **Shipped:** `ForkWorkspace` sends a `ResetIdentity` vsock RPC after each fork boots, resetting hostname, machine-id, and RNG before the workspace is returned to the caller; fail-closed (fork torn down on failure). Two concurrent forks of the same snapshot now have distinct hostname and machine-id. **Remaining ◐:** guest CID is inherited from snapshot vmstate (Firecracker has no `guest_cid` override in `/snapshot/load`); isolation is per-chroot UDS — verified empirically safe. In-memory snapshot contents (data at capture time) are present in each fork; scrubbing is operational (snapshot-a-warm-idle-base usage contract, §9 below). | ✅ hostname/machine-id/RNG reset. ◐ CID inherited (UDS-isolated). ◐ In-memory state: operational contract. |
 | **Fork residual risks** | (a) **Inherited snapshot state:** forks inherit all captured snapshot in-memory data and `/workspace` contents at capture time. Identity reset does not scrub memory contents — only hostname/machine-id/RNG are reset. Usage contract: snapshot a warm-but-idle base workspace before any sensitive data is loaded; fork → reset → dispatch. (b) **CID inherited by design:** each fork inherits the vsock CID from the snapshot vmstate; isolation is per-chroot UDS, not CID (verified: two same-CID forks run concurrently, no cross-talk). (c) **Per-fork memory copy cost:** each fork copies the full memory image into its own jailer chroot; shared-backend UFFD copy-on-write is deferred. (d) **RNG reset window:** a brief window between VM boot and the `ResetIdentity` call uses the snapshot's RNG state; the window is bounded by guest agent readiness. On reset the guest now issues `RNDRESEEDCRNG` after mixing the host-supplied seed, so the kernel CRNG diverges **immediately** rather than only at the next periodic reseed (a plain `/dev/urandom` write does not reseed the CRNG on kernels ≥ 5.18). Workload-internal userspace CSPRNGs seeded before snapshot remain identical across forks and can only be re-seeded by the workload itself. (e) **Networked forks unsupported:** Firecracker bakes the host TAP into vmstate, same as snapshot/restore. | (c) Planned: UFFD CoW shared backend. All others: operational or accepted. |
 | **Warm-pool residual risks** | (a) **Inherited base-snapshot state:** pooled members inherit all captured base-snapshot state — in-memory contents and `/workspace` at capture time. Identity reset re-randomizes only hostname/machine-id/RNG; it does not scrub memory. Usage contract: pool from a *warm-but-idle* base (no sensitive data loaded at snapshot time). (b) **Provisional hostname:** a member's guest hostname is its pool id (`pool-{tier}-{ulid}`), not the caller's `workspace_id`. This is cosmetic — machine-id distinctness and RNG divergence hold; the cold path does not guarantee `hostname == workspace_id` either. (c) **Per-member full memory copy:** each pooled member copies the full memory image into its jailer chroot; shared-backend / UFFD copy-on-write is deferred. (d) **Non-networked members only:** snapshot/restore bakes the host TAP device into vmstate, so pooled members carry no network device. `Create(tier)` with network config is rejected (`InvalidRequest`) — the pool is not silently bypassed. | (c) Planned: UFFD CoW shared backend. All others: operational or accepted. |
@@ -374,7 +413,7 @@ it.
 | **Snapshot artifacts are plaintext at rest — PARTIALLY RESOLVED** | **Runtime-side sealed format shipped:** the `ne-seal` crate provides AES-256-GCM chunked-streaming content encryption + a signed `seal.json` envelope (`ne-enclave-seal-v1`, manifest↔seal canonical-hash binding) + a runtime-local attestation gate (`ne_attestation::verify` against the embedded `SealingPolicy`) that must pass before the DEK is released. **Honest ceiling:** the shipped KEK is a **software fallback** (HKDF of the host Ed25519 key) — an insider host operator who holds the runtime key material can derive it. The sealed artifact defends **at-rest confidentiality-vs-the-operator only**, NOT hardware-rooted protection. Sealed snapshots are wired into the supervisor path **Linux-gated** and apply only where the snapshot path applies (non-networked workspaces). **Remaining ⏳:** the real control-plane KMS, AWS-KMS / Vault BYO-KMS, HSM backing, and the `SevSnp` policy path on real silicon — the hardware-rooted claim is unclaimed. | ◐ Runtime-side sealed format shipped (synthetic-tested). ⏳ CP KMS / AWS-KMS / HSM / real-silicon gate: future. |
 | **Snapshot/restore serialization under concurrent load** | The supervisor's instances-map mutex is held across the Firecracker pause + snapshot API call, so concurrent snapshots of different workspaces serialize during the capture window. This is an availability/throughput limit, not an isolation weakness — consistent with the existing create/terminate posture and the §9 boot-storm IPC note. Per-instance locking is a planned improvement. | Planned: per-instance locking for snapshot concurrency. |
 | **In-place Pause/Resume API deferred** | After a Firecracker in-place `PATCH /vm Resumed`, the host→guest vsock control channel stops servicing new CONNECTs — the resumed guest is unreachable. The public `PauseWorkspace`/`ResumeWorkspace` API is therefore deferred and returns `Unsupported`; it does not represent a new attack surface. The low-level `crate::firecracker::pause`/`resume` calls remain and are used internally by `WorkspaceManager::snapshot` (pause-before-snapshot, resume-after). **Live-state snapshot is shipped via hot-swap restore** (capture + fresh-process restore + registry swap), which delivers the live-snapshot value — source VM survives reachable — without requiring the in-place resume path. In-place `PauseWorkspace`/`ResumeWorkspace` remains deferred; the fix path (Firecracker fork patch to re-arm the muxer epoll on `PATCH /vm Resumed`) is a future item. | Future: Firecracker fork patch to re-register vsock on in-place resume. |
-| **Runtime supply-chain enforcement not absorbed** | OSV / OPA / CVSS enforcement of package installs at execution time is not wired into the runtime workspace; it lives in the OpenShell fork. Build-time supply chain (SBOM, cosign) is release-pipeline policy, separate from this. | Future: absorb runtime supply-chain enforcement into `crates/`. |
+| **Runtime supply-chain enforcement not absorbed** | OSV / OPA / CVSS enforcement of package installs at execution time is not wired into the standard runtime workspace; it lives in the OpenShell fork. This is distinct from the v0.2.0 signed release bundle, checksums, SPDX SBOM, provenance, and installer verification. | Future: absorb runtime package-policy enforcement into `crates/`. |
 | **Ingress residual risks** | (a) **WebSocket / `Connection: Upgrade` proxying deferred:** low-level hyper 1.x upgrade bridging is disproportionate for the initial implementation; clients attempting a WebSocket upgrade receive a connection error. Not a security control gap — the control plane should not rely on WebSocket ingress until a follow-up ships. (b) **Inbound rate-limiting is partial:** a per-process connection-count cap + header/handshake read timeouts now ship, bounding fd/memory exhaustion; per-workspace / per-IP token buckets and true process/cgroup isolation of the edge from the supervisor remain a flagged future follow-up — operators should front the edge with an upstream LB / rate-limiter until then. (c) **Ingress TLS terminate path unit-tested only:** the e2e exercises the plaintext loopback path (dev mode); the TLS terminate path is covered by unit tests (`crates/ne-ingress`). (d) **Ingress applies to cold-booted networked workspaces only:** warm-pool / forked / snapshot-restored members are non-networked; `Create(tier)` with `network_config` is rejected. This is by design (Firecracker bakes the TAP into vmstate) — it is not a missing control. | (a)(b) Follow-up. (c)(d) Operational / accepted. |
 
 ---

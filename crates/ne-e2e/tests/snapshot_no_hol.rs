@@ -111,7 +111,14 @@ async fn snapshot_does_not_head_of_line_block() {
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     // Generous admission: source VM + a concurrent small create.
     let mem_mib = source_mem_mib();
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 64, 65536).expect("workspace manager"));
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
+    let mgr = Arc::new(
+        WorkspaceManager::new(cfg, audit, attestation, 64, 65536).expect("workspace manager"),
+    );
 
     // --- Create the large-mem source (cold boot) ---
     let create_resp = mgr
@@ -286,7 +293,14 @@ async fn terminate_during_snapshot_does_not_resurrect() {
     cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
     let mem_mib = source_mem_mib();
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 64, 65536).expect("workspace manager"));
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
+    let mgr = Arc::new(
+        WorkspaceManager::new(cfg, audit, attestation, 64, 65536).expect("workspace manager"),
+    );
 
     // --- Create the large-mem source so the dump is long enough to terminate
     //     mid-flight ---
@@ -465,7 +479,14 @@ async fn same_id_recreate_waits_for_live_snapshot_lease() {
     cfg.state_dir = state_dir.clone();
     cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 64, 65536).expect("workspace manager"));
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
+    let mgr = Arc::new(
+        WorkspaceManager::new(cfg, audit, attestation, 64, 65536).expect("workspace manager"),
+    );
 
     // --- Original boot (small mem: the window here is the hot-swap's restore
     //     boot, not the dump) with a marker file only the OLD boot has ---

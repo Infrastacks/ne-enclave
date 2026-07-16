@@ -54,6 +54,22 @@ impl Layout {
     pub fn state_dir(&self) -> PathBuf {
         self.at("/var/lib/ne-enclave")
     }
+    /// Directory holding OpenShell policy inputs.
+    pub fn openshell_dir(&self) -> PathBuf {
+        self.at("/var/lib/ne-enclave/openshell")
+    }
+    /// Installed OpenShell Rego policy.
+    pub fn openshell_policy_rules(&self) -> PathBuf {
+        self.at("/var/lib/ne-enclave/openshell/policy.rego")
+    }
+    /// Installed OpenShell YAML policy data.
+    pub fn openshell_policy_data(&self) -> PathBuf {
+        self.at("/var/lib/ne-enclave/openshell/policy.yaml")
+    }
+    /// Installed OpenShell sandbox executable.
+    pub fn openshell_sandbox_binary(&self) -> PathBuf {
+        self.at("/opt/ne-enclave/bin/openshell-sandbox")
+    }
     /// Content-addressed guest image store.
     pub fn images_dir(&self) -> PathBuf {
         self.at("/var/lib/ne-enclave/images")
@@ -115,6 +131,22 @@ mod tests {
         assert_eq!(
             l.privacy_policy_file(),
             Path::new("/tmp/fakeroot/etc/ne-enclave/privacy-policy.yaml")
+        );
+        assert_eq!(
+            l.openshell_dir(),
+            Path::new("/tmp/fakeroot/var/lib/ne-enclave/openshell")
+        );
+        assert_eq!(
+            l.openshell_policy_rules(),
+            Path::new("/tmp/fakeroot/var/lib/ne-enclave/openshell/policy.rego")
+        );
+        assert_eq!(
+            l.openshell_policy_data(),
+            Path::new("/tmp/fakeroot/var/lib/ne-enclave/openshell/policy.yaml")
+        );
+        assert_eq!(
+            l.openshell_sandbox_binary(),
+            Path::new("/tmp/fakeroot/opt/ne-enclave/bin/openshell-sandbox")
         );
         assert_eq!(l.run_dir(), Path::new("/tmp/fakeroot/run/ne-enclave"));
     }

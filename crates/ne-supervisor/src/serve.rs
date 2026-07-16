@@ -16,6 +16,41 @@ use crate::command::Dispatcher;
 use crate::ipc::{IpcServer, PeerAuth};
 use crate::workspace::{WorkspaceManager, WorkspaceManagerConfig};
 
+#[cfg(unix)]
+fn path_is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn path_is_executable(_path: &std::path::Path) -> bool {
+    false
+}
+
+fn probe_startup_requirements(
+    cfg: &SupervisorConfig,
+) -> crate::attestation_factory::StartupRequirements {
+    let sandbox_user = std::process::Command::new("getent")
+        .args(["passwd", "sandbox"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    crate::attestation_factory::StartupRequirements {
+        linux_x86_64: cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        kvm: std::path::Path::new("/dev/kvm").exists(),
+        azure_vtpm: std::path::Path::new("/dev/tpmrm0").exists(),
+        firecracker: path_is_executable(&cfg.firecracker_binary),
+        jailer: path_is_executable(&cfg.jailer_binary),
+        openshell_sandbox: path_is_executable(&cfg.openshell_sandbox_binary),
+        openshell_policy_rules: cfg.state_dir.join("openshell/policy.rego").is_file(),
+        openshell_policy_data: cfg.state_dir.join("openshell/policy.yaml").is_file(),
+        sandbox_user,
+    }
+}
+
 /// Read total host RAM in MiB from `/proc/meminfo`'s `MemTotal` line
 /// (kB → MiB). Used to resolve `NE_MAX_WORKSPACES=0` /
 /// `NE_MAX_WORKSPACE_MEM_MIB=0` ("auto") at startup (audit O3).
@@ -53,6 +88,8 @@ fn read_host_ram_mib() -> u64 {
 /// `ne-supervisor` CLI flags 1:1 so behavior is unchanged).
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
+    /// Execution and attestation profile selected for this process.
+    pub execution_profile: ne_protocol::profile::ExecutionProfile,
     /// Path to the unix domain socket the API daemon connects on.
     pub socket: PathBuf,
     /// Expected UID of the API daemon. Required in production.
@@ -184,6 +221,7 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
     tracing::info!(
         socket = %cfg.socket.display(),
         dev_mode = cfg.dev_mode,
+        execution_profile = %cfg.execution_profile,
         firecracker = %cfg.firecracker_binary.display(),
         jailer = %cfg.jailer_binary.display(),
         "ne-supervisor starting"
@@ -191,9 +229,22 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
 
     let auth = cfg.resolve_auth()?;
 
+    crate::attestation_factory::validate_legacy_confidential_switch(
+        std::env::var_os("NE_CONFIDENTIAL_MODE").as_deref(),
+    )?;
+    let execution_profile = cfg.execution_profile;
+    crate::attestation_factory::validate_startup_requirements(
+        execution_profile,
+        &probe_startup_requirements(&cfg),
+    )?;
+    let attestation_backend = execution_profile.attestation_backend();
+
     let audit = AuditLog::open(&cfg.state_dir)
         .await
         .context("opening audit log + signing key under --state-dir")?;
+    let attestation =
+        crate::attestation_factory::build_provider(attestation_backend, audit.signing_key())
+            .context("construct profile-selected attestation provider")?;
 
     #[cfg(target_os = "linux")]
     let network = if cfg.enable_networking {
@@ -233,44 +284,13 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
         ),
     };
 
-    // Attestation provider selection + fail-closed gate.
-    //
-    // Two decisions, in order:
-    //   1. Confidential mode (NE_CONFIDENTIAL_MODE + CVM hardware present)
-    //      selects the firmware-rooted SEV-SNP provider. "CVM present" is
-    //      `/dev/sev-guest` (GCP/bare-metal/AWS) OR `/dev/tpmrm0` (Azure
-    //      OpenHCL paravisor — Wedge 5 proved `/dev/sev-guest` is absent on
-    //      DCasv5; the vTPM is the CVM signal there). A request for confidential
-    //      mode WITHOUT either is fatal — a confidential deployment never
-    //      silently falls back to software attestation.
-    //   2. Otherwise the software-fallback provider is used, gated by the
-    //      existing `software_provider_allowed` prod-gate (dev mode OR an
-    //      explicit NE_ATTEST_ALLOW_SOFTWARE opt-in). The gate only fires on
-    //      the software path so a confidential deployment isn't required to
-    //      also set the software opt-in.
     let allow_software_attestation = std::env::var("NE_ATTEST_ALLOW_SOFTWARE").is_ok();
-    let confidential = std::env::var("NE_CONFIDENTIAL_MODE").is_ok();
-    let sev_present = cfg!(target_os = "linux") && std::path::Path::new("/dev/sev-guest").exists();
-    let vtpm_present = cfg!(target_os = "linux") && std::path::Path::new("/dev/tpmrm0").exists();
-    let cvm_present = crate::workspace::cvm_hardware_present(sev_present, vtpm_present);
-    if crate::workspace::refuse_software_in_confidential_mode(confidential, cvm_present) {
-        anyhow::bail!(
-            "confidential mode requested (NE_CONFIDENTIAL_MODE) but no CVM hardware is present \
-             (neither /dev/sev-guest nor /dev/tpmrm0); refusing to start — a confidential \
-             deployment cannot fall back to software attestation"
-        );
-    }
-    let attestation_profile = if confidential && cvm_present {
-        crate::workspace::AttestationProfile::SevSnp
-    } else {
-        crate::workspace::AttestationProfile::Software
-    };
     // The software-fallback provider is not firmware-rooted, so it must fail
     // closed outside dev unless the operator explicitly opts in. Only enforced
     // on the software path — a confidential (SEV-SNP) deployment bypasses it.
     if matches!(
-        attestation_profile,
-        crate::workspace::AttestationProfile::Software
+        attestation_backend,
+        ne_protocol::profile::AttestationBackend::Software
     ) && !ne_attestation::software_provider_allowed(cfg.dev_mode, allow_software_attestation)
     {
         anyhow::bail!(
@@ -306,6 +326,7 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
     let workspaces = Arc::new(
         WorkspaceManager::new(
             WorkspaceManagerConfig {
+                execution_profile,
                 firecracker_binary: cfg.firecracker_binary,
                 jailer_binary: cfg.jailer_binary,
                 chroot_base: cfg.jailer_chroot_base,
@@ -315,7 +336,6 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
                 openshell_sandbox_binary: cfg.openshell_sandbox_binary,
                 api_socket_timeout: Duration::from_millis(cfg.api_socket_timeout_ms),
                 default_kernel_boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_string(),
-                attestation_profile,
                 #[cfg(target_os = "linux")]
                 network,
                 state_dir: cfg.state_dir,
@@ -323,6 +343,7 @@ pub async fn serve(cfg: SupervisorConfig) -> Result<()> {
                 warm_pool,
             },
             audit.clone(),
+            attestation,
             max_workspaces,
             max_workspace_mem_mib,
         )
@@ -427,6 +448,7 @@ mod tests {
 
     fn base() -> SupervisorConfig {
         SupervisorConfig {
+            execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
             socket: "/run/ne-enclave/supervisor.sock".into(),
             expected_peer_uid: None,
             dev_mode: false,

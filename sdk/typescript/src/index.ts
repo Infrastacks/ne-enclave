@@ -1,6 +1,15 @@
 export { Client, isServiceError, type ClientOptions } from "./client.js";
+export {
+  AttestationBackend,
+  AttestationProvider,
+  ExecutionBackend,
+  ExecutionProfile,
+  WorkspaceOperation,
+} from "./generated/ne/runtime/v1/runtime.js";
 
 export type {
+  AttestationEvidence,
+  AttestationProof,
   AuditEvent,
   CreateWorkspaceRequest,
   CreateWorkspaceResponse,
@@ -8,14 +17,22 @@ export type {
   DestroyWorkspaceResponse,
   ExecuteCommandRequest,
   ExecuteCommandResponse,
+  GetAttestationEvidenceRequest,
+  GetAttestationEvidenceResponse,
+  GetRuntimeCapabilitiesRequest,
+  GetRuntimeCapabilitiesResponse,
   ListEventsRequest,
   ListEventsResponse,
   NetworkConfig,
   PingRequest,
   PingResponse,
   PrivacyRouterConfig,
+  PublicAttestationEvidence,
   ReadFileRequest,
   ReadFileResponse,
+  SevSnpAzureProof,
+  SevSnpDirectProof,
+  SoftwareProof,
   WorkspaceNetwork,
   WriteFileRequest,
   WriteFileResponse,

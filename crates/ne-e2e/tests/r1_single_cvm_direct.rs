@@ -1,332 +1,310 @@
 // SPDX-FileCopyrightText: 2026 Infrastacks LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! e2e: R1 confidential tier (B) — single-CVM-direct agent execution on Azure DCasv5.
+//! Host-gated Azure DCasv5 product-wiring e2e for the confidential profile.
 //!
-//! HOST-GATED + FEATURE-GATED: requires (1) an Azure DCasv5/ECasv5 SEV-SNP CVM with
-//! `tpm2-tools` ≥ 5.2 + the `openshell-sandbox` binary installed, (2) a live
-//! control-plane Worker (`NE_CP_KEY_RELEASE_ENDPOINT` + `NE_CP_API_KEY`), and
-//! (3) `--features confidential-cvm` on the test invocation. `#[ignore]` everywhere
-//! without a CVM; `cfg(linux)` + `cfg(feature = "confidential-cvm")` gate the body.
+//! This test assumes `nee install --execution-profile confidential-azure` has
+//! already installed the release candidate. Its primary assertions use only
+//! the installed binary, systemd services, and public REST/CLI surfaces:
+//! capabilities, create, execute, file I/O, complete Azure evidence, destroy,
+//! and audit export/verification. Low-level vTPM fingerprints are emitted only
+//! after the product round trip succeeds.
 //!
-//! This is the **R1 confidential-execution round-trip** (spec
-//! `2026-06-29-r1-nested-cvm-blocked-design.md` §4). Unlike the Wedge-5
-//! `sev_snp_azure` e2e (which exercises the supervisor's attestation + seal/unseal
-//! path directly with NO workspace running), this e2e:
-//!   - Spawns an OpenShell sandbox IN-CVM (the confidential-tier execution substrate),
-//!   - Runs a command in it over the NSSH1 SSH control channel,
-//!   - Exercises the Wedge-5 attestation + key-release path (reused verbatim) to
-//!     prove the DEK is released only on the 2-layer hardware evidence,
-//!   - Seal→unseal restores byte-identical plaintext.
-//!
-//! TCB = the OpenHCL paravisor + UEFI launch digest (Wedge 5), NOT guest-code
-//! measurement. OpenShell's isolation is shared-kernel (Landlock/seccomp/netns),
-//! NOT per-workspace hardware isolation (that is C/v2). No nested Firecracker
-//! microVM is booted (R1 nesting is blocked — ARCH §6.1).
-//!
-//! Run manually on a provisioned Azure CVM (Worker + openshell-sandbox installed):
+//! Run as root on a provisioned Azure confidential VM:
 //! ```sh
-//! NE_CP_KEY_RELEASE_ENDPOINT=https://<worker>/v1 \
-//! NE_CP_API_KEY=<key> \
-//! NE_OPENSHELL_SANDBOX_BIN=/opt/ne-enclave/bin/openshell-sandbox \
-//! cargo test -p ne-e2e --features confidential-cvm --test r1_single_cvm_direct \
-//!   -- --ignored --nocapture --test-threads=1
+//! cargo test -p ne-e2e --features confidential-cvm \
+//!   --test r1_single_cvm_direct -- --ignored --nocapture --test-threads=1
 //! ```
-//!
-//! **Claim discipline:** until this passes on a named DCasv5, the R1
-//! confidential-execution claim stays UNCLAIMED. The bring-up report records the
-//! genuine fingerprints + the pass.
 
 #![cfg(all(target_os = "linux", feature = "confidential-cvm"))]
 
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::os::unix::fs::FileTypeExt as _;
+use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use ed25519_dalek::{Signer, SigningKey};
-use ne_attestation::{
-    AttestationProvider, AzureVtpmReportSource, EvidenceRequest, Measurement, Nonce, ProviderType,
-    SevSnpProvider,
-    vcek::{AMD_MILAN_ARK_DER, KdsVcekFetcher, VcekCache, VcekFetcher},
-};
-use ne_protocol::snapshot::{GuestIdentity, MANIFEST_VERSION, SnapshotManifest};
-use ne_seal::key_release_cp::ControlPlaneKeyReleaseClient;
-use ne_seal::orchestration::{seal_artifacts, unseal_artifacts};
-use ne_seal::types::{KekProvider, SealingPolicy, SealingTrustAnchor};
-use sha2::Digest;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
-fn wall_now() -> i64 {
+const API: &str = "http://127.0.0.1:8080/v1";
+const NEE: &str = "/opt/ne-enclave/bin/nee";
+
+fn wall_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+        .map_or(0, |duration| duration.as_secs())
 }
 
-fn hex_sha256(b: &[u8]) -> String {
-    let mut h = sha2::Sha256::new();
-    h.update(b);
-    hex::encode(h.finalize())
+fn checked_output(program: &str, args: &[&str]) -> Output {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("run {program} {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
-/// `#[ignore]` real-silicon e2e: the R1 single-CVM-direct confidential-execution round-trip.
-///
-/// Asserts: (1) the OpenShell sandbox spawns in-CVM + a command runs over SSH;
-/// (2) the Wedge-5 attestation path produces 2-layer evidence; (3) the CP gate
-/// releases the DEK only on that evidence; (4) seal→unseal is byte-identical.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an Azure DCasv5 CVM + tpm2-tools + openshell-sandbox + a live CP Worker"]
-async fn r1_single_cvm_direct_round_trip() {
-    // ---- Pre-flight: confirm the R1 nesting block empirically (the load-bearing ----
-    // finding that justifies the whole B pivot). /dev/kvm MUST be absent on a DCasv5
-    // (AMD SEV-SNP strips the virt extensions from the leaf guest; Azure/GCP/AWS all
-    // refuse nested virt in a CVM). This is the on-silicon proof of ARCH §6.1.
+fn curl(method: &str, url: &str, body: Option<&str>) -> Vec<u8> {
+    let mut command = Command::new("curl");
+    command.args(["-fsS", "-X", method, url]);
+    if let Some(body) = body {
+        command.args(["-H", "content-type: application/json", "-d", body]);
+    }
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("curl {method} {url}: {error}"));
+    assert!(
+        output.status.success(),
+        "curl {method} {url} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn curl_json(method: &str, url: &str, body: Option<&str>) -> Value {
+    let bytes = curl(method, url, body);
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("decode JSON from {method} {url}: {error}"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+struct WorkspaceCleanup {
+    workspace_id: String,
+    armed: bool,
+}
+
+impl WorkspaceCleanup {
+    fn new(workspace_id: String) -> Self {
+        Self {
+            workspace_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkspaceCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = Command::new("curl")
+                .args([
+                    "-fsS",
+                    "-X",
+                    "DELETE",
+                    &format!("{API}/workspaces/{}", self.workspace_id),
+                ])
+                .status();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the installed confidential-azure release candidate on Azure DCasv5"]
+fn r1_single_cvm_direct_round_trip() {
     assert!(
         !std::path::Path::new("/dev/kvm").exists(),
-        "R1.1 nesting-block check FAILED: /dev/kvm exists on this CVM — the nesting premise \
-         would not be blocked here. Re-examine before proceeding."
+        "Azure confidential profile must not depend on nested KVM"
     );
-    let cpuinfo = std::fs::read("/proc/cpuinfo").unwrap_or_default();
-    let cpu_flags = String::from_utf8_lossy(&cpuinfo);
-    let svm_count = cpu_flags.matches("svm").count();
+    let vtpm = std::fs::metadata("/dev/tpmrm0").expect("/dev/tpmrm0 must exist");
     assert!(
-        svm_count == 0,
-        "R1.1 nesting-block check FAILED: 'svm' cpu flag present ({svm_count} matches) — \
-         nested virt may be available, contradicting the AMD/Azure constraints."
+        vtpm.file_type().is_char_device(),
+        "/dev/tpmrm0 must be a character device"
     );
-    eprintln!(
-        "R1.1 nesting block CONFIRMED: /dev/kvm absent, no svm cpu flag (B's premise holds)."
-    );
-
-    // ---- Pre-flight: the Azure vTPM path (NVRAM 0x01400001), NOT /dev/sev-guest. ----
-    let probe = Command::new("tpm2")
-        .args(["nvread", "-C", "o", "0x01400001"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
     assert!(
-        matches!(probe, Ok(o) if o.status.success()),
-        "pre-flight FAILED: tpm2_nvread -C o 0x01400001 did not succeed — not an Azure CVM, \
-         or tpm2-tools missing, or needs sudo (run under `sudo -E`)."
+        std::path::Path::new(NEE).is_file(),
+        "installed nee binary missing at {NEE}"
     );
-    eprintln!("pre-flight OK: HCLA blob readable from vTPM NVRAM 0x01400001.");
 
-    // ---- Pre-flight: the openshell-sandbox binary. ----
-    let sandbox_bin = std::env::var("NE_OPENSHELL_SANDBOX_BIN")
-        .unwrap_or_else(|_| "/opt/ne-enclave/bin/openshell-sandbox".to_string());
+    checked_output(
+        NEE,
+        &["doctor", "--execution-profile", "confidential-azure"],
+    );
+    checked_output("systemctl", &["daemon-reload"]);
+    checked_output(
+        "systemctl",
+        &["restart", "ne-supervisor.service", "ne-api.service"],
+    );
+
+    let mut healthy = false;
+    for _attempt in 0..60 {
+        if Command::new("curl")
+            .args(["-fsS", &format!("{API}/host/health")])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            healthy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert!(healthy, "installed API did not become healthy");
+
+    let capabilities = curl_json("GET", &format!("{API}/runtime/capabilities"), None);
+    assert_eq!(capabilities["execution_profile"], "confidential-azure");
+    assert_eq!(capabilities["execution_backend"], "open_shell");
+    assert_eq!(capabilities["attestation_backend"], "sev_snp_azure");
+    assert_eq!(capabilities["hard_workspace_capacity"], 1);
+
+    let workspace_id = format!("r1-product-{}", wall_now());
+    let mut cleanup = WorkspaceCleanup::new(workspace_id.clone());
+    let create = serde_json::json!({
+        "workspace_id": workspace_id,
+        "kernel_sha256": "",
+        "rootfs_sha256": "",
+        "rootfs_read_only": true,
+        "vcpu_count": 0,
+        "mem_size_mib": 0,
+        "guest_vsock_cid": 0
+    });
+    curl(
+        "POST",
+        &format!("{API}/workspaces"),
+        Some(&create.to_string()),
+    );
+
+    let exec_body = serde_json::json!({
+        "command": "/bin/echo",
+        "args": ["r1-product-ok"]
+    });
+    let mut exec_response = None;
+    for _attempt in 0..60 {
+        let output = Command::new("curl")
+            .args([
+                "-fsS",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                &exec_body.to_string(),
+                &format!("{API}/workspaces/{workspace_id}/exec"),
+            ])
+            .output()
+            .expect("run exec request");
+        if output.status.success() {
+            exec_response =
+                Some(serde_json::from_slice::<Value>(&output.stdout).expect("exec JSON"));
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let exec_response = exec_response.expect("workspace exec never became ready");
     assert!(
-        std::path::Path::new(&sandbox_bin).exists(),
-        "pre-flight FAILED: openshell-sandbox not found at {sandbox_bin} (set NE_OPENSHELL_SANDBOX_BIN)."
-    );
-    eprintln!("pre-flight OK: openshell-sandbox at {sandbox_bin}.");
-
-    // ---- 1. Spawn an OpenShell sandbox in-CVM (the confidential execution substrate). ----
-    // The supervisor's create_confidential() path spawns the sandbox binary with NSSH1
-    // SSH control. Here we exercise the same launch directly to prove the in-CVM
-    // execution path + governance is live.
-    use ne_supervisor::openshell::{OpenShellLaunchConfig, Sandbox};
-    use std::net::{Ipv4Addr, SocketAddr};
-    use std::path::PathBuf;
-
-    let workspace_id = format!("r1-b-{}", wall_now());
-    // The OpenShell OPA engine (regorus) requires a valid Rego policy with the
-    // data-passthrough rules — a bare `default allow_network` is rejected with
-    // "not a valid rule path". Use the committed fixture (a minimal-but-valid
-    // subset of the fork's reference sandbox-policy.rego).
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let policy_rules_path = manifest_dir.join("fixtures/sandbox-policy.rego");
-    let policy_data_path = manifest_dir.join("fixtures/sandbox-policy.yaml");
-    assert!(
-        policy_rules_path.exists() && policy_data_path.exists(),
-        "missing fixture policy"
+        exec_response["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("r1-product-ok"))
     );
 
-    // Bind a concrete ephemeral port (not 0) so we can connect back to the sandbox.
-    let ssh_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .map(|l| l.local_addr().map(|a| a.port()).unwrap_or(0))
-        .unwrap_or(0);
-    let cfg = OpenShellLaunchConfig {
-        sandbox_binary: PathBuf::from(&sandbox_bin),
-        workspace_id: workspace_id.clone(),
-        agent_command: vec![
-            "/bin/bash".to_string(),
-            "-c".to_string(),
-            "sleep infinity".to_string(),
-        ],
-        policy_rules_path,
-        policy_data_path,
-        ssh_listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, ssh_port)),
-        ssh_ready_timeout: Duration::from_secs(15),
-    };
-    let sandbox = Sandbox::spawn(&cfg).await.expect("openshell-sandbox spawn");
-    eprintln!(
-        "1. OpenShell sandbox spawned (confidential tier, B): pid={}, ssh={}",
-        sandbox.child.id().unwrap_or(0),
-        sandbox.ssh_addr
+    let payload = b"r1-product-file-roundtrip";
+    let payload_b64 = BASE64.encode(payload);
+    let write = serde_json::json!({
+        "path": "r1-proof.txt",
+        "content": payload_b64
+    });
+    curl(
+        "PUT",
+        &format!("{API}/workspaces/{workspace_id}/files"),
+        Some(&write.to_string()),
     );
-
-    // ---- 2. Run a command in the sandbox over the NSSH1 SSH control channel. ----
-    // Exercise the same run_command_via_ssh the supervisor's run_command path uses.
-    let resp = ne_supervisor::openshell::run_command_via_ssh(
-        &sandbox,
-        "echo",
-        &["r1-b-exec-ok".to_string()],
-        10_000,
-    )
-    .await
-    .expect("SSH exec in sandbox");
-    let ne_protocol::guest::GuestResponse::CommandCompleted(completed) = &resp else {
-        panic!("expected CommandCompleted, got {resp:?}");
-    };
-    assert!(
-        completed.stdout.contains("r1-b-exec-ok"),
-        "sandbox exec stdout mismatch: {:?}",
-        completed.stdout
-    );
-    eprintln!(
-        "2. SSH exec in sandbox OK: stdout={:?}",
-        completed.stdout.trim()
-    );
-
-    // ---- 3. The Wedge-5 attestation path (reused verbatim): 2-layer evidence. ----
-    let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
-    let verifying = signing_key.verifying_key();
-    let azure_source = AzureVtpmReportSource::open().expect("open Azure vTPM source");
-    let vcek: Arc<dyn VcekFetcher> = Arc::new(VcekCache::new(KdsVcekFetcher::new()));
-    let provider = SevSnpProvider::new_azure(azure_source, vcek);
-    let nonce = Nonce::new(vec![0xACu8; 32]).expect("nonce");
-    let req = EvidenceRequest {
-        workspace_id: workspace_id.clone(),
-        measurement: Measurement([0u8; 32]),
-        nonce: nonce.clone(),
-    };
-    let evidence = provider
-        .generate(&req, wall_now())
-        .expect("generate Azure evidence");
-    assert_eq!(evidence.provider_type, ProviderType::SevSnp);
-    eprintln!("3. Wedge-5 attestation evidence produced (2-layer binding).");
-
-    // ---- 4. The CP key-release gate (SoftwareKms, live Worker) — DEK on HW evidence. ----
-    let (endpoint, api_key) = match (
-        std::env::var("NE_CP_KEY_RELEASE_ENDPOINT"),
-        std::env::var("NE_CP_API_KEY"),
-    ) {
-        (Ok(e), Ok(k)) => (e, k),
-        _ => panic!("NE_CP_KEY_RELEASE_ENDPOINT + NE_CP_API_KEY must point at the live Worker"),
-    };
-    let cp = ControlPlaneKeyReleaseClient::new(endpoint, api_key, Arc::new(wall_now));
-    let cp_wrap: Option<&dyn ne_seal::key_release_cp::CpWrapClient> = Some(&cp);
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let snap = tmp.path().join("snap");
-    tokio::fs::create_dir_all(&snap).await.expect("dir");
-    let plaintext_mem = b"R1-B-CONFIDENTIAL-MEM";
-    let plaintext_vmstate = b"R1-B-CONFIDENTIAL-VMSTATE";
-    tokio::fs::write(snap.join("mem"), plaintext_mem)
-        .await
-        .expect("write mem");
-    tokio::fs::write(snap.join("vmstate"), plaintext_vmstate)
-        .await
-        .expect("write vmstate");
-
-    let mut manifest = SnapshotManifest {
-        manifest_version: MANIFEST_VERSION,
-        snapshot_id: format!("r1-b-snap-{}", wall_now()),
-        created_from_workspace_id: workspace_id.clone(),
-        firecracker_version: "1.7.0".into(),
-        mem_sha256: hex_sha256(plaintext_mem),
-        vmstate_sha256: hex_sha256(plaintext_vmstate),
-        kernel_sha256: "bb".repeat(32),
-        rootfs_sha256: "cc".repeat(32),
-        guest_identity: GuestIdentity {
-            hostname: workspace_id.clone(),
-            mac: "06:00:00:00:00:01".into(),
-            guest_vsock_cid: 0,
-            vcpu_count: 1,
-            mem_size_mib: 128,
-        },
-        kernel_boot_args: "console=ttyS0".into(),
-        signer_pubkey_b64: String::new(),
-        signature_b64: String::new(),
-    };
-    // Sign the manifest (mirrors the Wedge-5 e2e).
-    manifest.signer_pubkey_b64 =
-        base64::engine::general_purpose::STANDARD.encode(verifying.as_bytes());
-    let manifest_sig = signing_key.sign(
-        &manifest
-            .canonical_bytes()
-            .expect("manifest canonical_bytes"),
-    );
-    manifest.signature_b64 =
-        base64::engine::general_purpose::STANDARD.encode(manifest_sig.to_bytes());
-    tokio::fs::write(
-        snap.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest).expect("ser"),
-    )
-    .await
-    .expect("write manifest.json");
-
-    let policy = SealingPolicy {
-        accept_provider_types: vec![ProviderType::SevSnp],
-        freshness_seconds: 300,
-        trust_anchor: SealingTrustAnchor::SevSnp {
-            amd_product_root_der: AMD_MILAN_ARK_DER.to_vec(),
-            expected_host_cvm_meas: None,
-            min_tcb: 0,
-            guest_policy: 0,
-        },
-        expected_measurement: None,
-    };
-    let _envelope = seal_artifacts(
-        &snap,
-        &manifest,
-        &signing_key,
-        policy.clone(),
-        KekProvider::ControlPlane,
-        cp_wrap,
-    )
-    .await
-    .expect("seal_artifacts");
-    eprintln!("4. Sealed under ControlPlane KEK (WASM gate on the 2-layer evidence).");
-
-    // ---- 5. Unseal: the CP gate releases the DEK only on the HW evidence; restore. ----
-    let cp_release: Option<&dyn ne_seal::key_release::ControlPlaneKeyRelease> = Some(&cp);
-    let out_mem = tmp.path().join("out_mem");
-    let out_vmstate = tmp.path().join("out_vmstate");
-    unseal_artifacts(
-        &snap,
-        &verifying,
+    let read = curl_json(
+        "GET",
+        &format!("{API}/workspaces/{workspace_id}/files?path=r1-proof.txt"),
         None,
-        cp_release,
-        &provider,
-        &workspace_id,
-        Measurement([0u8; 32]),
-        wall_now(),
-        &out_mem,
-        &out_vmstate,
-    )
-    .await
-    .expect("unseal_artifacts restores the plaintext");
-    let restored_mem = tokio::fs::read(&out_mem).await.expect("read restored mem");
-    let restored_vmstate = tokio::fs::read(&out_vmstate)
-        .await
-        .expect("read restored vmstate");
-    assert_eq!(
-        restored_mem, plaintext_mem,
-        "restored mem must be byte-identical"
     );
-    assert_eq!(
-        restored_vmstate, plaintext_vmstate,
-        "restored vmstate must be byte-identical"
+    assert_eq!(read["content"], payload_b64);
+
+    let nonce = BASE64.encode([0xacu8; 32]);
+    let evidence = curl_json(
+        "POST",
+        &format!("{API}/workspaces/{workspace_id}/attestation"),
+        Some(&serde_json::json!({ "nonce": nonce }).to_string()),
     );
-    eprintln!("5. Unseal byte-identical — DEK released on the 2-layer hardware evidence.");
+    assert_eq!(evidence["provider"], "sev_snp_azure");
+    assert_eq!(evidence["proof"]["proof_type"], "sev_snp_azure");
+    for field in [
+        "report",
+        "vcek_cert_chain",
+        "var_data",
+        "ak_pub_tpm2b",
+        "quote_msg",
+        "quote_sig",
+    ] {
+        assert!(
+            evidence["proof"][field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "Azure public proof field {field} is empty"
+        );
+    }
 
-    // ---- 6. Terminate the sandbox (SIGTERM→wait→SIGKILL; netns/veth auto-cleanup). ----
-    sandbox.terminate(Duration::from_secs(5)).await;
-    eprintln!("6. OpenShell sandbox terminated.");
+    curl("DELETE", &format!("{API}/workspaces/{workspace_id}"), None);
+    cleanup.disarm();
 
-    eprintln!("\nR1 single-CVM-direct round-trip PASSED:");
-    eprintln!("  - R1.1 nesting block confirmed (/dev/kvm absent, no svm flag)");
-    eprintln!("  - OpenShell sandbox spawned in-CVM + SSH exec succeeded");
-    eprintln!("  - Wedge-5 attestation + CP key-release gate held on 2-layer evidence");
-    eprintln!("  - seal->unseal byte-identical");
+    let export = checked_output(NEE, &["audit", "export", "--out", "/tmp"]);
+    let export_dir = String::from_utf8(export.stdout)
+        .expect("audit export path is UTF-8")
+        .trim()
+        .to_string();
+    assert!(!export_dir.is_empty(), "audit export path missing");
+    checked_output(NEE, &["audit", "verify", &export_dir]);
+
+    eprintln!("installed confidential product round trip passed");
+    eprintln!("  capabilities: {capabilities}");
+    eprintln!("  evidence report_data: {}", evidence["report_data"]);
+
+    let nvread = Command::new("tpm2")
+        .args(["nvread", "-C", "o", "0x01400001"])
+        .output();
+    match nvread {
+        Ok(output) if output.status.success() => {
+            eprintln!(
+                "diagnostic HCLA NV blob sha256={}",
+                sha256_hex(&output.stdout)
+            );
+        }
+        Ok(output) => eprintln!(
+            "diagnostic HCLA NV read failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("diagnostic HCLA NV read unavailable: {error}"),
+    }
+
+    let diagnostic_dir = tempfile::tempdir().expect("diagnostic tempdir");
+    let ak_path = diagnostic_dir.path().join("ak-public.tss");
+    let ak_path_string = ak_path.to_string_lossy().into_owned();
+    let ak = Command::new("tpm2")
+        .args([
+            "readpublic",
+            "-c",
+            "0x81000003",
+            "-f",
+            "tss",
+            "-o",
+            &ak_path_string,
+        ])
+        .output();
+    match ak {
+        Ok(output) if output.status.success() => match std::fs::read(&ak_path) {
+            Ok(bytes) => eprintln!("diagnostic AK public sha256={}", sha256_hex(&bytes)),
+            Err(error) => eprintln!("diagnostic AK public read failed: {error}"),
+        },
+        Ok(output) => eprintln!(
+            "diagnostic AK readpublic failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("diagnostic AK readpublic unavailable: {error}"),
+    }
 }

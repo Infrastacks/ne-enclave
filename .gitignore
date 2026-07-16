@@ -8,11 +8,12 @@ Cargo.lock.bak
 
 # Python SDK
 /sdk/*/.venv/
-/sdk/*/__pycache__/
+/sdk/**/__pycache__/
 /sdk/*/*.egg-info/
 /sdk/*/.pytest_cache/
 /sdk/*/dist/
 /sdk/*/.ruff_cache/
+*.py[cod]
 
 # Node / TypeScript SDK
 /sdk/*/node_modules/
@@ -25,9 +26,13 @@ Cargo.lock.bak
 /images/buildroot/output/
 /images/buildroot/dl/
 
+# Internal agent specs, plans, and isolated working trees
+/.superpowers/
+/docs/superpowers/
+/.worktrees/
+/worktrees/
+
 # Editor / OS
-.worktrees/
-.superpowers/
 .idea/
 .vscode/
 *.swp

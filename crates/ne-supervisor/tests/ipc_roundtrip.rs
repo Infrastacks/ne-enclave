@@ -26,10 +26,16 @@ async fn ping_pong_round_trip() {
     let audit = ne_supervisor::audit::AuditLog::open(audit_dir.path())
         .await
         .expect("audit open");
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
     let workspaces = Arc::new(
         ne_supervisor::workspace::WorkspaceManager::new(
             ne_supervisor::workspace::WorkspaceManagerConfig::dev_defaults(),
             audit.clone(),
+            attestation,
             1024,
             32768,
         )
@@ -75,10 +81,16 @@ async fn invalid_json_returns_error_and_keeps_connection_alive() {
     let audit = ne_supervisor::audit::AuditLog::open(audit_dir.path())
         .await
         .expect("audit open");
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
     let workspaces = Arc::new(
         ne_supervisor::workspace::WorkspaceManager::new(
             ne_supervisor::workspace::WorkspaceManagerConfig::dev_defaults(),
             audit.clone(),
+            attestation,
             1024,
             32768,
         )

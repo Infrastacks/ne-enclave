@@ -1,21 +1,9 @@
-# Release pipeline — NeuronEdge Enclave runtime + SDKs.
+# Release pipeline — one immutable, signed NeuronEdge Enclave candidate bundle.
 #
-# Triggered by a `v*` tag push (e.g. `git tag v0.1.1 && git push origin v0.1.1`).
-# Produces, from one tag:
-#   1. A GitHub Release carrying the signed static musl `nee` binary + SHA256SUMS
-#      (what `deploy/install.sh` downloads + verifies).
-#   2. `@neuronedge/enclave` published to npm.
-#   3. `neuronedge-enclave` published to PyPI.
-#
-# Prerequisites (operator-owned, one-time):
-#   - GitHub secrets: NPM_TOKEN, PYPI_TOKEN.
-#   - The version sources bumped to match the tag BEFORE tagging
-#     (Cargo.toml workspace version, sdk/typescript/package.json,
-#     sdk/python/pyproject.toml + src/ne/__init__.py). version-check enforces this.
-#
-# Design: gauntlet gates everything; the GitHub Release (binary) is the
-# always-ships artifact; npm + PyPI are independent jobs so one registry
-# outage cannot block the other or the binary release.
+# The candidate job builds every publishable component once, resolves the
+# component manifest, generates checksums/SBOM/provenance, signs the bundle,
+# verifies it, and uploads the complete staging directory. Publication and
+# environment gates may only consume that artifact; they never rebuild it.
 name: Release
 
 on:
@@ -24,19 +12,25 @@ on:
       - 'v*'
 
 permissions:
-  contents: write # softprops/action-gh-release creates the Release + assets.
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  BUILDROOT_VERSION: "2025.05"
 
 jobs:
-  # ---- Gate: never release a red tree. Mirrors ci.yml's lint + test ----
   gauntlet:
     name: pre-release gauntlet
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+      - name: release component contract
+        run: sh deploy/test-release-contract.sh
+      - name: Check advisory exception ownership and expiry
+        run: sh scripts/check-advisory-exceptions.sh deny.toml
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
@@ -48,7 +42,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace --lib (excludes ne-e2e; needs KVM host)
         run: cargo test --workspace --lib
-      # TypeScript SDK gate.
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -67,7 +60,6 @@ jobs:
         working-directory: sdk/typescript
         run: npm run test
 
-  # ---- Version consistency: tag must match all three manifest sources ----
   version-check:
     name: version consistency
     runs-on: ubuntu-24.04
@@ -77,7 +69,6 @@ jobs:
       - uses: actions/checkout@v6
       - id: ver
         run: |
-          # Strip the leading `v` from the tag (v0.1.1 -> 0.1.1).
           v="${GITHUB_REF_NAME#v}"
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Release version: $v"
@@ -90,8 +81,16 @@ jobs:
           ts_v=$(jq -r .version sdk/typescript/package.json)
           py_v=$(grep -m1 '^version' sdk/python/pyproject.toml | sed -E 's/version = "(.*)"/\1/')
           py_init_v=$(grep -E '^__version__' sdk/python/src/ne/__init__.py | sed -E 's/.*"(.*)".*/\1/')
-          for src in "Cargo.toml:$cargo_v" "package.json:$ts_v" "pyproject.toml:$py_v" "__init__.py:$py_init_v"; do
-            name="${src%%:*}"; val="${src##*:}"
+          contract_v=$(jq -r .release_version deploy/release-components.json)
+          for src in \
+            "Cargo.toml:$cargo_v" \
+            "package.json:$ts_v" \
+            "pyproject.toml:$py_v" \
+            "__init__.py:$py_init_v" \
+            "release-components.json:$contract_v"
+          do
+            name="${src%%:*}"
+            val="${src##*:}"
             if [ "$val" != "$VERSION" ]; then
               echo "::error::$name has version '$val' but tag is '$VERSION'. Bump all sources before tagging."
               exit 1
@@ -99,11 +98,15 @@ jobs:
             echo "$name -> $val (ok)"
           done
 
-  # ---- Build the static musl binary + checksums (release artifact) ----
-  binary:
-    name: build musl binary
+  candidate:
+    name: build and sign immutable candidate
     runs-on: ubuntu-24.04
     needs: [gauntlet, version-check]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -111,103 +114,555 @@ jobs:
           toolchain: "1.95.0"
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - name: Install musl tooling
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build nee (static musl)
-        run: cargo build --release --target x86_64-unknown-linux-musl -p ne-enclave
-      - name: Stage release asset + checksums
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          python -m pip install --upgrade build
+      - name: Build nee with all supported execution profiles
+        run: >-
+          cargo build --release
+          --target x86_64-unknown-linux-musl
+          -p ne-enclave
+          --features confidential-cvm
+      - name: Build pinned OpenShell sandbox (static musl)
+        run: |
+          set -euo pipefail
+          git clone https://github.com/Infrastacks/OpenShell.git "$RUNNER_TEMP/OpenShell"
+          git -C "$RUNNER_TEMP/OpenShell" checkout --detach 70328542941838612a75b62c3cc365e01594c0c3
+          cargo build \
+            --manifest-path "$RUNNER_TEMP/OpenShell/Cargo.toml" \
+            --release \
+            --target x86_64-unknown-linux-musl \
+            -p openshell-sandbox
+      - name: Stage runtime and install assets
         run: |
           set -euo pipefail
           mkdir -p staging
-          cp target/x86_64-unknown-linux-musl/release/nee staging/ne-x86_64-unknown-linux-musl
-          sha256sum staging/ne-x86_64-unknown-linux-musl > staging/SHA256SUMS
-          # Stage install.sh as a release asset so the curl one-liner
-          # (curl .../releases/latest/download/install.sh) resolves.
+          cp target/x86_64-unknown-linux-musl/release/nee \
+            staging/nee-x86_64-unknown-linux-musl
+          cp "$RUNNER_TEMP/OpenShell/target/x86_64-unknown-linux-musl/release/openshell-sandbox" \
+            staging/openshell-sandbox-x86_64-unknown-linux-musl
+          cp crates/ne/templates/openshell-policy.rego staging/openshell-policy.rego
+          cp crates/ne/templates/openshell-policy.yaml staging/openshell-policy.yaml
           cp deploy/install.sh staging/install.sh
-          cat staging/SHA256SUMS
+          cp deploy/release-components.json staging/release-components.json
+      - name: Build TypeScript candidate package
+        working-directory: sdk/typescript
+        run: |
+          npm ci
+          npm run build
+          npm pack --pack-destination ../../staging
+      - name: Build Python candidate packages
+        working-directory: sdk/python
+        run: python -m build --outdir ../../staging
+      - name: Assert candidate SDK filenames
+        run: |
+          test -f staging/neuronedge-enclave-0.2.0.tgz
+          test -f staging/neuronedge_enclave-0.2.0-py3-none-any.whl
+          test -f staging/neuronedge_enclave-0.2.0.tar.gz
       - name: Verify static linkage
         run: |
-          file target/x86_64-unknown-linux-musl/release/nee
-          ldd target/x86_64-unknown-linux-musl/release/nee || true
+          set -euo pipefail
+          for binary in \
+            target/x86_64-unknown-linux-musl/release/nee \
+            "$RUNNER_TEMP/OpenShell/target/x86_64-unknown-linux-musl/release/openshell-sandbox"
+          do
+            description="$(file "$binary")"
+            echo "$description"
+            case "$description" in
+              *"statically linked"* | *"static-pie linked"*) ;;
+              *)
+                echo "::error::$binary is not statically linked"
+                exit 1
+                ;;
+            esac
+          done
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: staging
+          format: spdx-json
+          output-file: staging/ne-enclave.spdx.json
+          artifact-name: ne-enclave.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Resolve release manifest and checksums
+        run: |
+          set -euo pipefail
+          for key in $(jq -r '
+            .assets
+            | keys[]
+            | select(. != "checksums" and . != "provenance")
+          ' staging/release-components.json); do
+            file="$(jq -r --arg key "$key" \
+              '.assets[$key]' staging/release-components.json)"
+            test -f "staging/$file"
+            digest="$(sha256sum "staging/$file" | awk '{print $1}')"
+            tmp="$(mktemp)"
+            jq --arg key "$key" --arg digest "$digest" \
+              '.resolved_sha256[$key] = $digest' \
+              staging/release-components.json > "$tmp"
+            mv "$tmp" staging/release-components.json
+          done
+          for file in staging/*; do
+            case "$file" in
+              */SHA256SUMS|*.sigstore.json) continue ;;
+            esac
+            sha256sum "$file"
+          done | sed 's#staging/##' | sort -k2 > staging/SHA256SUMS
+          cat staging/SHA256SUMS
+      - name: Generate build provenance
+        id: provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: staging/SHA256SUMS
+      - name: Stage provenance bundle
+        run: >-
+          cp '${{ steps.provenance.outputs.bundle-path }}'
+          staging/ne-enclave.provenance.sigstore.json
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+      - name: Sign every ordinary candidate component
+        run: |
+          set -euo pipefail
+          for file in staging/*; do
+            case "$file" in
+              *.sigstore.json) continue ;;
+            esac
+            cosign sign-blob --yes --bundle "${file}.sigstore.json" "$file"
+          done
+      - name: Verify candidate signatures and provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          identity='https://github\.com/Infrastacks/ne-enclave/\.github/workflows/release\.yml@refs/tags/'
+          issuer='https://token.actions.githubusercontent.com'
+          for file in staging/*; do
+            case "$file" in
+              *.sigstore.json) continue ;;
+            esac
+            cosign verify-blob "$file" \
+              --bundle "${file}.sigstore.json" \
+              --certificate-identity-regexp "^${identity}v[0-9].*$" \
+              --certificate-oidc-issuer "$issuer"
+          done
+          while read -r _digest file; do
+            gh attestation verify "staging/$file" \
+              --repo Infrastacks/ne-enclave \
+              --bundle staging/ne-enclave.provenance.sigstore.json \
+              --signer-workflow Infrastacks/ne-enclave/.github/workflows/release.yml \
+              --source-ref "$GITHUB_REF"
+          done < staging/SHA256SUMS
+      - name: Archive exact verified candidate
+        run: |
+          tar -C staging -cf ne-release-assets.tar .
       - uses: actions/upload-artifact@v4
         with:
           name: ne-release-assets
-          path: |
-            staging/ne-x86_64-unknown-linux-musl
-            staging/SHA256SUMS
-            staging/install.sh
+          path: ne-release-assets.tar
+          if-no-files-found: error
 
-  # ---- Create the GitHub Release + attach the binary + checksums ----
-  github-release:
-    name: GitHub Release
+  standard-artifact-gate:
+    name: signed candidate — standard KVM
     runs-on: ubuntu-24.04
-    needs: [binary, version-check]
+    needs: [candidate]
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v5
         with:
           name: ne-release-assets
-          path: staging
-      - name: Publish Release
+          path: ${{ runner.temp }}/release-artifact
+      - name: Extract exact verified candidate
+        run: |
+          mkdir staging
+          tar -xf "$RUNNER_TEMP/release-artifact/ne-release-assets.tar" -C staging
+      - name: Require KVM
+        run: |
+          test -c /dev/kvm
+          ls -l /dev/kvm
+      - name: Install jq and Firecracker
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq musl-tools
+          arch="$(uname -m)"
+          version="$(curl -fsSL https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest | jq -r .tag_name)"
+          curl -fsSL \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${version}/firecracker-${version}-${arch}.tgz" \
+            | sudo tar -xz -C /usr/local --strip-components=1
+          sudo find /usr/local -maxdepth 3 -name "firecracker-${version}-${arch}" \
+            -exec install {} /usr/local/bin/firecracker \;
+          sudo find /usr/local -maxdepth 3 -name "jailer-${version}-${arch}" \
+            -exec install {} /usr/local/bin/jailer \;
+          firecracker --version
+          jailer --version
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+      - name: Expose Cosign to the root installer
+        run: sudo install -m 0755 "$(command -v cosign)" /usr/local/bin/cosign
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore Buildroot downloads and compiler cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/buildroot-dl
+            ~/.buildroot-ccache
+          key: release-br-${{ env.BUILDROOT_VERSION }}-${{ hashFiles('images/**', 'crates/ne-guest-agent/**', 'crates/ne-protocol/**') }}
+      - name: Build only the standard test guest image
+        run: |
+          set -euo pipefail
+          cargo build -p ne-guest-agent --release --target x86_64-unknown-linux-musl
+          git clone --depth 1 --branch "${BUILDROOT_VERSION}" \
+            https://gitlab.com/buildroot.org/buildroot.git "${HOME}/buildroot"
+          mkdir -p "${HOME}/buildroot-dl" "${HOME}/.buildroot-ccache"
+          export BR2_DL_DIR="${HOME}/buildroot-dl"
+          export CCACHE_DIR="${HOME}/.buildroot-ccache"
+          cargo run -p ne-image -- build \
+            --template phase0-spike \
+            --buildroot "${HOME}/buildroot"
+      - name: Install and exercise the signed standard candidate
+        env:
+          NE_E2E_FIRECRACKER: /usr/local/bin/firecracker
+          NE_E2E_JAILER: /usr/local/bin/jailer
+        run: |
+          sudo --preserve-env=NE_E2E_FIRECRACKER,NE_E2E_JAILER \
+            env NE_VERSION="$GITHUB_REF_NAME" \
+            deploy/smoke-install.sh \
+            "$GITHUB_WORKSPACE/staging" \
+            "$GITHUB_WORKSPACE/target/images/phase0-spike/images/vmlinux" \
+            "$GITHUB_WORKSPACE/target/images/phase0-spike/images/rootfs.ext4"
+
+  azure-confidential-artifact-gate:
+    name: signed candidate — Azure confidential DCasv5
+    runs-on: ubuntu-24.04
+    needs: [candidate]
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      AZURE_CORE_OUTPUT: none
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: ne-release-assets
+          path: ${{ runner.temp }}/release-artifact
+      - name: Extract exact verified candidate
+        run: |
+          mkdir staging
+          tar -xf "$RUNNER_TEMP/release-artifact/ne-release-assets.tar" -C staging
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+      - name: Azure OIDC login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Provision Azure confidential VM
+        id: azure
+        run: |
+          set -euo pipefail
+          resource_group="ne-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          vm_name="ne-cvm-${GITHUB_RUN_ID}"
+          location="${AZURE_LOCATION:-eastus}"
+          key="$RUNNER_TEMP/ne-release-azure"
+          ssh-keygen -t ed25519 -N '' -f "$key"
+          az group create \
+            --name "$resource_group" \
+            --location "$location"
+          az vm create \
+            --resource-group "$resource_group" \
+            --name "$vm_name" \
+            --location "$location" \
+            --size Standard_DC4as_v5 \
+            --image "Canonical:0001-com-ubuntu-confidential-vm-jammy:22_04-lts-cvm:latest" \
+            --security-type ConfidentialVM \
+            --enable-vtpm true \
+            --enable-secure-boot true \
+            --os-disk-security-encryption-type VMGuestStateOnly \
+            --admin-username nee-ci \
+            --ssh-key-values "$key.pub" \
+            --public-ip-sku Standard
+          public_ip="$(az vm show -d \
+            --resource-group "$resource_group" \
+            --name "$vm_name" \
+            --query publicIps -o tsv)"
+          test -n "$public_ip"
+          {
+            echo "resource_group=$resource_group"
+            echo "vm_name=$vm_name"
+            echo "public_ip=$public_ip"
+            echo "key=$key"
+          } >> "$GITHUB_OUTPUT"
+      - name: Transfer candidate and pinned verifier
+        env:
+          PUBLIC_IP: ${{ steps.azure.outputs.public_ip }}
+          SSH_KEY: ${{ steps.azure.outputs.key }}
+        run: |
+          set -euo pipefail
+          host="nee-ci@${PUBLIC_IP}"
+          ssh_opts=(
+            -i "$SSH_KEY"
+            -o ConnectTimeout=10
+            -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null
+          )
+          ready=
+          for _attempt in $(seq 1 60); do
+            if ssh "${ssh_opts[@]}" "$host" true 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          test -n "$ready"
+          ssh "${ssh_opts[@]}" "$host" \
+            'sudo apt-get update && sudo apt-get install -y tpm2-tools jq curl ca-certificates'
+          ssh "${ssh_opts[@]}" "$host" 'mkdir -p /tmp/ne-release'
+          scp "${ssh_opts[@]}" -r \
+            staging \
+            deploy/smoke-confidential-azure.sh \
+            "$host:/tmp/ne-release/"
+          scp "${ssh_opts[@]}" "$(command -v cosign)" \
+            "$host:/tmp/ne-release/cosign"
+          ssh "${ssh_opts[@]}" "$host" \
+            'chmod +x /tmp/ne-release/smoke-confidential-azure.sh && sudo install -m 0755 /tmp/ne-release/cosign /usr/local/bin/cosign'
+      - name: Exercise REST, CLI, Python, and TypeScript against Azure
+        env:
+          PUBLIC_IP: ${{ steps.azure.outputs.public_ip }}
+          SSH_KEY: ${{ steps.azure.outputs.key }}
+        run: |
+          set -euo pipefail
+          host="nee-ci@${PUBLIC_IP}"
+          ssh_opts=(
+            -i "$SSH_KEY"
+            -o ConnectTimeout=10
+            -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null
+          )
+          log="$RUNNER_TEMP/ne-azure-smoke.log"
+          remote_smoke_pid=
+          tunnel_pid=
+          cleanup_local() {
+            set +e
+            test -z "${tunnel_pid:-}" || kill "$tunnel_pid" 2>/dev/null
+            test -z "${remote_smoke_pid:-}" || kill "$remote_smoke_pid" 2>/dev/null
+            test ! -f "$log" || tail -n 200 "$log"
+          }
+          trap cleanup_local EXIT
+
+          release_tag="$(printf '%q' "$GITHUB_REF_NAME")"
+          ssh "${ssh_opts[@]}" "$host" \
+            "sudo env NE_VERSION=${release_tag} /tmp/ne-release/smoke-confidential-azure.sh /tmp/ne-release/staging" \
+            >"$log" 2>&1 &
+          remote_smoke_pid=$!
+          echo "$remote_smoke_pid" > "$RUNNER_TEMP/ne-azure-smoke.pid"
+
+          for _attempt in $(seq 1 120); do
+            if ssh "${ssh_opts[@]}" "$host" \
+              'test -f /tmp/ne-release-gate-ready' 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+          ssh "${ssh_opts[@]}" "$host" \
+            'test -f /tmp/ne-release-gate-ready'
+
+          ssh "${ssh_opts[@]}" \
+            -L 50051:127.0.0.1:50051 \
+            -L 8080:127.0.0.1:8080 \
+            -N "$host" &
+          tunnel_pid=$!
+          echo "$tunnel_pid" > "$RUNNER_TEMP/ne-azure-tunnel.pid"
+          sleep 2
+          kill -0 "$tunnel_pid"
+
+          rest_nonce="$(python -c 'import base64; print(base64.b64encode(bytes([0x11]) * 32).decode())')"
+          curl -fsS \
+            -H 'content-type: application/json' \
+            -d "{\"nonce\":\"${rest_nonce}\"}" \
+            http://127.0.0.1:8080/v1/workspaces/azure-release-gate/attestation \
+            > rest-evidence.json
+          jq -e '
+            .provider == "sev_snp_azure"
+            and .proof.proof_type == "sev_snp_azure"
+            and (.proof.report | length > 0)
+            and (.proof.vcek_cert_chain | length > 0)
+            and (.proof.var_data | length > 0)
+            and (.proof.ak_pub_tpm2b | length > 0)
+            and (.proof.quote_msg | length > 0)
+            and (.proof.quote_sig | length > 0)
+          ' rest-evidence.json
+
+          cli_nonce="$(printf '44%.0s' $(seq 1 32))"
+          staging/nee-x86_64-unknown-linux-musl workspace attest \
+            azure-release-gate \
+            --endpoint http://127.0.0.1:50051 \
+            --nonce "$cli_nonce" \
+            --output json \
+            --out evidence.json
+          jq -n --arg nonce "$cli_nonce" '{
+            accepted_providers: ["sev_snp_azure"],
+            expected_workspace_id: "azure-release-gate",
+            expected_nonce_hex: $nonce,
+            freshness_seconds: 300,
+            expected_workspace_measurement_hex: null,
+            expected_host_cvm_measurement_hex: null,
+            expected_signer_b64: null,
+            min_tcb: 0,
+            guest_policy: 0
+          }' > policy.json
+          staging/nee-x86_64-unknown-linux-musl attestation verify \
+            --evidence evidence.json \
+            --policy policy.json
+
+          python -m venv "$RUNNER_TEMP/ne-sdk-python"
+          "$RUNNER_TEMP/ne-sdk-python/bin/pip" install \
+            staging/neuronedge_enclave-0.2.0-py3-none-any.whl
+          "$RUNNER_TEMP/ne-sdk-python/bin/python" deploy/smoke-sdk-python.py
+
+          mkdir "$RUNNER_TEMP/ne-sdk-typescript"
+          cd "$RUNNER_TEMP/ne-sdk-typescript"
+          npm init -y
+          npm install "$GITHUB_WORKSPACE/staging/neuronedge-enclave-0.2.0.tgz"
+          cp "$GITHUB_WORKSPACE/deploy/smoke-sdk-typescript.mjs" .
+          node smoke-sdk-typescript.mjs
+
+          ssh "${ssh_opts[@]}" "$host" \
+            'sudo touch /tmp/ne-release-gate-clients-complete'
+          wait "$remote_smoke_pid"
+          remote_smoke_pid=
+          kill "$tunnel_pid"
+          tunnel_pid=
+          rm -f \
+            "$RUNNER_TEMP/ne-azure-smoke.pid" \
+            "$RUNNER_TEMP/ne-azure-tunnel.pid"
+          cat "$log"
+          trap - EXIT
+      - name: Upload Azure gate log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ne-azure-confidential-gate-log
+          path: ${{ runner.temp }}/ne-azure-smoke.log
+          if-no-files-found: ignore
+      - name: Destroy Azure resources
+        if: always()
+        run: |
+          for pid_file in \
+            "$RUNNER_TEMP/ne-azure-tunnel.pid" \
+            "$RUNNER_TEMP/ne-azure-smoke.pid"; do
+            if [ -f "$pid_file" ]; then
+              kill "$(cat "$pid_file")" 2>/dev/null || true
+            fi
+          done
+          az group delete \
+            --name "ne-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --yes \
+            --no-wait || true
+
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [candidate, version-check, standard-artifact-gate, azure-confidential-artifact-gate]
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: ne-release-assets
+          path: ${{ runner.temp }}/release-artifact
+      - name: Extract exact verified candidate
+        run: |
+          mkdir staging
+          tar -xf "$RUNNER_TEMP/release-artifact/ne-release-assets.tar" -C staging
+      - name: Publish verified candidate
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: |
-            staging/ne-x86_64-unknown-linux-musl
-            staging/SHA256SUMS
-            staging/install.sh
+          files: staging/*
 
-  # ---- Publish @neuronedge/enclave to npm ----
-  # Skipped until NPM_TOKEN is set on the repo. Set the secret and the next
-  # tag will publish; until then the binary + GitHub Release still ship.
   npm:
     name: npm publish
     runs-on: ubuntu-24.04
-    needs: [gauntlet, version-check]
+    needs: [candidate, version-check, standard-artifact-gate, azure-confidential-artifact-gate]
     if: vars.ENABLE_SDK_PUBLISH == 'true'
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: ne-release-assets
+          path: ${{ runner.temp }}/release-artifact
+      - name: Extract exact verified candidate
+        run: |
+          mkdir staging
+          tar -xf "$RUNNER_TEMP/release-artifact/ne-release-assets.tar" -C staging
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
           registry-url: https://registry.npmjs.org
-          cache: 'npm'
-          cache-dependency-path: sdk/typescript/package-lock.json
-      - name: npm ci
-        working-directory: sdk/typescript
-        run: npm ci
-      - name: npm run build
-        working-directory: sdk/typescript
-        run: npm run build
-      - name: npm publish
-        working-directory: sdk/typescript
+      - name: Publish verified TypeScript package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: |
+          npm publish staging/neuronedge-enclave-0.2.0.tgz --access public
 
-  # ---- Publish neuronedge-enclave to PyPI ----
-  # Skipped until PYPI_TOKEN is set on the repo (gated by the same var as npm).
   pypi:
     name: PyPI publish
     runs-on: ubuntu-24.04
-    needs: [gauntlet, version-check]
+    needs: [candidate, version-check, standard-artifact-gate, azure-confidential-artifact-gate]
     if: vars.ENABLE_SDK_PUBLISH == 'true'
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: ne-release-assets
+          path: ${{ runner.temp }}/release-artifact
+      - name: Extract exact verified candidate
+        run: |
+          mkdir staging
+          tar -xf "$RUNNER_TEMP/release-artifact/ne-release-assets.tar" -C staging
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install build backend
-        working-directory: sdk/python
-        run: pip install --upgrade build twine
-      - name: Build sdist + wheel
-        working-directory: sdk/python
-        run: rm -rf dist && python -m build
-      - name: Publish to PyPI
-        working-directory: sdk/python
+      - name: Install upload client
+        run: python -m pip install --upgrade twine
+      - name: Publish verified Python packages
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: twine upload dist/*
+        run: |
+          twine upload staging/neuronedge_enclave-0.2.0-py3-none-any.whl staging/neuronedge_enclave-0.2.0.tar.gz

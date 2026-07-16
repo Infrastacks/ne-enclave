@@ -171,7 +171,14 @@ async fn concurrent_same_id_create_has_one_winner() {
     cfg.state_dir = state_dir.clone();
     cfg.image_store = image_store;
     let audit = AuditLog::open(&state_dir).await.expect("audit");
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 1024, 32768).expect("workspace manager"));
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
+    let mgr = Arc::new(
+        WorkspaceManager::new(cfg, audit, attestation, 1024, 32768).expect("workspace manager"),
+    );
 
     // Fire two identical cold creates concurrently. The winner claims the id
     // up front (`claim_boot`) and boots alone; the loser fails fast without
@@ -484,7 +491,14 @@ async fn concurrent_pool_checkout_single_winner() {
         max_in_flight: 2,
     });
     let audit = AuditLog::open(&state_dir).await.expect("audit");
-    let mgr = Arc::new(WorkspaceManager::new(cfg, audit, 1024, 32768).expect("workspace manager"));
+    let attestation = ne_supervisor::attestation_factory::build_provider(
+        ne_protocol::profile::AttestationBackend::Software,
+        audit.signing_key(),
+    )
+    .expect("software provider");
+    let mgr = Arc::new(
+        WorkspaceManager::new(cfg, audit, attestation, 1024, 32768).expect("workspace manager"),
+    );
     mgr.spawn_refill();
 
     // Two ready members, no boots in flight: the on-disk `pool-*` dir set is

@@ -51,6 +51,19 @@ impl Runtime for RuntimeService {
         }))
     }
 
+    async fn get_runtime_capabilities(
+        &self,
+        _request: Request<pb::GetRuntimeCapabilitiesRequest>,
+    ) -> Result<Response<pb::GetRuntimeCapabilitiesResponse>, Status> {
+        debug!("get_runtime_capabilities received");
+        let capabilities = self
+            .core
+            .runtime_capabilities()
+            .await
+            .map_err(core_error_to_status)?;
+        Ok(Response::new(capabilities_to_pb(capabilities)))
+    }
+
     async fn create_workspace(
         &self,
         request: Request<pb::CreateWorkspaceRequest>,
@@ -383,6 +396,7 @@ impl Runtime for RuntimeService {
         }))
     }
 
+    #[allow(deprecated)]
     async fn get_attestation_evidence(
         &self,
         request: Request<pb::GetAttestationEvidenceRequest>,
@@ -393,8 +407,11 @@ impl Runtime for RuntimeService {
             .get_attestation_evidence(r.workspace_id, r.nonce)
             .await
             .map_err(core_error_to_status)?;
+        let public_evidence = Some(evidence_to_pb(evidence.clone())?);
+        let evidence = legacy_evidence_to_pb(evidence)?;
         Ok(Response::new(pb::GetAttestationEvidenceResponse {
-            evidence: Some(evidence_to_pb(evidence)?),
+            evidence,
+            public_evidence,
         }))
     }
 }
@@ -464,10 +481,64 @@ fn kind_to_status(kind: ne_protocol::supervisor::SupervisorErrorKind, message: S
         | K::WorkspaceNotPaused
         | K::WorkspaceAlreadyPaused
         | K::WorkspaceNotNetworked
-        | K::AttestationReplay => Status::failed_precondition(message),
+        | K::AttestationReplay
+        | K::UnsupportedForProfile
+        | K::ConfidentialCapacityExceeded => Status::failed_precondition(message),
         // SnapshotFailed / RestoreFailed / LaunchFailed / GuestProtocolError /
         // IoError / Internal / any future variant → internal.
         _ => Status::internal(message),
+    }
+}
+
+fn capabilities_to_pb(
+    capabilities: ne_protocol::profile::RuntimeCapabilitiesInfo,
+) -> pb::GetRuntimeCapabilitiesResponse {
+    use ne_protocol::profile::{
+        AttestationBackend, ExecutionBackend, ExecutionProfile, WorkspaceOperation,
+    };
+
+    let execution_profile = match capabilities.execution_profile {
+        ExecutionProfile::Standard => pb::ExecutionProfile::Standard,
+        ExecutionProfile::ConfidentialAzure => pb::ExecutionProfile::ConfidentialAzure,
+    };
+    let execution_backend = match capabilities.execution_backend {
+        ExecutionBackend::Firecracker => pb::ExecutionBackend::Firecracker,
+        ExecutionBackend::OpenShell => pb::ExecutionBackend::OpenShell,
+    };
+    let attestation_backend = match capabilities.attestation_backend {
+        AttestationBackend::Software => pb::AttestationBackend::Software,
+        AttestationBackend::SevSnpDirect => pb::AttestationBackend::SevSnpDirect,
+        AttestationBackend::SevSnpAzure => pb::AttestationBackend::SevSnpAzure,
+    };
+    let supported_operations = capabilities
+        .supported_operations
+        .into_iter()
+        .map(|operation| match operation {
+            WorkspaceOperation::Create => pb::WorkspaceOperation::Create as i32,
+            WorkspaceOperation::Destroy => pb::WorkspaceOperation::Destroy as i32,
+            WorkspaceOperation::Execute => pb::WorkspaceOperation::Execute as i32,
+            WorkspaceOperation::WriteFile => pb::WorkspaceOperation::WriteFile as i32,
+            WorkspaceOperation::ReadFile => pb::WorkspaceOperation::ReadFile as i32,
+            WorkspaceOperation::Pause => pb::WorkspaceOperation::Pause as i32,
+            WorkspaceOperation::Resume => pb::WorkspaceOperation::Resume as i32,
+            WorkspaceOperation::Snapshot => pb::WorkspaceOperation::Snapshot as i32,
+            WorkspaceOperation::Restore => pb::WorkspaceOperation::Restore as i32,
+            WorkspaceOperation::Fork => pb::WorkspaceOperation::Fork as i32,
+            WorkspaceOperation::WarmPool => pb::WorkspaceOperation::WarmPool as i32,
+            WorkspaceOperation::Ingress => pb::WorkspaceOperation::Ingress as i32,
+            WorkspaceOperation::Attest => pb::WorkspaceOperation::Attest as i32,
+        })
+        .collect();
+
+    pb::GetRuntimeCapabilitiesResponse {
+        runtime_version: capabilities.runtime_version,
+        execution_profile: execution_profile as i32,
+        execution_backend: execution_backend as i32,
+        attestation_backend: attestation_backend as i32,
+        supported_operations,
+        hard_workspace_capacity: capabilities.hard_workspace_capacity,
+        confidential_snapshot_supported: capabilities.confidential_snapshot_supported,
+        evidence_schema_version: capabilities.evidence_schema_version,
     }
 }
 
@@ -488,60 +559,77 @@ mod image_error_mapping_tests {
             assert_eq!(kind_to_status(kind, "image error".into()).code(), code);
         }
     }
+
+    #[test]
+    fn profile_errors_map_to_failed_precondition() {
+        for kind in [K::UnsupportedForProfile, K::ConfidentialCapacityExceeded] {
+            assert_eq!(
+                kind_to_status(kind, "profile error".into()).code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+    }
 }
 
-/// Convert the domain `Evidence` envelope to its protobuf form.
-///
-/// Both `Proof` and `ProviderType` are `#[non_exhaustive]` external enums, so
-/// the compiler requires catch-all arms. Unknown (future) provider/proof
-/// variants are a server bug, not a client error — refuse loudly with
-/// `Status::internal` rather than emit a success-framed bogus envelope a
-/// lenient client could mistake for a passing attestation.
-///
-/// `tonic::Status` is ~176 bytes so the large-err lint is suppressed here, as
-/// elsewhere in the crate; the `Status` return is intentional so the handler
-/// can `?` it straight onto the gRPC error path.
+/// Convert domain evidence through the shared public contract into protobuf.
 #[allow(clippy::result_large_err)]
-fn evidence_to_pb(ev: ne_attestation::Evidence) -> Result<pb::AttestationEvidence, Status> {
-    let (signature, signer_pubkey, sev_report, sev_chain) = match ev.proof {
-        ne_attestation::Proof::Software {
+fn evidence_to_pb(ev: ne_attestation::Evidence) -> Result<pb::PublicAttestationEvidence, Status> {
+    let public =
+        ne_protocol::attestation::PublicAttestationEvidence::try_from(ev).map_err(|error| {
+            Status::internal(format!("encode public attestation evidence: {error}"))
+        })?;
+    pb::PublicAttestationEvidence::try_from(public)
+        .map_err(|error| Status::internal(format!("encode protobuf attestation evidence: {error}")))
+}
+
+/// Convert evidence into the legacy v0.1.x protobuf shape when that shape can
+/// represent the proof without dropping fields. Azure vTPM evidence is only
+/// emitted through the typed public envelope.
+#[allow(clippy::result_large_err)]
+fn legacy_evidence_to_pb(
+    ev: ne_attestation::Evidence,
+) -> Result<Option<pb::AttestationEvidence>, Status> {
+    use ne_protocol::attestation::{PublicAttestationEvidence, PublicAttestationProof};
+
+    let public = PublicAttestationEvidence::try_from(ev).map_err(|error| {
+        Status::internal(format!("encode legacy attestation evidence: {error}"))
+    })?;
+    let proof = match public.proof {
+        PublicAttestationProof::Software {
             signature,
             signer_pubkey,
-        } => (
-            signature.to_vec(),
-            signer_pubkey.to_vec(),
-            Vec::new(),
-            Vec::new(),
-        ),
-        ne_attestation::Proof::SevSnp {
+        } => Some(pb::AttestationProof {
+            signature,
+            signer_pubkey,
+            sev_snp_report: Vec::new(),
+            sev_snp_vcek_chain: Vec::new(),
+        }),
+        PublicAttestationProof::SevSnpDirect {
             report,
             vcek_cert_chain,
-        } => (Vec::new(), Vec::new(), report, vcek_cert_chain),
-        // REVIEWER NOTE: catch-all stays — Proof is #[non_exhaustive]; unknown
-        // future variants are a server bug, refuse loudly (§7.3 invariant).
-        _ => return Err(Status::internal("unsupported attestation proof variant")),
-    };
-    let provider_type = match ev.provider_type {
-        ne_attestation::ProviderType::Software => "software",
-        ne_attestation::ProviderType::SevSnp => "sev_snp",
-        // REVIEWER NOTE: catch-all stays — ProviderType is #[non_exhaustive].
-        _ => return Err(Status::internal("unsupported attestation provider variant")),
-    }
-    .to_string();
-    Ok(pb::AttestationEvidence {
-        provider_type,
-        workspace_id: ev.workspace_id,
-        measurement: ev.measurement.0.to_vec(),
-        nonce: ev.nonce,
-        issued_at: ev.issued_at,
-        report_data: ev.report_data,
-        proof: Some(pb::AttestationProof {
-            signature,
-            signer_pubkey,
-            sev_snp_report: sev_report,
-            sev_snp_vcek_chain: sev_chain,
+        } => Some(pb::AttestationProof {
+            signature: Vec::new(),
+            signer_pubkey: Vec::new(),
+            sev_snp_report: report,
+            sev_snp_vcek_chain: vcek_cert_chain,
         }),
-    })
+        PublicAttestationProof::SevSnpAzure { .. } => return Ok(None),
+    };
+    let provider_type = match public.provider {
+        ne_protocol::attestation::PublicAttestationProvider::Software => "software",
+        ne_protocol::attestation::PublicAttestationProvider::SevSnpDirect => "sev_snp",
+        ne_protocol::attestation::PublicAttestationProvider::SevSnpAzure => return Ok(None),
+    };
+
+    Ok(Some(pb::AttestationEvidence {
+        provider_type: provider_type.to_string(),
+        workspace_id: public.workspace_id,
+        measurement: public.workspace_measurement,
+        nonce: public.nonce,
+        issued_at: public.issued_at,
+        report_data: public.report_data,
+        proof,
+    }))
 }
 
 #[cfg(test)]
@@ -1099,6 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn get_attestation_evidence_relays_and_converts() {
         use ne_attestation::{Evidence, Measurement, Proof, ProviderType};
 
@@ -1139,12 +1228,23 @@ mod tests {
             .expect("get_attestation_evidence")
             .into_inner();
 
-        let ev = resp.evidence.expect("evidence must be set");
-        assert_eq!(ev.provider_type, "software");
+        let legacy = resp.evidence.expect("legacy evidence must be set");
+        assert_eq!(legacy.provider_type, "software");
+        assert_eq!(legacy.workspace_id, "ws-attest-1");
+        assert_eq!(legacy.measurement, vec![0xab; 32]);
+        let legacy_proof = legacy.proof.expect("legacy software proof must be set");
+        assert_eq!(legacy_proof.signature.len(), 64);
+        assert_eq!(legacy_proof.signer_pubkey.len(), 32);
+
+        let ev = resp.public_evidence.expect("public evidence must be set");
+        assert_eq!(ev.schema_version, 1);
+        assert_eq!(ev.provider, pb::AttestationProvider::Software as i32);
         assert_eq!(ev.workspace_id, "ws-attest-1");
-        assert_eq!(ev.measurement.len(), 32);
-        assert!(ev.measurement.iter().all(|&b| b == 0xab));
-        let proof = ev.proof.expect("proof must be set");
+        assert_eq!(ev.workspace_measurement.len(), 32);
+        assert!(ev.workspace_measurement.iter().all(|&b| b == 0xab));
+        let Some(pb::public_attestation_evidence::Proof::Software(proof)) = ev.proof else {
+            panic!("software proof must be set");
+        };
         assert_eq!(proof.signature.len(), 64);
         assert_eq!(proof.signer_pubkey.len(), 32);
     }
@@ -1162,9 +1262,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
-    /// `evidence_to_pb` maps a SEV-SNP `Evidence` envelope onto the protobuf
-    /// form: empty software fields, populated `sev_snp_report` /
-    /// `sev_snp_vcek_chain`, and `provider_type == "sev_snp"`.
+    /// Direct SEV-SNP maps to the direct provider and oneof variant.
     #[test]
     fn evidence_to_pb_maps_sev_snp_envelope() {
         let report = vec![0xAu8; 0x1000];
@@ -1183,21 +1281,17 @@ mod tests {
         };
 
         let pb_ev = evidence_to_pb(ev).expect("sev_snp evidence maps cleanly");
-        assert_eq!(pb_ev.provider_type, "sev_snp");
+        assert_eq!(pb_ev.provider, pb::AttestationProvider::SevSnpDirect as i32);
         assert_eq!(pb_ev.workspace_id, "ws-snp-1");
-        assert_eq!(pb_ev.measurement.len(), 32);
-        let proof = pb_ev.proof.expect("proof must be set");
-        // Software proof is empty for SEV-SNP envelopes.
-        assert!(proof.signature.is_empty());
-        assert!(proof.signer_pubkey.is_empty());
-        // Firmware proof carried verbatim.
-        assert_eq!(proof.sev_snp_report, report);
-        assert_eq!(proof.sev_snp_vcek_chain, chain);
+        assert_eq!(pb_ev.workspace_measurement.len(), 32);
+        let Some(pb::public_attestation_evidence::Proof::SevSnpDirect(proof)) = pb_ev.proof else {
+            panic!("direct SNP proof must be set");
+        };
+        assert_eq!(proof.report, report);
+        assert_eq!(proof.vcek_cert_chain, chain);
     }
 
-    /// `evidence_to_pb` maps a Software envelope onto the protobuf form,
-    /// leaving the SEV-SNP fields empty (regression for backward-compat field
-    /// mapping after the additive proto change).
+    /// Software evidence maps to the software provider and oneof variant.
     #[test]
     fn evidence_to_pb_maps_software_envelope_leaves_snp_empty() {
         let ev = ne_attestation::Evidence {
@@ -1214,30 +1308,16 @@ mod tests {
         };
 
         let pb_ev = evidence_to_pb(ev).expect("software evidence maps cleanly");
-        assert_eq!(pb_ev.provider_type, "software");
-        let proof = pb_ev.proof.expect("proof must be set");
+        assert_eq!(pb_ev.provider, pb::AttestationProvider::Software as i32);
+        let Some(pb::public_attestation_evidence::Proof::Software(proof)) = pb_ev.proof else {
+            panic!("software proof must be set");
+        };
         assert_eq!(proof.signature.len(), 64);
         assert_eq!(proof.signer_pubkey.len(), 32);
-        assert!(proof.sev_snp_report.is_empty());
-        assert!(proof.sev_snp_vcek_chain.is_empty());
     }
 
-    /// Regression anchor for the catch-all arm. `Proof` and `ProviderType`
-    /// are `#[non_exhaustive]`, so a future (TDX, …) variant added upstream
-    /// must surface as `Status::internal` — never a silently-truncated
-    /// envelope that a lenient client could mistake for a passing
-    /// attestation (§7.3 "refuse loudly").
-    ///
-    /// We can't construct a not-yet-existing variant in a unit test, so this
-    /// test asserts the *known* arms are exhaustive at compile time: if the
-    /// match ever dropped its `_` catch-all (or someone removed an arm), the
-    /// compiler would reject the match for a `#[non_exhaustive]` enum. The
-    /// presence of this test + the `_ =>` arm is the invariant.
     #[test]
-    fn evidence_to_pb_exhaustive_arms_keep_catch_all_for_future_variants() {
-        // Software arm + provider_type round-trip (already covered above); the
-        // real assertion is the explicit `_ => return Err(Status::internal(..))`
-        // arms remaining in `evidence_to_pb`. Sealed here as documentation.
+    fn evidence_to_pb_uses_shared_public_converter() {
         let ev = ne_attestation::Evidence {
             provider_type: ne_attestation::ProviderType::Software,
             workspace_id: "ws-doc".into(),
@@ -1251,5 +1331,134 @@ mod tests {
             },
         };
         let _ = evidence_to_pb(ev).expect("known arms still map");
+    }
+
+    #[test]
+    fn evidence_to_pb_preserves_all_azure_proof_fields() {
+        let ev = ne_attestation::Evidence {
+            provider_type: ne_attestation::ProviderType::SevSnp,
+            workspace_id: "ws-azure".into(),
+            measurement: ne_attestation::Measurement([0x44; 32]),
+            nonce: vec![0x55; 16],
+            issued_at: 1_700_000_002,
+            report_data: vec![0x66; 48],
+            proof: ne_attestation::Proof::SevSnpAzure {
+                report: vec![1],
+                vcek_cert_chain: vec![2],
+                var_data: vec![3],
+                ak_pub_tpm2b: vec![4],
+                quote_msg: vec![5],
+                quote_sig: vec![6],
+            },
+        };
+
+        let pb_ev = evidence_to_pb(ev).expect("Azure evidence maps cleanly");
+        assert_eq!(pb_ev.provider, pb::AttestationProvider::SevSnpAzure as i32);
+        let Some(pb::public_attestation_evidence::Proof::SevSnpAzure(proof)) = pb_ev.proof else {
+            panic!("Azure proof must be set");
+        };
+        assert_eq!(proof.report, vec![1]);
+        assert_eq!(proof.vcek_cert_chain, vec![2]);
+        assert_eq!(proof.var_data, vec![3]);
+        assert_eq!(proof.ak_pub_tpm2b, vec![4]);
+        assert_eq!(proof.quote_msg, vec![5]);
+        assert_eq!(proof.quote_sig, vec![6]);
+    }
+
+    #[test]
+    fn legacy_evidence_is_available_for_software_and_direct_but_not_azure() {
+        let software = ne_attestation::Evidence {
+            provider_type: ne_attestation::ProviderType::Software,
+            workspace_id: "ws-sw".into(),
+            measurement: ne_attestation::Measurement([0x11; 32]),
+            nonce: vec![0x22; 16],
+            issued_at: 1,
+            report_data: vec![0x33],
+            proof: ne_attestation::Proof::Software {
+                signature: [0x44; 64],
+                signer_pubkey: [0x55; 32],
+            },
+        };
+        let direct = ne_attestation::Evidence {
+            provider_type: ne_attestation::ProviderType::SevSnp,
+            workspace_id: "ws-direct".into(),
+            measurement: ne_attestation::Measurement([0x66; 32]),
+            nonce: vec![0x77; 16],
+            issued_at: 2,
+            report_data: vec![0x88],
+            proof: ne_attestation::Proof::SevSnp {
+                report: vec![0x99],
+                vcek_cert_chain: vec![0xaa],
+            },
+        };
+        let azure = ne_attestation::Evidence {
+            provider_type: ne_attestation::ProviderType::SevSnp,
+            workspace_id: "ws-azure".into(),
+            measurement: ne_attestation::Measurement([0xbb; 32]),
+            nonce: vec![0xcc; 16],
+            issued_at: 3,
+            report_data: vec![0xdd],
+            proof: ne_attestation::Proof::SevSnpAzure {
+                report: vec![1],
+                vcek_cert_chain: vec![2],
+                var_data: vec![3],
+                ak_pub_tpm2b: vec![4],
+                quote_msg: vec![5],
+                quote_sig: vec![6],
+            },
+        };
+
+        let software = legacy_evidence_to_pb(software)
+            .expect("software maps")
+            .expect("software legacy envelope");
+        assert_eq!(software.provider_type, "software");
+        assert_eq!(
+            software.proof.expect("software proof").signature,
+            vec![0x44; 64]
+        );
+
+        let direct = legacy_evidence_to_pb(direct)
+            .expect("direct maps")
+            .expect("direct legacy envelope");
+        assert_eq!(direct.provider_type, "sev_snp");
+        assert_eq!(
+            direct.proof.expect("direct proof").sev_snp_report,
+            vec![0x99]
+        );
+
+        assert!(
+            legacy_evidence_to_pb(azure)
+                .expect("Azure omission is intentional")
+                .is_none(),
+            "lossy Azure evidence must not be emitted through the legacy envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_attestation_evidence_rejects_malformed_supervisor_evidence() {
+        let malformed = ne_attestation::Evidence {
+            provider_type: ne_attestation::ProviderType::Software,
+            workspace_id: "ws-malformed".into(),
+            measurement: ne_attestation::Measurement([0x11; 32]),
+            nonce: vec![0x22; 15],
+            issued_at: 1,
+            report_data: vec![0x33],
+            proof: ne_attestation::Proof::Software {
+                signature: [0x44; 64],
+                signer_pubkey: [0x55; 32],
+            },
+        };
+        let (svc, _tmp) = make_service(move |_| SupervisorResponse::AttestationEvidenceIssued {
+            evidence: malformed.clone(),
+        });
+
+        let err = svc
+            .get_attestation_evidence(Request::new(pb::GetAttestationEvidenceRequest {
+                workspace_id: "ws-malformed".into(),
+                nonce: vec![0xaa; 16],
+            }))
+            .await
+            .expect_err("malformed domain evidence must be rejected");
+        assert_eq!(err.code(), tonic::Code::Internal);
     }
 }
