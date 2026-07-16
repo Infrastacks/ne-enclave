@@ -36,6 +36,7 @@ const REST_MAX_BODY_BYTES: usize = 15 * 1024 * 1024;
 pub fn router(core: Arc<RuntimeCore>) -> Router {
     Router::new()
         .route("/v1/host/health", get(health))
+        .route("/v1/runtime/capabilities", get(runtime_capabilities))
         .route("/v1/workspaces", post(create_workspace))
         .route("/v1/workspaces/:workspace_id", delete(destroy_workspace))
         .route("/v1/workspaces/:workspace_id/exec", post(execute_command))
@@ -164,7 +165,9 @@ fn core_error_to_status(e: &CoreError) -> StatusCode {
         | K::WorkspaceNotPaused
         | K::WorkspaceAlreadyPaused
         | K::WorkspaceNotNetworked
-        | K::AttestationReplay => StatusCode::CONFLICT,
+        | K::AttestationReplay
+        | K::UnsupportedForProfile
+        | K::ConfidentialCapacityExceeded => StatusCode::CONFLICT,
         K::WorkspaceNotFound
         | K::FileNotFound
         | K::ImageNotFound
@@ -197,6 +200,17 @@ mod image_error_mapping_tests {
             assert_eq!(core_error_to_status(&error), status);
         }
     }
+
+    #[test]
+    fn profile_errors_map_to_conflict() {
+        for kind in [K::UnsupportedForProfile, K::ConfidentialCapacityExceeded] {
+            let error = CoreError::Supervisor {
+                kind,
+                message: "profile error".into(),
+            };
+            assert_eq!(core_error_to_status(&error), StatusCode::CONFLICT);
+        }
+    }
 }
 
 /// Liveness + supervisor round-trip. `GET /v1/host/health`.
@@ -216,6 +230,12 @@ async fn health(State(core): State<Arc<RuntimeCore>>) -> Result<Json<HealthRespo
         supervisor_version: out.supervisor_version,
         supervisor_uptime_ms: out.supervisor_uptime_ms,
     }))
+}
+
+async fn runtime_capabilities(
+    State(core): State<Arc<RuntimeCore>>,
+) -> Result<Json<ne_protocol::profile::RuntimeCapabilitiesInfo>, ApiError> {
+    Ok(Json(core.runtime_capabilities().await?))
 }
 
 /// `POST /v1/workspaces` request body. `network.privacy_router` present
@@ -735,18 +755,26 @@ struct AttestationBody {
 
 /// `POST /v1/workspaces/:workspace_id/attestation` — generate attestation
 /// evidence for the workspace. The caller must supply a base64-encoded
-/// nonce (16..=64 bytes after decoding). Returns the signed
-/// [`ne_attestation::Evidence`] envelope as JSON.
+/// nonce (16..=64 bytes after decoding). Returns the versioned public
+/// evidence envelope as JSON.
 async fn get_attestation(
     State(core): State<Arc<RuntimeCore>>,
     Path(workspace_id): Path<String>,
     Json(body): Json<AttestationBody>,
-) -> Result<Json<ne_attestation::Evidence>, ApiError> {
+) -> Result<Json<ne_protocol::attestation::PublicAttestationEvidence>, ApiError> {
     let nonce = BASE64
         .decode(body.nonce.as_bytes())
         .map_err(|_| CoreError::Validation("nonce must be valid base64".into()))?;
     let evidence = core.get_attestation_evidence(workspace_id, nonce).await?;
-    Ok(Json(evidence))
+    let public = ne_protocol::attestation::PublicAttestationEvidence::try_from(evidence).map_err(
+        |error| {
+            ApiError(CoreError::Supervisor {
+                kind: sup::SupervisorErrorKind::Internal,
+                message: format!("encode public attestation evidence: {error}"),
+            })
+        },
+    )?;
+    Ok(Json(public))
 }
 
 #[cfg(test)]
@@ -990,8 +1018,7 @@ mod attestation_tests {
             .unwrap()
     }
 
-    /// Happy path: 16-byte nonce, fake supervisor returns `AttestationEvidenceIssued`.
-    /// Response must be 200 with `provider_type = "Software"` in JSON.
+    /// Happy path: REST returns the versioned public software envelope.
     #[tokio::test]
     async fn attestation_happy_path_200_with_evidence() {
         let nonce_bytes = vec![0xaau8; 16];
@@ -1031,9 +1058,83 @@ mod attestation_tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // ProviderType::Software has #[serde(rename_all = "snake_case")] → "software".
-        assert_eq!(json["provider_type"], serde_json::json!("software"));
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["provider"], serde_json::json!("software"));
         assert_eq!(json["workspace_id"], "ws-1");
+        assert_eq!(json["workspace_measurement"], BASE64.encode([0xbbu8; 32]));
+        assert_eq!(json["nonce"], nonce_b64);
+        assert_eq!(json["proof"]["proof_type"], "software");
+        assert!(json["proof"]["signature"].is_string());
+    }
+
+    #[tokio::test]
+    async fn attestation_azure_response_preserves_all_typed_proof_fields() {
+        let nonce_bytes = vec![0xaau8; 16];
+        let nonce_b64 = BASE64.encode(&nonce_bytes);
+        let fake_evidence = Evidence {
+            provider_type: ProviderType::SevSnp,
+            workspace_id: "ws-azure".into(),
+            measurement: Measurement([0xbbu8; 32]),
+            nonce: nonce_bytes.clone(),
+            issued_at: 1_700_000_043,
+            report_data: vec![0xcc],
+            proof: Proof::SevSnpAzure {
+                report: vec![1],
+                vcek_cert_chain: vec![2],
+                var_data: vec![3],
+                ak_pub_tpm2b: vec![4],
+                quote_msg: vec![5],
+                quote_sig: vec![6],
+            },
+        };
+        let expected = fake_evidence.clone();
+        let (app, _tmp) = app_with(move |_| SupervisorResponse::AttestationEvidenceIssued {
+            evidence: expected.clone(),
+        });
+
+        let resp = app
+            .oneshot(attest_request("ws-azure", &nonce_b64))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["provider"], "sev_snp_azure");
+        assert_eq!(json["proof"]["proof_type"], "sev_snp_azure");
+        assert_eq!(json["proof"]["report"], BASE64.encode([1]));
+        assert_eq!(json["proof"]["vcek_cert_chain"], BASE64.encode([2]));
+        assert_eq!(json["proof"]["var_data"], BASE64.encode([3]));
+        assert_eq!(json["proof"]["ak_pub_tpm2b"], BASE64.encode([4]));
+        assert_eq!(json["proof"]["quote_msg"], BASE64.encode([5]));
+        assert_eq!(json["proof"]["quote_sig"], BASE64.encode([6]));
+    }
+
+    #[tokio::test]
+    async fn attestation_rejects_malformed_supervisor_evidence() {
+        let request_nonce = BASE64.encode([0xaau8; 16]);
+        let malformed = Evidence {
+            provider_type: ProviderType::Software,
+            workspace_id: "ws-malformed".into(),
+            measurement: Measurement([0xbbu8; 32]),
+            nonce: vec![0xcc; 15],
+            issued_at: 1_700_000_044,
+            report_data: vec![0xdd],
+            proof: Proof::Software {
+                signature: [0xee; 64],
+                signer_pubkey: [0xff; 32],
+            },
+        };
+        let (app, _tmp) = app_with(move |_| SupervisorResponse::AttestationEvidenceIssued {
+            evidence: malformed.clone(),
+        });
+
+        let resp = app
+            .oneshot(attest_request("ws-malformed", &request_nonce))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Unknown workspace → supervisor returns `WorkspaceNotFound` → 404.

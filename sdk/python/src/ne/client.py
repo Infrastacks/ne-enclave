@@ -57,6 +57,42 @@ class Client:
         the supervisor it relayed to."""
         return self._stub.Ping(runtime_pb2.PingRequest(), timeout=timeout)
 
+    def get_runtime_capabilities(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> runtime_pb2.GetRuntimeCapabilitiesResponse:
+        """Return the runtime's resolved execution and attestation capabilities."""
+        return self._stub.GetRuntimeCapabilities(
+            runtime_pb2.GetRuntimeCapabilitiesRequest(),
+            timeout=timeout,
+        )
+
+    def create_confidential_workspace(
+        self,
+        *,
+        workspace_id: str,
+        timeout: float | None = None,
+    ) -> runtime_pb2.CreateWorkspaceResponse:
+        """Launch one workspace through the confidential-azure profile.
+
+        Confidential capacity belongs to the enclosing CVM, so the request
+        intentionally carries empty image digests and zero runtime sizing
+        fields.
+        """
+        return self._stub.CreateWorkspace(
+            runtime_pb2.CreateWorkspaceRequest(
+                workspace_id=workspace_id,
+                kernel_sha256="",
+                rootfs_sha256="",
+                rootfs_read_only=True,
+                vcpu_count=0,
+                mem_size_mib=0,
+                guest_vsock_cid=0,
+            ),
+            timeout=timeout,
+        )
+
     def create_workspace(
         self,
         *,

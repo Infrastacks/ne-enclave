@@ -1,7 +1,9 @@
 # NeuronEdge Enclave Self-Host Install Guide
 
 Operator guide for running the NeuronEdge Enclave runtime on a single bare-metal or VM host.
-Validated on Ubuntu 24.04 / x86_64 with KVM.
+The `standard` profile targets Ubuntu 24.04 / x86_64 with KVM. The
+`confidential-azure` profile is Preview and targets an Azure confidential VM
+with a vTPM.
 
 ---
 
@@ -10,26 +12,27 @@ Validated on Ubuntu 24.04 / x86_64 with KVM.
 | Requirement | Detail |
 |---|---|
 | OS | Ubuntu 24.04 (x86_64) |
-| KVM | `/dev/kvm` present and accessible |
-| Firecracker + jailer | Operator-installed at `/opt/ne-enclave/bin/{firecracker,jailer}` |
+| Release verification | Cosign 3 on `PATH`; the bootstrap installer fails before installation without it |
+| Standard profile | `/dev/kvm` plus operator-installed Firecracker + jailer at `/opt/ne-enclave/bin/{firecracker,jailer}` |
+| Azure confidential profile (Preview) | `/dev/tpmrm0`, `tpm2-tools`, no `/dev/kvm`; the signed release supplies the pinned OpenShell binary and policies |
 | Privileges | Root for install; the runtime itself drops to `nee` where possible |
 
-NeuronEdge Enclave does not bundle Firecracker or jailer. Install them from the
+The standard profile does not bundle Firecracker or jailer. Install them from the
 [Firecracker releases page](https://github.com/firecracker-microvm/firecracker/releases)
 and place both binaries at `/opt/ne-enclave/bin/` before running
-`sudo /opt/ne-enclave/bin/nee install`.
+`sudo /opt/ne-enclave/bin/nee install --execution-profile standard`.
 
 ---
 
 ## Security posture (read before installing)
 
-> **WARNING:** Production external authentication (mTLS / JWT / API key) is
-> **not yet implemented**. The API binds to **localhost only**
-> (`127.0.0.1:50051` gRPC, `127.0.0.1:8080` REST) and runs in dev-mode.
-> **Do NOT expose these ports to untrusted networks.** The supervisor IPC
-> boundary (Unix-socket peer-credential auth) is enforced.
->
-> Production auth (mTLS, API-key rotation) ships in a later phase.
+> **API-key authentication and server TLS are implemented.** Production
+> posture refuses to start without an API key and refuses a non-loopback bind
+> without TLS. The default self-host configuration remains loopback-only
+> (`127.0.0.1:50051` gRPC, `127.0.0.1:8080` REST). mTLS/client certificates and
+> control-plane JWT are not implemented; client identity is API-key based.
+> The supervisor IPC boundary independently enforces Unix-socket peer
+> credentials.
 
 ---
 
@@ -54,25 +57,28 @@ knobs — deploy-doc reference, not a security-capability claim — set them in
 ## Quick install
 
 ```sh
+# Install Cosign first:
+# https://docs.sigstore.dev/cosign/system_config/installation/
 curl -fsSL https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh | sh
 ```
 
-The thin `install.sh` (in this directory) does three things:
+The thin `install.sh`:
 
-1. Downloads the static-musl `nee` binary from the GitHub release.
-2. Verifies the SHA-256 checksum against the published `SHA256SUMS` file.
-3. Drops the binary to `/opt/ne-enclave/bin/nee` and execs
+1. Downloads the signed release manifest and `SHA256SUMS`, verifies both
+   Sigstore bundles against the release workflow identity and GitHub OIDC
+   issuer, then verifies the manifest checksum.
+2. Downloads every component required by the selected profile, verifies its
+   Sigstore bundle, `SHA256SUMS` entry, and resolved manifest digest.
+3. Only after every check passes, drops `nee` to
+   `/opt/ne-enclave/bin/nee` and execs
    `sudo /opt/ne-enclave/bin/nee install`.
-
-Cosign signature verification is a documented future step (see the commented
-block in `deploy/install.sh`).
 
 To pin a specific release:
 
 ```sh
 curl -fsSL \
   https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh |
-  NE_VERSION=v0.3.0 sh
+  NE_VERSION=v0.2.0 sh
 ```
 
 The assignment is attached to `sh`, so the downloaded installer receives `NE_VERSION`.
@@ -107,6 +113,7 @@ Steps in order:
 
 | Flag | Effect |
 |---|---|
+| `--execution-profile standard\|confidential-azure` | Render the explicit execution/attestation backend contract |
 | `--no-start` | Render config + units but do not enable/start |
 | `--no-image` | Skip guest image fetch (air-gapped; import manually) |
 | `--prefix <dir>` | Install under `<dir>` instead of `/` (fakeroot / CI testing) |
@@ -126,9 +133,13 @@ One fused static binary at `/opt/ne-enclave/bin/nee`. Subcommands:
 | `privacy-router` | Per-workspace egress proxy (spawned by supervisor) |
 | `install` | Host provisioner (described above) |
 | `uninstall` | Remove units, config, user; optionally state |
-| `doctor` | Preflight checks: KVM, Firecracker, jailer |
+| `doctor` | Profile-specific preflight checks |
 | `image import` | Import a kernel + rootfs from local paths |
 | `image pull` | Fetch a named image from the NeuronEdge Enclave image registry |
+| `runtime capabilities` | Print the resolved public capability contract |
+| `workspace attest` | Request summary or complete versioned evidence |
+| `attestation verify` | Verify exported evidence against an explicit offline policy |
+| `audit export` / `audit verify` | Export and independently verify the signed audit chain |
 
 ---
 
@@ -136,8 +147,11 @@ One fused static binary at `/opt/ne-enclave/bin/nee`. Subcommands:
 
 ```
 /opt/ne-enclave/bin/nee                     # fused binary (this package)
-/opt/ne-enclave/bin/firecracker               # operator-provided
+/opt/ne-enclave/bin/firecracker              # operator-provided, standard only
 /opt/ne-enclave/bin/jailer                    # operator-provided
+/opt/ne-enclave/bin/openshell-sandbox         # signed release component, confidential-azure
+/var/lib/ne-enclave/openshell/policy.rego
+/var/lib/ne-enclave/openshell/policy.yaml
 /etc/ne-enclave/ne-enclave.env                     # EnvironmentFile (both units)
 /var/lib/ne-enclave/images/
     kernels/<sha256>/vmlinux               # content-addressed guest kernels
@@ -197,50 +211,41 @@ Unprivileged service that exposes the gRPC and REST API.
 
 ---
 
-## Two execution tiers (standard + confidential)
+## Execution profiles (`standard` + `confidential-azure`)
 
-NeuronEdge Enclave ships a **two-tier** runtime (ARCH §6.1). The install above
-covers the **standard tier** (Firecracker microVM isolation — the default). The
-**confidential tier** (single-CVM-direct, B) runs the agent + OpenShell directly
-inside an operator-provisioned SEV-SNP CVM, with key release gated on
-hardware-rooted attestation evidence. The two tiers share the same `nee` binary
-and API; the profile is selected at runtime.
+NeuronEdge Enclave exposes one API with discoverable profile capabilities.
+`standard` is the supported default and uses Firecracker. `confidential-azure`
+is Preview and runs one OpenShell workspace inside an operator-provisioned
+Azure SEV-SNP CVM. Inspect `GET /v1/runtime/capabilities`,
+`GetRuntimeCapabilities`, or `nee runtime capabilities`; unsupported
+operations fail explicitly.
 
-### Activating the confidential tier (B)
+### Activating `confidential-azure` (Preview)
 
-The confidential tier is an opt-in profile, **not** a separate install. On a
-host that is itself a SEV-SNP confidential VM (e.g. Azure DCasv5):
+On an Azure DCasv5 confidential VM with `tpm2-tools` and Cosign installed:
 
-1. **Install the `openshell-sandbox` binary** alongside Firecracker/jailer.
-   Build it from the [Infrastacks OpenShell fork](https://github.com/Infrastacks/OpenShell)
-   (`cargo build -p openshell-sandbox --release`) and place it at
-   `/opt/ne-enclave/bin/openshell-sandbox`. (The standard tier does not need it.)
-2. **Provision the CVM** with a `sandbox` user/group (OpenShell's privilege-drop
-   target): `sudo useradd -r -m sandbox`.
-3. **Enable confidential mode** in the env file (`/etc/ne-enclave/ne-enclave.env`):
-   ```
-   NE_CONFIDENTIAL_MODE=1
-   NE_OPENSHELL_SANDBOX_BIN=/opt/ne-enclave/bin/openshell-sandbox
-   ```
-   The supervisor detects the CVM via `/dev/sev-guest` (GCP/bare-metal) OR
-   `/dev/tpmrm0` (Azure OpenHCL paravisor) and refuses to start if neither is
-   present (fail-closed — a confidential deployment never silently falls back).
-   Note: only the Azure OpenHCL attestation arm is silicon-verified today; the
-   `/dev/sev-guest` (GCP/bare-metal) arm is implemented and unit-tested but not
-   yet validated on that silicon.
-4. `sudo systemctl restart ne-supervisor.service`.
+```sh
+curl -fsSL \
+  https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh |
+  NE_EXECUTION_PROFILE=confidential-azure sh
+```
 
-On the confidential tier, `CreateWorkspace` spawns an OpenShell sandbox in the
-CVM (not a Firecracker microVM) and governs it via the L7 OPA proxy. The
-attestation evidence + sealed-snapshot key release reuse the verified path
-(verified end-to-end on Azure DCasv5: the boot-fixed AMD report — whose
-REPORT_DATA carries the vTPM AK fingerprint — combined with a fresh per-request
-TPM-Quote nonce, validated against the genuine AMD Milan ARK).
+The installer verifies and provisions the pinned OpenShell binary and policies,
+creates the sandbox service identity, and renders
+`NE_EXECUTION_PROFILE=confidential-azure`. This product profile requires
+`/dev/tpmrm0` and selects the Azure vTPM attestation provider explicitly; it
+does not probe or fall back to `/dev/sev-guest`.
 
-> **B v1 scope:** the confidential tier supports create / run-command /
-> write-file / read-file / terminate + attestation. Snapshot / restore / fork
-> return `Unsupported` for the OpenShell arm in v1 (Firecracker-vmstate-coupled;
-> a process-checkpoint format is a later wedge).
+Confidential create carries only the workspace identity; image digests and VM
+sizing fields are empty/zero. Use `create_confidential_workspace` in Python,
+`createConfidentialWorkspace` in TypeScript, or the equivalent REST request.
+The hard capacity is one workspace per CVM. Snapshot, restore, fork, warm pool,
+pause/resume, ingress, and confidential snapshots are not implemented for this
+profile.
+
+The Azure evidence primitive has been verified on DCasv5, but the product lane
+remains Preview until the exact signed v0.2.0 candidate passes the required
+Azure release job. See [the capability ledger](../docs/CAPABILITIES.md).
 
 ---
 
@@ -284,16 +289,21 @@ supported; create snapshot sources with `rootfs_read_only=true`.
 
 ## Verifying the install
 
-`deploy/smoke-install.sh` drives a full end-to-end roundtrip through the
-installed API:
+`deploy/smoke-install.sh` consumes a directory containing the exact signed
+candidate bundle and drives a full standard-profile round trip:
 
 ```sh
-sudo deploy/smoke-install.sh /path/to/nee /path/to/vmlinux /path/to/rootfs.img
+sudo deploy/smoke-install.sh \
+  /path/to/signed/staging \
+  /path/to/vmlinux \
+  /path/to/rootfs.img
 ```
 
-The script: installs the local binary, imports the image, starts the units,
-then runs **create → exec → write → read → destroy** against the REST API at
-`http://127.0.0.1:8080/v1`. Exits `0` and prints `SMOKE OK` on success.
+The script runs the bootstrap installer against `file://` release assets, so
+signature, checksum, and resolved-manifest verification happen before install.
+It imports the image, asserts the `standard` capability contract, starts the
+units, then runs **create → exec → write → read → destroy** against the REST
+API. It exits `0` and prints `SMOKE OK` on success.
 
 The script stages Firecracker + jailer into `/opt/ne-enclave/bin/` (where the
 installed runtime expects them) from `NE_E2E_FIRECRACKER`/`NE_E2E_JAILER`, then

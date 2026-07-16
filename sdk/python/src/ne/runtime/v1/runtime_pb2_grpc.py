@@ -40,6 +40,11 @@ class RuntimeStub:
                 request_serializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.PingRequest.SerializeToString,
                 response_deserializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.PingResponse.FromString,
                 _registered_method=True)
+        self.GetRuntimeCapabilities = channel.unary_unary(
+                '/ne.runtime.v1.Runtime/GetRuntimeCapabilities',
+                request_serializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.GetRuntimeCapabilitiesRequest.SerializeToString,
+                response_deserializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.GetRuntimeCapabilitiesResponse.FromString,
+                _registered_method=True)
         self.CreateWorkspace = channel.unary_unary(
                 '/ne.runtime.v1.Runtime/CreateWorkspace',
                 request_serializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.CreateWorkspaceRequest.SerializeToString,
@@ -129,10 +134,18 @@ class RuntimeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetRuntimeCapabilities(self, request, context):
+        """Return the runtime's resolved execution, attestation, operation,
+        capacity, and public evidence-schema capabilities.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CreateWorkspace(self, request, context):
-        """Launch one Firecracker microVM workspace. The supervisor stages
-        kernel + rootfs into a per-workspace jailer chroot, starts
-        Firecracker, configures it via its HTTP API socket, and boots.
+        """Launch one workspace using the runtime's selected execution profile.
+        The standard profile consumes the Firecracker fields below;
+        confidential-azure accepts the workspace id with zeroed runtime fields.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -260,6 +273,11 @@ def add_RuntimeServicer_to_server(servicer, server):
                     request_deserializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.PingRequest.FromString,
                     response_serializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.PingResponse.SerializeToString,
             ),
+            'GetRuntimeCapabilities': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRuntimeCapabilities,
+                    request_deserializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.GetRuntimeCapabilitiesRequest.FromString,
+                    response_serializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.GetRuntimeCapabilitiesResponse.SerializeToString,
+            ),
             'CreateWorkspace': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateWorkspace,
                     request_deserializer=ne_dot_runtime_dot_v1_dot_runtime__pb2.CreateWorkspaceRequest.FromString,
@@ -364,6 +382,33 @@ class Runtime:
             '/ne.runtime.v1.Runtime/Ping',
             ne_dot_runtime_dot_v1_dot_runtime__pb2.PingRequest.SerializeToString,
             ne_dot_runtime_dot_v1_dot_runtime__pb2.PingResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetRuntimeCapabilities(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ne.runtime.v1.Runtime/GetRuntimeCapabilities',
+            ne_dot_runtime_dot_v1_dot_runtime__pb2.GetRuntimeCapabilitiesRequest.SerializeToString,
+            ne_dot_runtime_dot_v1_dot_runtime__pb2.GetRuntimeCapabilitiesResponse.FromString,
             options,
             channel_credentials,
             insecure,

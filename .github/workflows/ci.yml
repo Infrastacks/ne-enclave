@@ -14,6 +14,14 @@ env:
   BUILDROOT_VERSION: "2025.05"
 
 jobs:
+  release-contract:
+    name: release component contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: release component contract
+        run: sh deploy/test-release-contract.sh
+
   license-check:
     name: license check (cargo-deny)
     runs-on: ubuntu-24.04
@@ -26,6 +34,8 @@ jobs:
         # needed — passing `check` there would make it `cargo deny check check`.
         # cargo-deny reads Cargo.lock metadata only (no compilation), so the
         # pinned toolchain is moot for this job.
+      - name: Check advisory exception ownership and expiry
+        run: sh scripts/check-advisory-exceptions.sh deny.toml
 
   lint:
     name: fmt + clippy
@@ -100,7 +110,7 @@ jobs:
     # main pushes + manual dispatch, never on dev pushes or PRs (quota).
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
-    needs: [lint, test]
+    needs: [lint, test, release-contract]
     steps:
       - uses: actions/checkout@v6
       - name: Verify KVM availability
@@ -200,7 +210,7 @@ jobs:
     # main-branch validation build. Skip on dev/PRs to save quota.
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
-    needs: [lint, test]
+    needs: [lint, test, release-contract]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -210,24 +220,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install musl tooling
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build nee (static musl)
-        run: cargo build --release --target x86_64-unknown-linux-musl -p ne-enclave
+      - name: Build nee with all supported execution profiles
+        run: >-
+          cargo build --release
+          --target x86_64-unknown-linux-musl
+          -p ne-enclave
+          --features confidential-cvm
       - name: Checksums
         run: |
           set -euo pipefail
           cd target/x86_64-unknown-linux-musl/release
-          cp nee ne-x86_64-unknown-linux-musl
-          sha256sum ne-x86_64-unknown-linux-musl > SHA256SUMS
+          cp nee nee-x86_64-unknown-linux-musl
+          sha256sum nee-x86_64-unknown-linux-musl > SHA256SUMS
           cat SHA256SUMS
       - name: Verify static linkage
         run: |
-          file target/x86_64-unknown-linux-musl/release/nee
-          ldd target/x86_64-unknown-linux-musl/release/nee || true
+          set -euo pipefail
+          description="$(file target/x86_64-unknown-linux-musl/release/nee)"
+          echo "$description"
+          case "$description" in
+            *"statically linked"* | *"static-pie linked"*) ;;
+            *)
+              echo "::error::nee is not statically linked"
+              exit 1
+              ;;
+          esac
       - uses: actions/upload-artifact@v4
         with:
           name: ne-musl
           path: |
-            target/x86_64-unknown-linux-musl/release/ne-x86_64-unknown-linux-musl
+            target/x86_64-unknown-linux-musl/release/nee-x86_64-unknown-linux-musl
             target/x86_64-unknown-linux-musl/release/SHA256SUMS
 
   unit-lint:

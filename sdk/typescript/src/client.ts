@@ -16,6 +16,7 @@ import {
   type ForkWorkspaceResponse,
   type GetAttestationEvidenceResponse,
   type GetPoolStatusResponse,
+  type GetRuntimeCapabilitiesResponse,
   type ListEventsResponse,
   type NetworkConfig,
   type PauseWorkspaceResponse,
@@ -93,6 +94,37 @@ export class Client {
     return this.#unary<PingResponse>(options.deadlineMs, (callOptions, callback) =>
       this.#stub.ping({}, this.#buildMetadata(), callOptions, callback),
     );
+  }
+
+  /** Return the runtime's resolved execution and attestation capabilities. */
+  getRuntimeCapabilities(
+    options: { deadlineMs?: number } = {},
+  ): Promise<GetRuntimeCapabilitiesResponse> {
+    return this.#unary<GetRuntimeCapabilitiesResponse>(
+      options.deadlineMs,
+      (callOptions, callback) =>
+        this.#stub.getRuntimeCapabilities({}, this.#buildMetadata(), callOptions, callback),
+    );
+  }
+
+  /** Launch one workspace through the confidential-azure execution profile.
+   *
+   *  Confidential capacity belongs to the enclosing CVM, so the request uses
+   *  empty image digests and zero runtime sizing fields by contract. */
+  createConfidentialWorkspace(options: {
+    workspaceId: string;
+    deadlineMs?: number;
+  }): Promise<CreateWorkspaceResponse> {
+    return this.createWorkspace({
+      workspaceId: options.workspaceId,
+      kernelSha256: "",
+      rootfsSha256: "",
+      rootfsReadOnly: true,
+      vcpuCount: 0,
+      memSizeMib: 0,
+      guestVsockCid: 0,
+      ...(options.deadlineMs === undefined ? {} : { deadlineMs: options.deadlineMs }),
+    });
   }
 
   createWorkspace(options: {

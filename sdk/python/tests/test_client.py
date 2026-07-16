@@ -41,6 +41,17 @@ class _FakeRuntime(runtime_pb2_grpc.RuntimeServicer):
                 supervisor_uptime_ms=22,
             )
         )
+        self.on_get_runtime_capabilities: Callable[
+            [runtime_pb2.GetRuntimeCapabilitiesRequest],
+            runtime_pb2.GetRuntimeCapabilitiesResponse,
+        ] = lambda _: runtime_pb2.GetRuntimeCapabilitiesResponse(
+            runtime_version="0.2.0",
+            execution_profile=runtime_pb2.EXECUTION_PROFILE_STANDARD,
+            execution_backend=runtime_pb2.EXECUTION_BACKEND_FIRECRACKER,
+            attestation_backend=runtime_pb2.ATTESTATION_BACKEND_SOFTWARE,
+            supported_operations=[runtime_pb2.WORKSPACE_OPERATION_CREATE],
+            evidence_schema_version=1,
+        )
         self.on_create: Callable[
             [runtime_pb2.CreateWorkspaceRequest], runtime_pb2.CreateWorkspaceResponse
         ] = lambda req: runtime_pb2.CreateWorkspaceResponse(
@@ -149,6 +160,9 @@ class _FakeRuntime(runtime_pb2_grpc.RuntimeServicer):
     def Ping(self, request, context):
         return self.on_ping(request)
 
+    def GetRuntimeCapabilities(self, request, context):
+        return self.on_get_runtime_capabilities(request)
+
     def CreateWorkspace(self, request, context):
         return self.on_create(request)
 
@@ -225,6 +239,29 @@ def test_ping_round_trips(fake_server) -> None:
     assert pong.supervisor_uptime_ms == 22
 
 
+def test_get_runtime_capabilities_returns_resolved_profile(fake_server) -> None:
+    servicer, target = fake_server
+    servicer.on_get_runtime_capabilities = lambda _: runtime_pb2.GetRuntimeCapabilitiesResponse(
+        runtime_version="0.2.0",
+        execution_profile=runtime_pb2.EXECUTION_PROFILE_CONFIDENTIAL_AZURE,
+        execution_backend=runtime_pb2.EXECUTION_BACKEND_OPEN_SHELL,
+        attestation_backend=runtime_pb2.ATTESTATION_BACKEND_SEV_SNP_AZURE,
+        supported_operations=[
+            runtime_pb2.WORKSPACE_OPERATION_CREATE,
+            runtime_pb2.WORKSPACE_OPERATION_ATTEST,
+        ],
+        hard_workspace_capacity=1,
+        evidence_schema_version=1,
+    )
+
+    with Client(target) as client:
+        capabilities = client.get_runtime_capabilities()
+
+    assert capabilities.execution_profile == runtime_pb2.EXECUTION_PROFILE_CONFIDENTIAL_AZURE
+    assert capabilities.hard_workspace_capacity == 1
+    assert capabilities.evidence_schema_version == 1
+
+
 def test_create_workspace_passes_fields_through(fake_server) -> None:
     servicer, target = fake_server
     seen = {}
@@ -261,6 +298,29 @@ def test_create_workspace_passes_fields_through(fake_server) -> None:
     assert sent.rootfs_read_only is True  # SDK default
     assert resp.workspace_id == "wks-py-1"
     assert resp.firecracker_pid == 99
+
+
+def test_create_confidential_workspace_sends_profile_neutral_zero_fields(fake_server) -> None:
+    servicer, target = fake_server
+    seen = {}
+
+    def capture(req: runtime_pb2.CreateWorkspaceRequest) -> runtime_pb2.CreateWorkspaceResponse:
+        seen["req"] = req
+        return runtime_pb2.CreateWorkspaceResponse(workspace_id=req.workspace_id)
+
+    servicer.on_create = capture
+    with Client(target) as client:
+        response = client.create_confidential_workspace(workspace_id="secret-1")
+
+    sent = seen["req"]
+    assert sent.workspace_id == "secret-1"
+    assert sent.kernel_sha256 == ""
+    assert sent.rootfs_sha256 == ""
+    assert sent.rootfs_read_only is True
+    assert sent.vcpu_count == 0
+    assert sent.mem_size_mib == 0
+    assert sent.guest_vsock_cid == 0
+    assert response.workspace_id == "secret-1"
 
 
 def test_create_workspace_tier_omits_managed_image_digests(fake_server) -> None:
@@ -877,6 +937,48 @@ def test_get_attestation_evidence_round_trips(fake_server) -> None:
     assert resp.evidence.provider_type == "software"
     assert resp.evidence.workspace_id == "ws-att"
     assert len(resp.evidence.measurement) == 32
+
+
+def test_get_attestation_evidence_preserves_all_azure_typed_proof_fields(fake_server) -> None:
+    servicer, target = fake_server
+
+    def capture(req):
+        return runtime_pb2.GetAttestationEvidenceResponse(
+            public_evidence=runtime_pb2.PublicAttestationEvidence(
+                schema_version=1,
+                provider=runtime_pb2.ATTESTATION_PROVIDER_SEV_SNP_AZURE,
+                workspace_id=req.workspace_id,
+                workspace_measurement=b"\x01" * 32,
+                nonce=req.nonce,
+                issued_at=1,
+                report_data=b"\x02",
+                sev_snp_azure=runtime_pb2.SevSnpAzureProof(
+                    report=b"\x03",
+                    vcek_cert_chain=b"\x04",
+                    var_data=b"\x05",
+                    ak_pub_tpm2b=b"\x06",
+                    quote_msg=b"\x07",
+                    quote_sig=b"\x08",
+                ),
+            )
+        )
+
+    servicer.on_get_attestation_evidence = capture
+    with Client(target) as client:
+        response = client.get_attestation_evidence(
+            workspace_id="ws-azure",
+            nonce=b"\x09" * 16,
+        )
+
+    evidence = response.public_evidence
+    assert evidence.provider == runtime_pb2.ATTESTATION_PROVIDER_SEV_SNP_AZURE
+    assert evidence.WhichOneof("proof") == "sev_snp_azure"
+    assert evidence.sev_snp_azure.report == b"\x03"
+    assert evidence.sev_snp_azure.vcek_cert_chain == b"\x04"
+    assert evidence.sev_snp_azure.var_data == b"\x05"
+    assert evidence.sev_snp_azure.ak_pub_tpm2b == b"\x06"
+    assert evidence.sev_snp_azure.quote_msg == b"\x07"
+    assert evidence.sev_snp_azure.quote_sig == b"\x08"
 
 
 def test_client_surfaces_grpc_status_as_rpcerror() -> None:

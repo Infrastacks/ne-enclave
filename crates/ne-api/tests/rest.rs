@@ -94,6 +94,42 @@ async fn health_returns_ping_payload() {
 }
 
 #[tokio::test]
+async fn runtime_capabilities_return_the_profile_contract() {
+    let capabilities =
+        ne_protocol::profile::ExecutionProfile::ConfidentialAzure.capabilities("0.2.0", 1);
+    let (app, _tmp) = app_with(move |_| SupervisorResponse::Capabilities(capabilities.clone()));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runtime/capabilities")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["runtime_version"], "0.2.0");
+    assert_eq!(json["execution_profile"], "confidential-azure");
+    assert_eq!(json["execution_backend"], "open_shell");
+    assert_eq!(json["attestation_backend"], "sev_snp_azure");
+    assert_eq!(json["hard_workspace_capacity"], 1);
+    assert_eq!(json["evidence_schema_version"], 1);
+    assert!(
+        json["supported_operations"]
+            .as_array()
+            .expect("operations")
+            .contains(&serde_json::json!("attest"))
+    );
+    assert!(
+        !json["supported_operations"]
+            .as_array()
+            .expect("operations")
+            .contains(&serde_json::json!("snapshot"))
+    );
+}
+
+#[tokio::test]
 async fn supervisor_error_maps_to_status_and_code() {
     let (app, _tmp) = app_with(|_| SupervisorResponse::Error {
         kind: SupervisorErrorKind::WorkspaceNotFound,
@@ -161,9 +197,9 @@ async fn create_workspace_returns_201() {
 
 #[tokio::test]
 async fn create_workspace_zero_vcpu_is_400() {
-    let (app, _tmp) = app_with(|_| SupervisorResponse::Pong {
-        version: "x".into(),
-        uptime_ms: 0,
+    let (app, _tmp) = app_with(|_| SupervisorResponse::Error {
+        kind: SupervisorErrorKind::InvalidRequest,
+        message: "standard creates require vcpu_count >= 1".into(),
     });
     let payload = serde_json::json!({
         "workspace_id": "w",
@@ -187,7 +223,7 @@ async fn create_workspace_zero_vcpu_is_400() {
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = body_json(resp).await;
-    assert_eq!(json["error"]["code"], "VALIDATION");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
 }
 
 #[tokio::test]

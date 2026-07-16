@@ -8,11 +8,12 @@ Cargo.lock.bak
 
 # Python SDK
 /sdk/*/.venv/
-/sdk/*/__pycache__/
+/sdk/**/__pycache__/
 /sdk/*/*.egg-info/
 /sdk/*/.pytest_cache/
 /sdk/*/dist/
 /sdk/*/.ruff_cache/
+*.py[cod]
 
 # Node / TypeScript SDK
 /sdk/*/node_modules/

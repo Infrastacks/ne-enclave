@@ -18,9 +18,14 @@ service Runtime {
   // daemon and the upstream supervisor it relays to.
   rpc Ping(PingRequest) returns (PingResponse);
 
-  // Launch one Firecracker microVM workspace. The supervisor stages
-  // kernel + rootfs into a per-workspace jailer chroot, starts
-  // Firecracker, configures it via its HTTP API socket, and boots.
+  // Return the runtime's resolved execution, attestation, operation,
+  // capacity, and public evidence-schema capabilities.
+  rpc GetRuntimeCapabilities(GetRuntimeCapabilitiesRequest)
+      returns (GetRuntimeCapabilitiesResponse);
+
+  // Launch one workspace using the runtime's selected execution profile.
+  // The standard profile consumes the Firecracker fields below;
+  // confidential-azure accepts the workspace id with zeroed runtime fields.
   rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse);
 
   // Tear down a registered workspace and reclaim host resources.
@@ -95,6 +100,57 @@ message PingResponse {
   uint64 supervisor_uptime_ms = 4;
 }
 
+// ---- GetRuntimeCapabilities ---------------------------------------
+
+enum ExecutionProfile {
+  EXECUTION_PROFILE_UNSPECIFIED = 0;
+  EXECUTION_PROFILE_STANDARD = 1;
+  EXECUTION_PROFILE_CONFIDENTIAL_AZURE = 2;
+}
+
+enum ExecutionBackend {
+  EXECUTION_BACKEND_UNSPECIFIED = 0;
+  EXECUTION_BACKEND_FIRECRACKER = 1;
+  EXECUTION_BACKEND_OPEN_SHELL = 2;
+}
+
+enum AttestationBackend {
+  ATTESTATION_BACKEND_UNSPECIFIED = 0;
+  ATTESTATION_BACKEND_SOFTWARE = 1;
+  ATTESTATION_BACKEND_SEV_SNP_DIRECT = 2;
+  ATTESTATION_BACKEND_SEV_SNP_AZURE = 3;
+}
+
+enum WorkspaceOperation {
+  WORKSPACE_OPERATION_UNSPECIFIED = 0;
+  WORKSPACE_OPERATION_CREATE = 1;
+  WORKSPACE_OPERATION_DESTROY = 2;
+  WORKSPACE_OPERATION_EXECUTE = 3;
+  WORKSPACE_OPERATION_WRITE_FILE = 4;
+  WORKSPACE_OPERATION_READ_FILE = 5;
+  WORKSPACE_OPERATION_PAUSE = 6;
+  WORKSPACE_OPERATION_RESUME = 7;
+  WORKSPACE_OPERATION_SNAPSHOT = 8;
+  WORKSPACE_OPERATION_RESTORE = 9;
+  WORKSPACE_OPERATION_FORK = 10;
+  WORKSPACE_OPERATION_WARM_POOL = 11;
+  WORKSPACE_OPERATION_INGRESS = 12;
+  WORKSPACE_OPERATION_ATTEST = 13;
+}
+
+message GetRuntimeCapabilitiesRequest {}
+
+message GetRuntimeCapabilitiesResponse {
+  string runtime_version = 1;
+  ExecutionProfile execution_profile = 2;
+  ExecutionBackend execution_backend = 3;
+  AttestationBackend attestation_backend = 4;
+  repeated WorkspaceOperation supported_operations = 5;
+  optional uint32 hard_workspace_capacity = 6;
+  bool confidential_snapshot_supported = 7;
+  uint32 evidence_schema_version = 8;
+}
+
 // ---- CreateWorkspace ----------------------------------------------
 
 message CreateWorkspaceRequest {
@@ -108,7 +164,8 @@ message CreateWorkspaceRequest {
   string rootfs_sha256 = 3;
   // Whether the rootfs should be mounted read-only inside the guest.
   bool rootfs_read_only = 4;
-  // Guest vCPU count. Protobuf has no u8 — runtime validates 1..=255.
+  // Guest vCPU count. Standard validates 1..=255; confidential-azure
+  // requires 0 because capacity belongs to the enclosing CVM.
   uint32 vcpu_count = 5;
   // Guest memory in MiB.
   uint32 mem_size_mib = 6;
@@ -193,12 +250,12 @@ message HeaderInjection {
 
 message CreateWorkspaceResponse {
   string workspace_id = 1;
-  // PID of the jailer (effectively Firecracker's PID).
+  // PID of the jailer (effectively Firecracker's PID); 0 for OpenShell.
   uint32 firecracker_pid = 2;
   // Host-side absolute path to the vsock UDS the guest agent reaches
-  // through. See Firecracker's host→guest CONNECT handshake.
+  // through. Empty for the OpenShell profile.
   string vsock_host_socket = 3;
-  // Host-side absolute path to the jailer chroot for this workspace.
+  // Host-side absolute path to the jailer chroot; empty for OpenShell.
   string jailer_chroot = 4;
   // Network resources the supervisor provisioned, when the request
   // asked for networking. Absent when the request omitted `network`
@@ -464,22 +521,71 @@ message GetAttestationEvidenceRequest {
   bytes nonce = 2;            // 16..=64 bytes; runtime validates
 }
 message GetAttestationEvidenceResponse {
-  AttestationEvidence evidence = 1;
+  // Legacy v0.1.x envelope retained at tag 1 for wire compatibility.
+  // Azure vTPM evidence cannot be represented losslessly here; use
+  // public_evidence for all new integrations.
+  AttestationEvidence evidence = 1 [deprecated = true];
+  PublicAttestationEvidence public_evidence = 2;
 }
+
+// Legacy v0.1.x attestation envelope. Do not reuse or renumber these fields.
 message AttestationEvidence {
-  string provider_type = 1;  // "software" (sev_snp / tdx reserved)
+  string provider_type = 1;
   string workspace_id = 2;
-  bytes measurement = 3;     // 32 bytes
+  bytes measurement = 3;
   bytes nonce = 4;
   int64 issued_at = 5;
   bytes report_data = 6;
   AttestationProof proof = 7;
 }
+
+// Legacy v0.1.x provider proof. New proof shapes belong in
+// PublicAttestationEvidence below.
 message AttestationProof {
-  // Software proof. Hardware proof fields are reserved for later.
-  bytes signature = 1;       // 64 bytes (software)
-  bytes signer_pubkey = 2;   // 32 bytes (software)
-  // SEV-SNP firmware Attestation Report (provider_type "sev_snp").
-  bytes sev_snp_report = 3;     // firmware Attestation Report (sev_snp)
-  bytes sev_snp_vcek_chain = 4; // VCEK cert chain, DER leaf-first (sev_snp)
+  bytes signature = 1;
+  bytes signer_pubkey = 2;
+  bytes sev_snp_report = 3;
+  bytes sev_snp_vcek_chain = 4;
+}
+
+enum AttestationProvider {
+  ATTESTATION_PROVIDER_UNSPECIFIED = 0;
+  ATTESTATION_PROVIDER_SOFTWARE = 1;
+  ATTESTATION_PROVIDER_SEV_SNP_DIRECT = 2;
+  ATTESTATION_PROVIDER_SEV_SNP_AZURE = 3;
+}
+
+message SoftwareProof {
+  bytes signature = 1;
+  bytes signer_pubkey = 2;
+}
+
+message SevSnpDirectProof {
+  bytes report = 1;
+  bytes vcek_cert_chain = 2;
+}
+
+message SevSnpAzureProof {
+  bytes report = 1;
+  bytes vcek_cert_chain = 2;
+  bytes var_data = 3;
+  bytes ak_pub_tpm2b = 4;
+  bytes quote_msg = 5;
+  bytes quote_sig = 6;
+}
+
+// Versioned, typed public evidence envelope for new SDK integrations.
+message PublicAttestationEvidence {
+  uint32 schema_version = 1;
+  AttestationProvider provider = 2;
+  string workspace_id = 3;
+  bytes workspace_measurement = 4;
+  bytes nonce = 5;
+  int64 issued_at = 6;
+  bytes report_data = 7;
+  oneof proof {
+    SoftwareProof software = 10;
+    SevSnpDirectProof sev_snp_direct = 11;
+    SevSnpAzureProof sev_snp_azure = 12;
+  }
 }

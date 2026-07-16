@@ -47,6 +47,46 @@ async fn ping_round_trips_through_api_and_supervisor() {
 }
 
 #[tokio::test]
+async fn runtime_capabilities_round_trip_with_typed_enums() {
+    let capabilities =
+        ne_protocol::profile::ExecutionProfile::ConfidentialAzure.capabilities("0.2.0", 1);
+    let (client, _tmp) =
+        stand_up_stack(move |_| SupervisorResponse::Capabilities(capabilities.clone())).await;
+    let mut client = client;
+    let response = client
+        .get_runtime_capabilities(pb::GetRuntimeCapabilitiesRequest {})
+        .await
+        .expect("capabilities rpc")
+        .into_inner();
+
+    assert_eq!(response.runtime_version, "0.2.0");
+    assert_eq!(
+        pb::ExecutionProfile::try_from(response.execution_profile).expect("profile"),
+        pb::ExecutionProfile::ConfidentialAzure
+    );
+    assert_eq!(
+        pb::ExecutionBackend::try_from(response.execution_backend).expect("backend"),
+        pb::ExecutionBackend::OpenShell
+    );
+    assert_eq!(
+        pb::AttestationBackend::try_from(response.attestation_backend).expect("attestation"),
+        pb::AttestationBackend::SevSnpAzure
+    );
+    assert_eq!(response.hard_workspace_capacity, Some(1));
+    assert_eq!(response.evidence_schema_version, 1);
+    assert!(
+        response
+            .supported_operations
+            .contains(&(pb::WorkspaceOperation::Attest as i32))
+    );
+    assert!(
+        !response
+            .supported_operations
+            .contains(&(pb::WorkspaceOperation::Snapshot as i32))
+    );
+}
+
+#[tokio::test]
 async fn create_workspace_round_trips_through_api_and_supervisor() {
     let (client, _tmp) = stand_up_stack(|req| match req {
         SupervisorRequest::CreateWorkspace(c) => {

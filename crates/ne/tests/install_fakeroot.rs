@@ -16,12 +16,16 @@ fn fakeroot_install_creates_missing_prefix_root() {
     let layout = Layout::new(&root);
 
     install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: layout.clone(),
         fakeroot: true,
         no_start: true,
         no_image: true,
         dry_run: false,
         ne_uid: 991,
+        openshell_sandbox_source: None,
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
     })
     .expect("fakeroot install with missing prefix");
 
@@ -48,12 +52,16 @@ fn fakeroot_install_rejects_symlink_prefix_without_touching_target() {
     symlink(&sentinel, &root).unwrap();
 
     let result = install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: Layout::new(&root),
         fakeroot: true,
         no_start: true,
         no_image: true,
         dry_run: false,
         ne_uid: 991,
+        openshell_sandbox_source: None,
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
     });
 
     assert!(result.is_err(), "accepted symlink prefix root");
@@ -75,12 +83,16 @@ fn fakeroot_install_rejects_regular_file_prefix_without_changing_contents() {
     std::fs::write(&root, b"must-not-change").unwrap();
 
     let result = install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: Layout::new(&root),
         fakeroot: true,
         no_start: true,
         no_image: true,
         dry_run: false,
         ne_uid: 991,
+        openshell_sandbox_source: None,
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
     });
 
     assert!(result.is_err(), "accepted regular file prefix root");
@@ -94,12 +106,16 @@ fn fakeroot_install_creates_layout_and_files() {
     let layout = Layout::new(root);
 
     install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: layout.clone(),
         fakeroot: true,
         no_start: true,
         no_image: true,
         dry_run: false,
         ne_uid: 991,
+        openshell_sandbox_source: None,
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
     })
     .expect("fakeroot install");
 
@@ -159,6 +175,207 @@ fn fakeroot_install_creates_layout_and_files() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn fakeroot_confidential_install_provisions_openshell_without_guest_images() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = Layout::new(tmp.path().join("root"));
+    let source = tmp.path().join("openshell-sandbox");
+    std::fs::write(&source, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rules_source = tmp.path().join("policy.rego");
+    let data_source = tmp.path().join("policy.yaml");
+    std::fs::write(&rules_source, "package test\n").unwrap();
+    std::fs::write(&data_source, "version: 1\nnetwork_policies: {}\n").unwrap();
+
+    let options = InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::ConfidentialAzure,
+        layout: layout.clone(),
+        fakeroot: true,
+        no_start: true,
+        no_image: false,
+        dry_run: false,
+        ne_uid: 991,
+        openshell_sandbox_source: Some(source),
+        openshell_policy_rules_source: Some(rules_source),
+        openshell_policy_data_source: Some(data_source),
+    };
+    install(options.clone()).expect("confidential fakeroot install");
+
+    assert!(layout.openshell_sandbox_binary().is_file());
+    assert_eq!(
+        std::fs::metadata(layout.openshell_sandbox_binary())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert!(layout.openshell_policy_rules().is_file());
+    assert!(layout.openshell_policy_data().is_file());
+    assert_eq!(
+        std::fs::metadata(layout.openshell_policy_rules())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        std::fs::metadata(layout.openshell_policy_data())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        std::fs::read_to_string(layout.openshell_policy_rules()).unwrap(),
+        "package test\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(layout.openshell_policy_data()).unwrap(),
+        "version: 1\nnetwork_policies: {}\n"
+    );
+    let env = std::fs::read_to_string(layout.env_file()).unwrap();
+    assert!(env.contains("NE_EXECUTION_PROFILE=confidential-azure"));
+    assert!(!layout.images_dir().join("kernels").exists());
+    assert!(!layout.images_dir().exists());
+    assert!(!layout.jailer_base().exists());
+    let supervisor_unit = std::fs::read_to_string(layout.supervisor_unit()).unwrap();
+    assert!(supervisor_unit.contains("ProtectHome=tmpfs"));
+    assert!(supervisor_unit.contains("BindPaths=/home/sandbox"));
+    assert!(supervisor_unit.contains("PrivateTmp=true"));
+    assert!(supervisor_unit.contains("/home/sandbox"));
+    assert!(!supervisor_unit.contains("/srv/jailer"));
+    assert!(!supervisor_unit.contains("ReadWritePaths=/tmp"));
+    assert!(!supervisor_unit.contains("__"));
+
+    std::fs::write(layout.openshell_policy_rules(), "operator edit\n").unwrap();
+    install(options).expect("confidential reinstall");
+    assert_eq!(
+        std::fs::read_to_string(layout.openshell_policy_rules()).unwrap(),
+        "operator edit\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fakeroot_confidential_install_uses_embedded_release_policies() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = Layout::new(tmp.path().join("root"));
+    let source = tmp.path().join("openshell-sandbox");
+    std::fs::write(&source, b"binary").unwrap();
+
+    install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::ConfidentialAzure,
+        layout: layout.clone(),
+        fakeroot: true,
+        no_start: true,
+        no_image: false,
+        dry_run: false,
+        ne_uid: 991,
+        openshell_sandbox_source: Some(source),
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
+    })
+    .expect("confidential install with embedded policies");
+
+    assert!(
+        std::fs::read_to_string(layout.openshell_policy_rules())
+            .unwrap()
+            .contains("package openshell.sandbox")
+    );
+    assert!(
+        std::fs::read_to_string(layout.openshell_policy_data())
+            .unwrap()
+            .contains("network_policies: {}")
+    );
+    assert_eq!(
+        std::fs::metadata(layout.openshell_policy_rules())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn confidential_install_rejects_policy_destination_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = Layout::new(tmp.path().join("root"));
+    let source = tmp.path().join("openshell-sandbox");
+    std::fs::write(&source, b"binary").unwrap();
+    std::fs::create_dir_all(layout.openshell_dir()).unwrap();
+    let outside = tmp.path().join("outside-policy");
+    std::fs::write(&outside, b"outside").unwrap();
+    symlink(&outside, layout.openshell_policy_rules()).unwrap();
+
+    let result = install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::ConfidentialAzure,
+        layout,
+        fakeroot: true,
+        no_start: true,
+        no_image: false,
+        dry_run: false,
+        ne_uid: 991,
+        openshell_sandbox_source: Some(source),
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
+    });
+
+    assert!(result.is_err(), "accepted policy destination symlink");
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+}
+
+#[test]
+fn confidential_install_requires_sandbox_source_before_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let result = install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::ConfidentialAzure,
+        layout: Layout::new(&root),
+        fakeroot: true,
+        no_start: true,
+        no_image: false,
+        dry_run: false,
+        ne_uid: 991,
+        openshell_sandbox_source: None,
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
+    });
+    assert!(result.is_err());
+    assert!(!root.exists(), "failed validation mutated the install root");
+}
+
+#[test]
+fn confidential_dry_run_rejects_missing_component_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let result = install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::ConfidentialAzure,
+        layout: Layout::new(&root),
+        fakeroot: true,
+        no_start: true,
+        no_image: false,
+        dry_run: true,
+        ne_uid: 991,
+        openshell_sandbox_source: Some(tmp.path().join("missing-openshell-sandbox")),
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
+    });
+    assert!(result.is_err());
+    assert!(!root.exists(), "failed dry-run validation mutated the root");
+}
+
 #[test]
 fn fakeroot_reinstall_preserves_operator_policy_edits() {
     let tmp = tempfile::tempdir().unwrap();
@@ -166,12 +383,16 @@ fn fakeroot_reinstall_preserves_operator_policy_edits() {
     let layout = Layout::new(root);
 
     let opts = InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout: layout.clone(),
         fakeroot: true,
         no_start: true,
         no_image: true,
         dry_run: false,
         ne_uid: 991,
+        openshell_sandbox_source: None,
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
     };
     install(opts.clone()).expect("first install");
 
@@ -208,12 +429,16 @@ fn fakeroot_reinstall_corrects_existing_image_store_modes() {
     .unwrap();
 
     install(InstallOptions {
+        execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
         layout,
         fakeroot: true,
         no_start: true,
         no_image: true,
         dry_run: false,
         ne_uid: 991,
+        openshell_sandbox_source: None,
+        openshell_policy_rules_source: None,
+        openshell_policy_data_source: None,
     })
     .unwrap();
 
@@ -247,12 +472,16 @@ fn fakeroot_reinstall_rejects_legacy_state_child_symlinks_without_touching_targe
         symlink(&sentinel, layout.state_dir().join(child)).unwrap();
 
         let result = install(InstallOptions {
+            execution_profile: ne_protocol::profile::ExecutionProfile::Standard,
             layout,
             fakeroot: true,
             no_start: true,
             no_image: true,
             dry_run: false,
             ne_uid: 991,
+            openshell_sandbox_source: None,
+            openshell_policy_rules_source: None,
+            openshell_policy_data_source: None,
         });
 
         assert!(result.is_err(), "accepted legacy {child} symlink");
