@@ -298,6 +298,16 @@ pub struct InstallArgs {
     )]
     pub execution_profile: ne_protocol::profile::ExecutionProfile,
 
+    /// Source `openshell-sandbox` executable for confidential Azure installs.
+    #[arg(long)]
+    pub openshell_sandbox_source: Option<PathBuf>,
+    /// Optional source OpenShell Rego policy.
+    #[arg(long)]
+    pub openshell_policy_rules_source: Option<PathBuf>,
+    /// Optional source OpenShell YAML policy data.
+    #[arg(long)]
+    pub openshell_policy_data_source: Option<PathBuf>,
+
     /// Redirect all paths under this root (fakeroot testing). Skips
     /// user/group creation and systemctl when set.
     #[arg(long)]
@@ -555,6 +565,38 @@ mod tests {
         assert_eq!(
             args.execution_profile,
             ne_protocol::profile::ExecutionProfile::ConfidentialAzure
+        );
+    }
+
+    #[test]
+    fn confidential_install_accepts_component_sources() {
+        let cli = Cli::try_parse_from([
+            "nee",
+            "install",
+            "--execution-profile",
+            "confidential-azure",
+            "--openshell-sandbox-source",
+            "/tmp/openshell-sandbox",
+            "--openshell-policy-rules-source",
+            "/tmp/policy.rego",
+            "--openshell-policy-data-source",
+            "/tmp/policy.yaml",
+        ])
+        .expect("parse");
+        let Command::Install(args) = cli.command else {
+            panic!("expected install command");
+        };
+        assert_eq!(
+            args.openshell_sandbox_source,
+            Some(PathBuf::from("/tmp/openshell-sandbox"))
+        );
+        assert_eq!(
+            args.openshell_policy_rules_source,
+            Some(PathBuf::from("/tmp/policy.rego"))
+        );
+        assert_eq!(
+            args.openshell_policy_data_source,
+            Some(PathBuf::from("/tmp/policy.yaml"))
         );
     }
 }

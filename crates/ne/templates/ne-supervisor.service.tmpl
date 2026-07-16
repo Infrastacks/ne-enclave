@@ -33,9 +33,11 @@ Group=ne
 AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT
 NoNewPrivileges=false
-ProtectHome=true
+ProtectHome=__SUPERVISOR_PROTECT_HOME__
 ProtectSystem=strict
-ReadWritePaths=/var/lib/ne-enclave /run/ne-enclave /srv/jailer
+PrivateTmp=__SUPERVISOR_PRIVATE_TMP__
+__SUPERVISOR_HOME_BIND__
+ReadWritePaths=__SUPERVISOR_READ_WRITE_PATHS__
 RuntimeDirectory=ne-enclave
 RuntimeDirectoryMode=0750
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

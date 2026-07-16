@@ -135,6 +135,9 @@ async fn main() -> Result<()> {
                 no_image: a.no_image,
                 dry_run: a.dry_run,
                 ne_uid,
+                openshell_sandbox_source: a.openshell_sandbox_source,
+                openshell_policy_rules_source: a.openshell_policy_rules_source,
+                openshell_policy_data_source: a.openshell_policy_data_source,
             })
         }
         Command::Doctor(a) => {

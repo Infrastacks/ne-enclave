@@ -39,23 +39,37 @@ pub struct InstallOptions {
     /// fakeroot tests. On real installs `install()` re-resolves the uid
     /// after `ensure_service_user` so any value passed here is overridden.
     pub ne_uid: u32,
+    /// Source OpenShell sandbox executable for confidential installs.
+    pub openshell_sandbox_source: Option<PathBuf>,
+    /// Optional source Rego policy. Uses the embedded release policy when absent.
+    pub openshell_policy_rules_source: Option<PathBuf>,
+    /// Optional source YAML policy data. Uses the embedded release data when absent.
+    pub openshell_policy_data_source: Option<PathBuf>,
 }
 
 /// Provision the host. Idempotent: re-running is a no-op where state exists.
 pub fn install(opts: InstallOptions) -> Result<()> {
+    if matches!(opts.execution_profile, ExecutionProfile::ConfidentialAzure) {
+        validate_confidential_inputs(&opts)?;
+    }
     let l = &opts.layout;
 
-    let managed_dirs = [
+    let mut managed_dirs = vec![
         l.bin_dir(),
         l.etc_dir(),
         l.state_dir(),
-        l.images_dir(),
         l.workspaces_dir(),
         l.snapshots_dir(),
-        l.jailer_base(),
         l.systemd_dir(),
         l.run_dir(),
     ];
+    match opts.execution_profile {
+        ExecutionProfile::Standard => {
+            managed_dirs.push(l.images_dir());
+            managed_dirs.push(l.jailer_base());
+        }
+        ExecutionProfile::ConfidentialAzure => managed_dirs.push(l.openshell_dir()),
+    }
 
     // Inspect the complete legacy layout before any path-following filesystem
     // mutation. A service-owned state directory from an older install may
@@ -69,6 +83,9 @@ pub fn install(opts: InstallOptions) -> Result<()> {
         opts.ne_uid
     } else {
         ensure_service_user("ne")?;
+        if matches!(opts.execution_profile, ExecutionProfile::ConfidentialAzure) {
+            ensure_sandbox_user()?;
+        }
         resolve_uid_after_creation("ne")
     };
 
@@ -94,13 +111,13 @@ pub fn install(opts: InstallOptions) -> Result<()> {
     if !opts.dry_run {
         apply_ownership(l, opts.fakeroot)?;
     }
-    if !opts.dry_run {
+    if !opts.dry_run && matches!(opts.execution_profile, ExecutionProfile::Standard) {
         image::harden_store(&l.images_dir(), opts.fakeroot)?;
     }
 
     // 3. Guest image (default pin), unless --no-image. Custom/air-gap
     //    images are provisioned separately via `nee image import`/`pull`.
-    if !opts.no_image {
+    if matches!(opts.execution_profile, ExecutionProfile::Standard) && !opts.no_image {
         if opts.dry_run {
             tracing::info!("[dry-run] fetch default guest image");
         } else {
@@ -109,12 +126,19 @@ pub fn install(opts: InstallOptions) -> Result<()> {
         }
     }
 
+    if matches!(opts.execution_profile, ExecutionProfile::ConfidentialAzure) {
+        install_confidential_components(&opts)?;
+    }
+
     // 4. Render config + units + tmpfiles.
-    let vars = RenderVars { ne_uid };
+    let vars = RenderVars {
+        ne_uid,
+        execution_profile: opts.execution_profile,
+    };
     write_file(l.env_file(), &render::render_env(&vars), opts.dry_run)?;
     write_file(
         l.supervisor_unit(),
-        &render::render_supervisor_unit(),
+        &render::render_supervisor_unit(&vars),
         opts.dry_run,
     )?;
     write_file(l.api_unit(), &render::render_api_unit(), opts.dry_run)?;
@@ -142,6 +166,39 @@ pub fn install(opts: InstallOptions) -> Result<()> {
     }
 
     print_next_steps(&opts);
+    Ok(())
+}
+
+fn validate_confidential_inputs(opts: &InstallOptions) -> Result<()> {
+    let sandbox = opts
+        .openshell_sandbox_source
+        .as_deref()
+        .context("confidential-azure requires --openshell-sandbox-source")?;
+    validate_regular_source("OpenShell sandbox", sandbox)?;
+    for (name, source) in [
+        (
+            "OpenShell policy rules",
+            opts.openshell_policy_rules_source.as_deref(),
+        ),
+        (
+            "OpenShell policy data",
+            opts.openshell_policy_data_source.as_deref(),
+        ),
+    ] {
+        if let Some(source) = source {
+            validate_regular_source(name, source)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_regular_source(name: &str, source: &Path) -> Result<()> {
+    let metadata = fs::metadata(source).with_context(|| format!("inspect {}", source.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{name} source {} is not a regular file",
+        source.display()
+    );
     Ok(())
 }
 
@@ -278,10 +335,41 @@ pub fn uninstall(layout: &Layout, purge: bool, fakeroot: bool) -> Result<()> {
 }
 
 /// Preflight wrapper for `nee doctor`.
-pub fn doctor(l: &Layout, _execution_profile: ExecutionProfile) -> preflight::Report {
+pub fn doctor(l: &Layout, execution_profile: ExecutionProfile) -> preflight::Report {
     // /dev/kvm is always the real host device, even under `--prefix`: the
     // prefix redirects install paths, not the kernel's KVM character device.
-    preflight::run_report(&l.bin_dir(), Path::new("/dev/kvm"))
+    let tpm2 = find_command("tpm2").unwrap_or_else(|| PathBuf::from("/usr/bin/tpm2"));
+    let sandbox_identity = if matches!(execution_profile, ExecutionProfile::ConfidentialAzure) {
+        sandbox_identity_status()
+    } else {
+        Ok(())
+    };
+    let mut report = preflight::run_report(
+        execution_profile,
+        &preflight::PreflightPaths {
+            kvm: PathBuf::from("/dev/kvm"),
+            vtpm: PathBuf::from("/dev/tpmrm0"),
+            firecracker: l.bin_dir().join("firecracker"),
+            jailer: l.bin_dir().join("jailer"),
+            openshell_sandbox: l.openshell_sandbox_binary(),
+            openshell_policy_rules: l.openshell_policy_rules(),
+            openshell_policy_data: l.openshell_policy_data(),
+            tpm2: tpm2.clone(),
+            sandbox_identity,
+        },
+    );
+    if matches!(execution_profile, ExecutionProfile::ConfidentialAzure) {
+        preflight::append_azure_tpm_checks(&mut report, &tpm2);
+    }
+    report
+}
+
+fn find_command(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn write_file(path: PathBuf, body: &str, dry_run: bool) -> Result<()> {
@@ -295,6 +383,120 @@ fn write_file(path: PathBuf, body: &str, dry_run: bool) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+fn install_confidential_components(opts: &InstallOptions) -> Result<()> {
+    let source = opts
+        .openshell_sandbox_source
+        .as_ref()
+        .context("confidential-azure requires --openshell-sandbox-source")?;
+    copy_executable(
+        source,
+        &opts.layout.openshell_sandbox_binary(),
+        opts.dry_run,
+    )?;
+    install_policy_if_absent(
+        opts.openshell_policy_rules_source.as_deref(),
+        &opts.layout.openshell_policy_rules(),
+        &render::render_openshell_policy_rules(),
+        opts.dry_run,
+    )?;
+    install_policy_if_absent(
+        opts.openshell_policy_data_source.as_deref(),
+        &opts.layout.openshell_policy_data(),
+        &render::render_openshell_policy_data(),
+        opts.dry_run,
+    )
+}
+
+fn install_policy_if_absent(
+    source: Option<&Path>,
+    destination: &Path,
+    embedded: &str,
+    dry_run: bool,
+) -> Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "OpenShell policy {} is a symlink or non-file",
+                destination.display()
+            );
+            if !dry_run {
+                set_policy_mode(destination)?;
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", destination.display()));
+        }
+    }
+    let body = source.map_or_else(
+        || Ok(embedded.to_string()),
+        |path| {
+            fs::read_to_string(path)
+                .with_context(|| format!("reading policy source {}", path.display()))
+        },
+    )?;
+    write_file(destination.to_path_buf(), &body, dry_run)?;
+    if !dry_run {
+        set_policy_mode(destination)?;
+    }
+    Ok(())
+}
+
+fn copy_executable(source: &Path, destination: &Path, dry_run: bool) -> Result<()> {
+    if dry_run {
+        tracing::info!(
+            "[dry-run] copy executable {} -> {}",
+            source.display(),
+            destination.display()
+        );
+        return Ok(());
+    }
+    validate_regular_source("OpenShell sandbox", source)?;
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "refusing to replace symlink {}",
+            destination.display()
+        );
+    }
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "copying OpenShell sandbox {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    set_executable_mode(destination)
+}
+
+#[cfg(unix)]
+fn set_executable_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 0755 {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_executable_mode(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_policy_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("chmod 0644 {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_policy_mode(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn fetch_default_image(l: &Layout) -> Result<()> {
@@ -348,6 +550,114 @@ fn ensure_service_user(_name: &str) -> Result<()> {
     anyhow::bail!("user creation is only supported on Linux")
 }
 
+const SANDBOX_HOME: &str = "/home/sandbox";
+
+fn validate_sandbox_account_fields(
+    user_gid: u32,
+    group_gid: u32,
+    home: &Path,
+) -> Result<(), String> {
+    if user_gid != group_gid {
+        return Err(format!(
+            "sandbox primary gid {user_gid} does not match sandbox group gid {group_gid}"
+        ));
+    }
+    if home != Path::new(SANDBOX_HOME) {
+        return Err(format!(
+            "sandbox home {} does not match {SANDBOX_HOME}",
+            home.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_sandbox_user() -> Result<()> {
+    use nix::unistd::{Group, User};
+
+    let user_exists = User::from_name("sandbox")
+        .context("looking up sandbox user")?
+        .is_some();
+    if !user_exists {
+        if Group::from_name("sandbox")
+            .context("looking up sandbox group")?
+            .is_none()
+        {
+            let status = std::process::Command::new("groupadd")
+                .args(["--system", "sandbox"])
+                .status()
+                .context("running groupadd for sandbox")?;
+            anyhow::ensure!(status.success(), "groupadd sandbox failed ({status})");
+        }
+        let status = std::process::Command::new("useradd")
+            .args([
+                "--system",
+                "--gid",
+                "sandbox",
+                "--home-dir",
+                SANDBOX_HOME,
+                "--create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                "sandbox",
+            ])
+            .status()
+            .context("running useradd for sandbox")?;
+        anyhow::ensure!(status.success(), "useradd sandbox failed ({status})");
+    }
+
+    let user = User::from_name("sandbox")
+        .context("looking up sandbox user after creation")?
+        .context("sandbox user missing after creation")?;
+    let group = Group::from_name("sandbox")
+        .context("looking up sandbox group after creation")?
+        .context("sandbox group missing after creation")?;
+    validate_sandbox_account_fields(user.gid.as_raw(), group.gid.as_raw(), &user.dir)
+        .map_err(anyhow::Error::msg)?;
+
+    let home = Path::new(SANDBOX_HOME);
+    ensure_directory_chain(Path::new("/"), home)?;
+    apply_directory_policy(home, "sandbox", "sandbox", 0o750, false)?;
+    sandbox_identity_status().map_err(anyhow::Error::msg)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_sandbox_user() -> Result<()> {
+    anyhow::bail!("sandbox user creation is only supported on Linux")
+}
+
+#[cfg(unix)]
+fn sandbox_identity_status() -> std::result::Result<(), String> {
+    use nix::unistd::{Group, User};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let user = User::from_name("sandbox")
+        .map_err(|error| format!("look up sandbox user: {error}"))?
+        .ok_or_else(|| "sandbox account missing".to_string())?;
+    let group = Group::from_name("sandbox")
+        .map_err(|error| format!("look up sandbox group: {error}"))?
+        .ok_or_else(|| "sandbox group missing".to_string())?;
+    validate_sandbox_account_fields(user.gid.as_raw(), group.gid.as_raw(), &user.dir)?;
+
+    let metadata = fs::symlink_metadata(SANDBOX_HOME)
+        .map_err(|error| format!("inspect {SANDBOX_HOME}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{SANDBOX_HOME} is not a real directory"));
+    }
+    if metadata.uid() != user.uid.as_raw() || metadata.gid() != group.gid.as_raw() {
+        return Err(format!("{SANDBOX_HOME} is not owned by sandbox:sandbox"));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o750 {
+        return Err(format!("{SANDBOX_HOME} mode is not 0750"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sandbox_identity_status() -> std::result::Result<(), String> {
+    Err("sandbox identity validation is only supported on Unix".to_string())
+}
+
 /// Resolve the uid of a user that was just created (or already existed).
 /// Falls back to 0 on non-Linux or lookup failure (root — will be corrected
 /// by the chown step in Task 12).
@@ -368,7 +678,9 @@ fn resolve_uid_after_creation(_name: &str) -> u32 {
 fn apply_ownership(l: &Layout, fakeroot: bool) -> Result<()> {
     for (abs, (user, group), mode) in dir_ownership() {
         let path = l.root().join(abs.trim_start_matches('/'));
-        apply_directory_policy(&path, user, group, mode, fakeroot)?;
+        if path.exists() {
+            apply_directory_policy(&path, user, group, mode, fakeroot)?;
+        }
     }
     Ok(())
 }
@@ -463,6 +775,7 @@ pub fn dir_ownership() -> Vec<(&'static str, (&'static str, &'static str), u32)>
         ("/var/lib/ne-enclave/images", ("root", "root"), 0o755),
         ("/var/lib/ne-enclave/workspaces", ("ne", "ne"), 0o750),
         ("/var/lib/ne-enclave/snapshots", ("ne", "ne"), 0o750),
+        ("/var/lib/ne-enclave/openshell", ("root", "root"), 0o755),
         ("/srv/jailer", ("root", "root"), 0o700),
         ("/etc/ne-enclave", ("root", "ne"), 0o750),
         ("/run/ne-enclave", ("root", "ne"), 0o750),
@@ -472,6 +785,13 @@ pub fn dir_ownership() -> Vec<(&'static str, (&'static str, &'static str), u32)>
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn sandbox_account_contract_requires_matching_group_and_home() {
+        assert!(validate_sandbox_account_fields(700, 700, Path::new("/home/sandbox")).is_ok());
+        assert!(validate_sandbox_account_fields(700, 701, Path::new("/home/sandbox")).is_err());
+        assert!(validate_sandbox_account_fields(700, 700, Path::new("/var/empty")).is_err());
+    }
 
     #[test]
     fn jailer_base_is_root_only() {
