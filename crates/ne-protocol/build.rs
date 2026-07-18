@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Mindpool, Inc.
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
 // SPDX-License-Identifier: Apache-2.0
 
 //! Build script — compiles `proto/ne/runtime/v1/runtime.proto` into Rust

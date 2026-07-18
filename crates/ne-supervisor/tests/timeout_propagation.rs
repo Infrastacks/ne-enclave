@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Mindpool, Inc.
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
 // SPDX-License-Identifier: Apache-2.0
 
 //! Wedge 5.5: host-side timeout propagation through the three vsock

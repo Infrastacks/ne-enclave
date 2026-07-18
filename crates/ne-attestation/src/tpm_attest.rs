@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Mindpool, Inc.
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pure parser for the TPM 2.0 `TPM2B_ATTEST` / `TPMS_ATTEST` structure that

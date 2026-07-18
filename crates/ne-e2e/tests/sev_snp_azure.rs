@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Mindpool, Inc.
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
 // SPDX-License-Identifier: Apache-2.0
 
 //! e2e: SEV-SNP hardware-rooted key release on Azure DCasv5 (OpenHCL vTPM + TPM Quote).

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Mindpool, Inc.
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
 // SPDX-License-Identifier: Apache-2.0
 
 //! Seal/unseal orchestration: the full restore trust path (design §8).
