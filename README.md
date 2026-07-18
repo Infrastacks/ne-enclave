@@ -2,13 +2,15 @@
 
 **The open-source execution boundary for AI agents, with a Preview Azure confidential profile.**
 
+NeuronEdge Enclave joined Mindpool in July 2026. It remains a standalone, Apache-2.0 execution boundary for AI agents — see https://neuronedge.ai.
+
 Autonomous agents run code, install packages, call APIs, and touch sensitive data. NeuronEdge Enclave gives each agent a governed sandbox: a Firecracker microVM with its own kernel in the supported standard profile, or an OpenShell sandbox inside an SEV-SNP CVM in the Preview Azure confidential profile.
 
 Apache-2.0. Self-hosted. Rust top-to-bottom.
 
 ```sh
 # Install on any Linux + KVM host (Ubuntu 22.04+/24.04, x86_64):
-curl -fsSL https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Mindpool-Labs/ne-enclave/releases/latest/download/install.sh | sh
 ```
 
 ---
@@ -29,7 +31,7 @@ NeuronEdge Enclave is the **fourth option**: a self-hosted runtime where standar
 
 ## What it is
 
-A Rust runtime that creates, controls, snapshots, and destroys Firecracker-backed microVM sandboxes for agent workloads. The standard profile includes runtime-owned networking, privacy routing, and signed audit controls. The confidential profile uses a pinned [OpenShell](https://github.com/Infrastacks/OpenShell) sandbox inside the CVM. OpenShell's package supply-chain engine is not wired into standard workspaces.
+A Rust runtime that creates, controls, snapshots, and destroys Firecracker-backed microVM sandboxes for agent workloads. The standard profile includes runtime-owned networking, privacy routing, and signed audit controls. The confidential profile uses a pinned [OpenShell](https://github.com/Mindpool-Labs/OpenShell) sandbox inside the CVM. OpenShell's package supply-chain engine is not wired into standard workspaces.
 
 | Capability | Maturity |
 |---|---|
@@ -67,7 +69,7 @@ for activation.
 
 ```sh
 # 1. Install the runtime (renders config + hardened systemd units + starts them)
-curl -fsSL https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Mindpool-Labs/ne-enclave/releases/latest/download/install.sh | sh
 
 # 2. Verify
 /opt/ne-enclave/bin/nee doctor      # preflight: KVM, Firecracker, jailer
@@ -158,9 +160,9 @@ not implied across profiles.
 
 ## Foundation
 
-Built on two production-credible Apache-2.0 Rust projects, both under Infrastacks ownership with substantial additions:
+Built on two production-credible Apache-2.0 Rust projects, both under Mindpool ownership with substantial additions:
 
-- **[NVIDIA OpenShell](https://github.com/Infrastacks/OpenShell)** — the sandbox substrate used by the Preview confidential profile (Landlock/seccomp/netns isolation and OPA policy). Its package supply-chain engine is not part of the standard runtime profile.
+- **[NVIDIA OpenShell](https://github.com/Mindpool-Labs/OpenShell)** — the sandbox substrate used by the Preview confidential profile (Landlock/seccomp/netns isolation and OPA policy). Its package supply-chain engine is not part of the standard runtime profile.
 - **[AWS Firecracker](https://github.com/firecracker-microvm/firecracker)** — the microVM substrate (upstream prebuilt binary for the standard tier).
 
 ---
@@ -202,10 +204,10 @@ without a rebuild.
 
 ## Community
 
-- **Issues:** [github.com/Infrastacks/ne-enclave/issues](https://github.com/Infrastacks/ne-enclave/issues)
-- **Discussions:** [github.com/Infrastacks/ne-enclave/discussions](https://github.com/Infrastacks/ne-enclave/discussions)
+- **Issues:** [github.com/Mindpool-Labs/ne-enclave/issues](https://github.com/Mindpool-Labs/ne-enclave/issues)
+- **Discussions:** [github.com/Mindpool-Labs/ne-enclave/discussions](https://github.com/Mindpool-Labs/ne-enclave/discussions)
 
-We are looking for **design partners** — regulated enterprises (finance, healthcare, government) evaluating confidential agent execution. If your CISO has blocked an agent deployment on isolation or attestation grounds, we'd like to talk: `eng@infrastacks.com`.
+We are looking for **design partners** — regulated enterprises (finance, healthcare, government) evaluating confidential agent execution. If your CISO has blocked an agent deployment on isolation or attestation grounds, we'd like to talk: `dev@mindpool.io`.
 
 ---
 

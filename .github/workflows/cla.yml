@@ -40,9 +40,9 @@ jobs:
           PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: "cla-signatures/version1/cla.json"
-          path-to-document: "https://github.com/Infrastacks/ne-enclave/blob/main/CLA.md"
+          path-to-document: "https://github.com/Mindpool-Labs/ne-enclave/blob/main/CLA.md"
           branch: "cla-signatures"
-          allowlist: murraju,Infrastacks,dependabot[bot],github-actions[bot]
+          allowlist: murraju,Mindpool-Labs,dependabot[bot],github-actions[bot]
 
           # Create the signature branch if it doesn't exist.
           create-file-if-not-exist: true
@@ -52,9 +52,9 @@ jobs:
           # The sign-off message the contributor types in the comment.
           custom-notsigned-prcomment: |
             Thanks for the contribution! Before we can merge, please sign our
-            [Contributor License Agreement](https://github.com/Infrastacks/ne-enclave/blob/main/CLA.md).
+            [Contributor License Agreement](https://github.com/Mindpool-Labs/ne-enclave/blob/main/CLA.md).
 
-            It grants Infrastacks a broad license to your contribution and
+            It grants Mindpool a broad license to your contribution and
             preserves the project's option to relicense under any OSI-approved
             license no more restrictive than Apache-2.0. You retain your
             copyrights.

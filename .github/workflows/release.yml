@@ -136,7 +136,7 @@ jobs:
       - name: Build pinned OpenShell sandbox (static musl)
         run: |
           set -euo pipefail
-          git clone https://github.com/Infrastacks/OpenShell.git "$RUNNER_TEMP/OpenShell"
+          git clone https://github.com/Mindpool-Labs/OpenShell.git "$RUNNER_TEMP/OpenShell"
           git -C "$RUNNER_TEMP/OpenShell" checkout --detach 70328542941838612a75b62c3cc365e01594c0c3
           cargo build \
             --manifest-path "$RUNNER_TEMP/OpenShell/Cargo.toml" \
@@ -245,7 +245,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          identity='https://github\.com/Infrastacks/ne-enclave/\.github/workflows/release\.yml@refs/tags/'
+          identity='https://github\.com/Mindpool-Labs/ne-enclave/\.github/workflows/release\.yml@refs/tags/'
           issuer='https://token.actions.githubusercontent.com'
           for file in staging/*; do
             case "$file" in
@@ -258,9 +258,9 @@ jobs:
           done
           while read -r _digest file; do
             gh attestation verify "staging/$file" \
-              --repo Infrastacks/ne-enclave \
+              --repo Mindpool-Labs/ne-enclave \
               --bundle staging/ne-enclave.provenance.sigstore.json \
-              --signer-workflow Infrastacks/ne-enclave/.github/workflows/release.yml \
+              --signer-workflow Mindpool-Labs/ne-enclave/.github/workflows/release.yml \
               --source-ref "$GITHUB_REF"
           done < staging/SHA256SUMS
       - name: Archive exact verified candidate

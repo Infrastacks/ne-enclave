@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Infrastacks LLC
+// SPDX-FileCopyrightText: 2026 Mindpool, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Chunked streaming AES-256-GCM container for sealed `mem`/`vmstate` files.

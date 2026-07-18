@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Infrastacks LLC
+// SPDX-FileCopyrightText: 2026 Mindpool, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! AMD SEV-SNP VCEK certificate-chain verification + firmware-signature check.

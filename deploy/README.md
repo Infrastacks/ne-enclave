@@ -59,7 +59,7 @@ knobs — deploy-doc reference, not a security-capability claim — set them in
 ```sh
 # Install Cosign first:
 # https://docs.sigstore.dev/cosign/system_config/installation/
-curl -fsSL https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Mindpool-Labs/ne-enclave/releases/latest/download/install.sh | sh
 ```
 
 The thin `install.sh`:
@@ -77,7 +77,7 @@ To pin a specific release:
 
 ```sh
 curl -fsSL \
-  https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh |
+  https://github.com/Mindpool-Labs/ne-enclave/releases/latest/download/install.sh |
   NE_VERSION=v0.2.0 sh
 ```
 
@@ -226,7 +226,7 @@ On an Azure DCasv5 confidential VM with `tpm2-tools` and Cosign installed:
 
 ```sh
 curl -fsSL \
-  https://github.com/Infrastacks/ne-enclave/releases/latest/download/install.sh |
+  https://github.com/Mindpool-Labs/ne-enclave/releases/latest/download/install.sh |
   NE_EXECUTION_PROFILE=confidential-azure sh
 ```
 

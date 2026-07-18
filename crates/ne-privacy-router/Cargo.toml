@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Infrastacks LLC
+# SPDX-FileCopyrightText: 2026 Mindpool, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
 # NeuronEdge Enclave workspace-egress privacy router.
@@ -27,8 +27,8 @@ path = "src/lib.rs"
 
 [dependencies]
 # Fork SHA pin lives here only; bump in this file when we ship upstream
-# changes to the Infrastacks/OpenShell PII engine.
-openshell-pii = { git = "https://github.com/Infrastacks/OpenShell.git", rev = "70328542941838612a75b62c3cc365e01594c0c3" }
+# changes to the Mindpool-Labs/OpenShell PII engine.
+openshell-pii = { git = "https://github.com/Mindpool-Labs/OpenShell.git", rev = "70328542941838612a75b62c3cc365e01594c0c3" }
 
 tokio = { workspace = true }
 clap = { workspace = true }

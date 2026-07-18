@@ -2277,7 +2277,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openshell-pii"
 version = "0.0.0"
-source = "git+https://github.com/Infrastacks/OpenShell.git?rev=70328542941838612a75b62c3cc365e01594c0c3#70328542941838612a75b62c3cc365e01594c0c3"
+source = "git+https://github.com/Mindpool-Labs/OpenShell.git?rev=70328542941838612a75b62c3cc365e01594c0c3#70328542941838612a75b62c3cc365e01594c0c3"
 dependencies = [
  "regex",
  "serde",

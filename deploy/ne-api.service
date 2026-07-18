@@ -6,7 +6,7 @@
 
 [Unit]
 Description=NeuronEdge Enclave API front door (gRPC + REST)
-Documentation=https://github.com/Infrastacks/ne-enclave
+Documentation=https://github.com/Mindpool-Labs/ne-enclave
 After=ne-supervisor.service
 Requires=ne-supervisor.service
 

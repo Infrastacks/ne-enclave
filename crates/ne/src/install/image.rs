@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Infrastacks LLC
+// SPDX-FileCopyrightText: 2026 Mindpool, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Guest image provisioning: verify a SHA256 digest and place a file
@@ -287,7 +287,7 @@ pub struct ImagePin {
 /// CI publishes the real asset; `fetch_default_image` guards against them).
 pub const DEFAULT_IMAGE: ImagePin = ImagePin {
     // Replace with the real release asset URL + digests in Task 15.
-    url_base: "https://github.com/Infrastacks/ne-enclave/releases/latest/download",
+    url_base: "https://github.com/Mindpool-Labs/ne-enclave/releases/latest/download",
     kernel_sha256: "PLACEHOLDER_KERNEL_SHA256",
     rootfs_sha256: "PLACEHOLDER_ROOTFS_SHA256",
 };

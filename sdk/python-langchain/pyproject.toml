@@ -9,7 +9,7 @@ description = "LangChain adapter for the NeuronEdge Enclave Runtime API."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Infrastacks LLC", email = "eng@infrastacks.com" }]
+authors = [{ name = "Mindpool, Inc.", email = "dev@mindpool.io" }]
 keywords = [
     "langchain",
     "enclave",
@@ -45,7 +45,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://neuronedge.ai"
-Repository = "https://github.com/Infrastacks/ne-enclave"
+Repository = "https://github.com/Mindpool-Labs/ne-enclave"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ne_langchain"]

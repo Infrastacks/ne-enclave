@@ -1,10 +1,10 @@
-// SPDX-FileCopyrightText: 2026 Infrastacks LLC
+// SPDX-FileCopyrightText: 2026 Mindpool, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! NeuronEdge Enclave workspace-egress privacy router.
 //!
 //! Wedge-5 substrate. Wraps the NVIDIA OpenShell PII detection engine
-//! (consumed as a SHA-pinned git dep from our Infrastacks fork) and
+//! (consumed as a SHA-pinned git dep from our OpenShell fork) and
 //! exposes:
 //!
 //! - **Re-exports** of the engine surface — downstream NeuronEdge Enclave crates
