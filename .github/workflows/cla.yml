@@ -26,6 +26,7 @@ permissions:
 
 jobs:
   CLAAssistant:
+    name: CLA Assistant
     runs-on: ubuntu-24.04
     steps:
       - name: CLA Assistant
