@@ -28,8 +28,8 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-authors = ["Infrastacks LLC <eng@infrastacks.com>"]
-repository = "https://github.com/Infrastacks/ne-enclave"
+authors = ["Mindpool, Inc. <dev@mindpool.io>"]
+repository = "https://github.com/Mindpool-Labs/ne-enclave"
 homepage = "https://neuronedge.ai"
 
 [workspace.dependencies]

@@ -1,7 +1,7 @@
 # Contributor License Agreement (CLA)
 
 > **STATUS: DRAFT TEMPLATE — NOT LEGAL ADVICE.**
-> This CLA is a template prepared for review by Infrastacks LLC counsel. It
+> This CLA is a template prepared for review by Mindpool, Inc. counsel. It
 > is provided here to make the contribution terms transparent. Have a
 > qualified attorney review and finalize before relying on it. Until a
 > finalized version is published, contributions to this repository are
@@ -20,11 +20,11 @@ contribution. Without a CLA, every contribution is owned by its author under
 a patchwork of copyrights, which makes it practically impossible to relicense
 the project later — even if every contributor would have agreed.
 
-This CLA grants Infrastacks a broad license to your contribution **and
-preserves Infrastacks's option to relicense** the project in the future.
+This CLA grants Mindpool a broad license to your contribution **and
+preserves Mindpool's option to relicense** the project in the future.
 That optionality is what keeps the project's IP clean enough to survive a
 relicense, an acquisition, or a change in open-source strategy. You retain
-ownership of your copyrights; you grant Infrastacks a perpetual, broad,
+ownership of your copyrights; you grant Mindpool a perpetual, broad,
 sublicensable license.
 
 **The runtime is Apache-2.0 today and the project's intent is to keep it that
@@ -37,7 +37,7 @@ relicense if the project's circumstances ever require it.
   `.cla/signatures/individuals.csv` (see `.cla/individual-cla.txt`).
 - **Corporate contributors** (contributing on behalf of an employer): have an
   authorized signatory complete `.cla/corporate-cla.txt` and email it to
-  eng@infrastacks.com.
+  dev@mindpool.io.
 
 By submitting a pull request, you confirm that you have read and agree to the
 applicable CLA below.
@@ -52,17 +52,17 @@ _Summary (non-binding):_
 You (the "Contributor") agree that, for each contribution you make to
 NeuronEdge Enclave:
 
-1. **Grant of license.** You grant Infrastacks LLC a perpetual, worldwide,
+1. **Grant of license.** You grant Mindpool, Inc. a perpetual, worldwide,
    non-exclusive, no-charge, royalty-free, irrevocable copyright license to
    reproduce, prepare derivative works of, publicly display, publicly perform,
    sublicense, and distribute your contributions and such derivative works.
-2. **Patent license.** You grant Infrastacks LLC a perpetual, worldwide,
+2. **Patent license.** You grant Mindpool, Inc. a perpetual, worldwide,
    non-exclusive, no-charge, royalty-free, irrevocable patent license to make,
    have made, use, offer to sell, sell, import, and otherwise transfer your
    contribution, where such license applies only to those patent claims
    licensable by you that are necessarily infringed by your contribution.
-3. **Relicensing.** You agree that Infrastacks may distribute your
-   contributions under the Apache License 2.0 **or any later license Infrastacks
+3. **Relicensing.** You agree that Mindpool may distribute your
+   contributions under the Apache License 2.0 **or any later license Mindpool
    chooses for the project** (the "Change License"), provided that any such
    Change License is certified as open-source by the Open Source Initiative
    (OSI) at the time it is adopted, or is no more restrictive than the Apache
@@ -88,4 +88,4 @@ rights to its employees' contributions and authorizes them to contribute.
 
 ---
 
-Questions: eng@infrastacks.com
+Questions: dev@mindpool.io

@@ -101,8 +101,8 @@ chore: bump Firecracker pin to v1.16.1
 
 ## Questions
 
-- Open a [Discussion](https://github.com/Infrastacks/ne-enclave/discussions)
+- Open a [Discussion](https://github.com/Mindpool-Labs/ne-enclave/discussions)
   for questions and design chat.
-- Open an [Issue](https://github.com/Infrastacks/ne-enclave/issues) for bugs
+- Open an [Issue](https://github.com/Mindpool-Labs/ne-enclave/issues) for bugs
   and concrete feature requests.
-- Email eng@infrastacks.com for anything sensitive.
+- Email dev@mindpool.io for anything sensitive.

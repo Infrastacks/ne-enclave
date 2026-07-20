@@ -1,5 +1,5 @@
 INDIVIDUAL CONTRIBUTOR LICENSE AGREEMENT
-NeuronEdge Enclave — Infrastacks LLC
+NeuronEdge Enclave — Mindpool, Inc.
 
 > DRAFT TEMPLATE — NOT LEGAL ADVICE. Have qualified counsel review and
 > finalize before relying on this document.
@@ -10,7 +10,7 @@ Contributions from any person or entity, the Project must have a Contributor
 License Agreement (CLA) on file that has been signed by each Contributor,
 indicating agreement to the terms below. This license is for your protection
 as a Contributor as well as the protection of the Project, its users, and
-Infrastacks LLC ("Infrastacks"); it does not change your rights to use your
+Mindpool, Inc. ("Mindpool"); it does not change your rights to use your
 own Contributions for any other purpose.
 
 This agreement applies to any and all Contributions you make to the Project.
@@ -18,7 +18,7 @@ This agreement applies to any and all Contributions you make to the Project.
 1. Definitions.
    "You" (or "Contributor") shall mean the copyright owner or legal entity
    authorized by the copyright owner that is making this Agreement with
-   Infrastacks. For legal entities, the entity making a Contribution and all
+   Mindpool. For legal entities, the entity making a Contribution and all
    other entities that control, are controlled by, or are under common control
    with that entity are considered to be a single Contributor. For the
    purposes of this definition, "control" means (i) the power, direct or
@@ -39,14 +39,14 @@ This agreement applies to any and all Contributions you make to the Project.
    marked or otherwise designated in writing by You as "Not a Contribution."
 
 2. Grant of Copyright License. Subject to the terms and conditions of this
-   Agreement, You hereby grant to Infrastacks and to recipients of software
+   Agreement, You hereby grant to Mindpool and to recipients of software
    distributed by the Project a perpetual, worldwide, non-exclusive,
    no-charge, royalty-free, irrevocable copyright license to reproduce,
    prepare derivative works of, publicly display, publicly perform, sublicense,
    and distribute Your Contributions and such derivative works.
 
 3. Grant of Patent License. Subject to the terms and conditions of this
-   Agreement, You hereby grant to Infrastacks and to recipients of software
+   Agreement, You hereby grant to Mindpool and to recipients of software
    distributed by the Project a perpetual, worldwide, non-exclusive,
    no-charge, royalty-free, irrevocable (except as stated in this section)
    patent license to make, have made, use, offer to sell, sell, import, and
@@ -61,9 +61,9 @@ This agreement applies to any and all Contributions you make to the Project.
    Agreement for that Contribution or Work shall terminate as of the date such
    litigation is filed.
 
-4. Relicensing Authorization. You agree that Infrastacks may distribute Your
+4. Relicensing Authorization. You agree that Mindpool may distribute Your
    Contributions under the Apache License, Version 2.0, or under any other
-   license that Infrastacks selects for the Project (a "Change License"),
+   license that Mindpool selects for the Project (a "Change License"),
    provided that the Change License at the time of its adoption either
    (a) has been approved as an open-source license by the Open Source
    Initiative (OSI), or (b) is no more restrictive than the Apache License,
@@ -77,7 +77,7 @@ This agreement applies to any and all Contributions you make to the Project.
    includes your Contributions, you represent that you have received
    permission to make Contributions on behalf of that employer, that your
    employer has waived such rights for your Contributions to the Project, or
-   that your employer has executed a separate Corporate CLA with Infrastacks.
+   that your employer has executed a separate Corporate CLA with Mindpool.
 
 6. You represent that each of Your Contributions is Your original creation
    (see section 7 for submissions on behalf of others). You represent that

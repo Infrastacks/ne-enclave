@@ -3,7 +3,7 @@
 # selected profile's release components, then hands off to `nee install`.
 set -eu
 
-REPO="${NE_REPO:-Infrastacks/ne-enclave}"
+REPO="${NE_REPO:-Mindpool-Labs/ne-enclave}"
 VERSION="${NE_VERSION:-latest}"
 PROFILE="${NE_EXECUTION_PROFILE:-standard}"
 NEE_ASSET="nee-x86_64-unknown-linux-musl"

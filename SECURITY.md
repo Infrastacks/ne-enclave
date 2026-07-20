@@ -10,9 +10,9 @@ issue and what to expect.
 
 Instead, please report it privately:
 
-- **Email:** security@infrastacks.com (preferred)
+- **Email:** security@neuronedge.ai (preferred)
 - **GitHub:** use the
-  [private vulnerability reporting](https://github.com/Infrastacks/ne-enclave/security/advisories/new)
+  [private vulnerability reporting](https://github.com/Mindpool-Labs/ne-enclave/security/advisories/new)
   feature on this repository.
 
 Please include:
@@ -52,7 +52,7 @@ Out of scope (but welcome as standard issues):
 - Issues requiring an already-compromised operator on the confidential tier
   (the confidential tier's trust model explicitly excludes a malicious host;
   see the threat-model docs).
-- Social engineering, phishing, or physical attacks against Infrastacks
+- Social engineering, phishing, or physical attacks against Mindpool
   infrastructure.
 
 ## Supported versions

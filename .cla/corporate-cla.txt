@@ -1,12 +1,12 @@
 CORPORATE CONTRIBUTOR LICENSE AGREEMENT
-NeuronEdge Enclave — Infrastacks LLC
+NeuronEdge Enclave — Mindpool, Inc.
 
 > DRAFT TEMPLATE — NOT LEGAL ADVICE. Have qualified counsel review and
 > finalize before relying on this document.
 
 This Corporate Contributor License Agreement ("Agreement") is entered into
-between the entity signing below ("You" or "Contributor") and Infrastacks LLC
-("Infrastacks"), applying to Contributions to the NeuronEdge Enclave Project
+between the entity signing below ("You" or "Contributor") and Mindpool, Inc.
+("Mindpool"), applying to Contributions to the NeuronEdge Enclave Project
 (the "Project"). It mirrors the Individual CLA and adds the corporate
 authority representations required so that employee contributions are
 cleanly covered.
@@ -21,14 +21,14 @@ cleanly covered.
    who submit Contributions on behalf of Contributor.
 
 2. Grant of Copyright License. Subject to the terms and conditions of this
-   Agreement, Contributor hereby grants to Infrastacks and to recipients of
+   Agreement, Contributor hereby grants to Mindpool and to recipients of
    software distributed by the Project a perpetual, worldwide, non-exclusive,
    no-charge, royalty-free, irrevocable copyright license to reproduce,
    prepare derivative works of, publicly display, publicly perform, sublicense,
    and distribute the Contributions and such derivative works.
 
 3. Grant of Patent License. Subject to the terms and conditions of this
-   Agreement, Contributor hereby grants to Infrastacks and to recipients of
+   Agreement, Contributor hereby grants to Mindpool and to recipients of
    software distributed by the Project a perpetual, worldwide, non-exclusive,
    no-charge, royalty-free, irrevocable (except as stated in this section)
    patent license to make, have made, use, offer to sell, sell, import, and
@@ -43,9 +43,9 @@ cleanly covered.
    this Agreement for that Contribution or Work shall terminate as of the date
    such litigation is filed.
 
-4. Relicensing Authorization. Contributor agrees that Infrastacks may
+4. Relicensing Authorization. Contributor agrees that Mindpool may
    distribute the Contributions under the Apache License, Version 2.0, or
-   under any other license that Infrastacks selects for the Project (a
+   under any other license that Mindpool selects for the Project (a
    "Change License"), provided that the Change License at the time of its
    adoption either (a) has been approved as an open-source license by the
    Open Source Initiative (OSI), or (b) is no more restrictive than the

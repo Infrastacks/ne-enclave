@@ -16,7 +16,7 @@
   },
   "resolved_sha256": {},
   "openshell": {
-    "repository": "https://github.com/Infrastacks/OpenShell.git",
+    "repository": "https://github.com/Mindpool-Labs/OpenShell.git",
     "commit": "70328542941838612a75b62c3cc365e01594c0c3"
   }
 }

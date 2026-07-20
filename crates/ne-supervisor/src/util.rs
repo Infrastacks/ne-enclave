@@ -1,4 +1,5 @@
-// SPDX-FileCopyrightText: 2026 Infrastacks LLC <eng@infrastacks.com>
+// SPDX-FileCopyrightText: 2026 Mindpool, Inc. <dev@mindpool.io>
+// SPDX-FileCopyrightText: 2026 Infrastacks LLC
 // SPDX-License-Identifier: Apache-2.0
 
 //! Small shared supervisor utilities.

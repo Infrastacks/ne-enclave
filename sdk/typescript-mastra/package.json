@@ -3,11 +3,11 @@
   "version": "0.1.0",
   "description": "Mastra adapter for the NeuronEdge Enclave Runtime API.",
   "license": "Apache-2.0",
-  "author": "Infrastacks LLC <eng@infrastacks.com>",
+  "author": "Mindpool, Inc. <dev@mindpool.io>",
   "homepage": "https://neuronedge.ai",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Infrastacks/ne-enclave.git"
+    "url": "git+https://github.com/Mindpool-Labs/ne-enclave.git"
   },
   "keywords": [
     "mastra",

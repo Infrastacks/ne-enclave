@@ -61,7 +61,8 @@ require_code_count() {
   file="$2"
   wanted="$3"
   count="$(
-    awk -v expected="$expected" '
+    EXPECTED="$expected" awk '
+      BEGIN { expected = ENVIRON["EXPECTED"] }
       {
         line = $0
         sub(/^[[:space:]]+/, "", line)
@@ -175,7 +176,7 @@ require_code_count "cosign sign-blob --yes --bundle \"\${file}.sigstore.json\" \
 require_code_count "cosign verify-blob \"\$file\" \\" "$release" 1
 require_code_count "gh attestation verify \"staging/\$file\" \\" "$release" 1
 require_code_count "--bundle staging/$provenance_asset \\" "$release" 1
-require_code_count "--signer-workflow Infrastacks/ne-enclave/.github/workflows/release.yml \\" "$release" 1
+require_code_count "--signer-workflow Mindpool-Labs/ne-enclave/.github/workflows/release.yml \\" "$release" 1
 require_code_count "--source-ref \"\$GITHUB_REF\"" "$release" 1
 require_code_count "tar -C staging -cf ne-release-assets.tar ." "$release" 1
 require_code_count "path: ne-release-assets.tar" "$release" 1
