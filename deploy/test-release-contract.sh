@@ -61,7 +61,8 @@ require_code_count() {
   file="$2"
   wanted="$3"
   count="$(
-    awk -v expected="$expected" '
+    EXPECTED="$expected" awk '
+      BEGIN { expected = ENVIRON["EXPECTED"] }
       {
         line = $0
         sub(/^[[:space:]]+/, "", line)

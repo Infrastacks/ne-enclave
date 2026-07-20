@@ -35,7 +35,7 @@ fn repo_root() -> PathBuf {
 
 fn read(rel: &str) -> String {
     let p = repo_root().join(rel);
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    std::fs::read_to_string(&p).expect("release contract source file must be readable")
 }
 
 #[test]

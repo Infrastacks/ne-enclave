@@ -26,6 +26,13 @@ ignore = [
     # libcrux SHAKE bug does not affect its ML-KEM use, which is the only path
     # reachable here through russh.
     { id = "RUSTSEC-2026-0074", reason = "owner=security@neuronedge.ai; expires=v0.2.1; rationale=affected incremental SHAKE squeeze API is not used by libcrux ML-KEM; upgrade russh dependency tree" },
+    # These libcrux-sha3 incremental/AVX2 SHAKE bugs explicitly do not affect
+    # ML-KEM, which is the only use reachable here through russh.
+    { id = "RUSTSEC-2026-0207", reason = "owner=security@neuronedge.ai; expires=v0.2.1; rationale=affected incremental SHAKE squeeze API is not used by libcrux ML-KEM; upgrade russh dependency tree" },
+    { id = "RUSTSEC-2026-0208", reason = "owner=security@neuronedge.ai; expires=v0.2.1; rationale=affected AVX2 SHAKE output lengths do not occur in libcrux ML-KEM; upgrade russh dependency tree" },
+    # libcrux-secrets is reachable through russh, but this bug is AArch64-only;
+    # the supported and release targets are x86_64.
+    { id = "RUSTSEC-2026-0212", reason = "owner=security@neuronedge.ai; expires=v0.2.1; rationale=affected constant-time select implementation is AArch64-only while supported targets are x86_64; upgrade russh dependency tree" },
     # rsa is used for public-signature verification only; no runtime private RSA
     # operation is exposed to an attacker-observable timing channel.
     { id = "RUSTSEC-2023-0071", reason = "owner=security@neuronedge.ai; expires=v0.2.1; rationale=runtime uses RSA verification only and holds no private RSA key; replace or upgrade rsa dependency" },

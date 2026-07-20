@@ -160,7 +160,7 @@ not implied across profiles.
 
 ## Foundation
 
-Built on two production-credible Apache-2.0 Rust projects, both under Mindpool ownership with substantial additions:
+NeuronEdge integrates two production-credible Apache-2.0 Rust projects:
 
 - **[NVIDIA OpenShell](https://github.com/Mindpool-Labs/OpenShell)** — the sandbox substrate used by the Preview confidential profile (Landlock/seccomp/netns isolation and OPA policy). Its package supply-chain engine is not part of the standard runtime profile.
 - **[AWS Firecracker](https://github.com/firecracker-microvm/firecracker)** — the microVM substrate (upstream prebuilt binary for the standard tier).
